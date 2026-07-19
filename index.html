@@ -18,7 +18,7 @@
   <header class="bg-navy text-white px-3 py-2 flex items-center justify-between shrink-0 z-10">
     <h1 class="font-bold text-sm md:text-base">レバレッジ・マスター</h1>
     <div class="flex items-center gap-3">
-      <button id="btn-bgm" class="text-lg leading-none" title="BGMの気分を変える">🎵</button>
+      <button id="btn-result" class="text-lg leading-none hidden" title="リザルトを見る">🏆</button><button id="btn-bgm" class="text-lg leading-none" title="BGMの気分を変える">🎵</button>
       <button id="btn-mute" class="text-lg leading-none" title="音のON/OFF">🔊</button>
       <button id="btn-reset" class="text-xs underline">リセット</button>
     </div>
@@ -31,8 +31,8 @@
   <main class="relative flex-1 min-h-0">
     <canvas id="city-canvas" class="absolute inset-0 w-full h-full touch-none select-none" style="cursor:grab;"></canvas>
 
-    <div id="panel-left" class="absolute left-1 top-1 bottom-1 w-32 sm:w-44 md:w-52 flex flex-col gap-1.5 pointer-events-none z-10"></div>
-    <div id="panel-right" class="absolute right-1 top-1 bottom-1 w-32 sm:w-44 md:w-52 flex flex-col gap-1.5 items-stretch pointer-events-none z-10"></div>
+    <div id="panel-left" class="absolute left-1 top-1 bottom-1 w-32 sm:w-44 md:w-52 flex flex-col gap-1.5 pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
+    <div id="panel-right" class="absolute right-1 top-1 bottom-1 w-32 sm:w-44 md:w-52 flex flex-col gap-1.5 items-stretch pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
   </main>
 
   <!-- 選択肢イベント／各種モーダル -->
@@ -58,8 +58,6 @@ export const CONFIG = {
   capGainTaxShort: 0.39,   // 譲渡税（保有5年以内）
   capGainTaxLong: 0.20,    // 譲渡税（5年超）
   defaultTermYears: 25,    // 融資期間デフォルト
-  salaryEmployee: 150000,  // サラリーマンの月次余剰
-  salarySelf: 100000,      // 自営業の月次余剰
   creditEmployee: 60,      // 信用度 初期（サラリーマン）
   creditSelf: 10,          // 信用度 初期（自営業）
   ltvMax: 0.90,            // LTV上限
@@ -69,11 +67,13 @@ export const CONFIG = {
   troubleChance: 0.03,     // 月次トラブル発生率
   troubleMin: 50000, troubleMax: 300000,
   maxAge: 80,              // 融資・ゲーム期限の上限年齢
-  salaryMin: 0, salaryMax: 5_000_000,     // 月余剰の設定可能範囲
   seedMin: 0, seedMax: 50_000_000,        // 種銭の設定可能範囲
   ageLoanPenaltyStart: 60, // この年齢からLTVが徐々に縮む
   reformLoanRate: 0.035,   // リフォームローン金利
   reformLoanYears: 10,     // リフォームローン期間
+  corporateTaxRate: 0.30,  // 法人税率（簡易）
+  corporateSetupCost: 2_000_000, // 法人設立費用
+  corpTransferCostRate: 0.05,    // 個人→法人移転時の取得コスト（不動産取得税・登記費用相当）
 };
 
 export function yen(n) {
@@ -115,9 +115,21 @@ export function monthlyDepreciation(price, bldgRatio, deprMonths) {
   return (price * bldgRatio) / deprMonths;
 }
 
-export function monthlyTax(noiAnnualVal, deprRemainingMonths) {
+// 法人税率または所得税率の適用
+export function monthlyTax(noiAnnualVal, deprRemainingMonths, isIncorporated) {
   if (deprRemainingMonths > 0) return 0;
-  return (noiAnnualVal / 12) * CONFIG.deadCrossTaxRate;
+  // 法人の場合：一律、個人の場合：簡易累進（ここではシンプルにNOI×40%とする旧来ロジックをベースに調整）
+  const rate = isIncorporated ? CONFIG.corporateTaxRate : CONFIG.deadCrossTaxRate;
+  return (noiAnnualVal / 12) * rate;
+}
+
+// 法人化を実行する関数
+export function incorporate(state) {
+  const s = structuredClone(state);
+  if (s.isIncorporated || s.cash < CONFIG.corporateSetupCost) return { state };
+  s.cash -= CONFIG.corporateSetupCost;
+  s.isIncorporated = true;
+  return { state: s };
 }
 
 export function negotiationRateCut(level) { return Math.min((level - 1) * 0.0025, 0.01); }
@@ -237,16 +249,47 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
     loan: null, boughtPrice: null, boughtMonth: null, selfManaged: false,
     history: [], cum: { cf: 0, months: 0 },
   };
+  // v3.8: 売主事情。売り急ぎ（相続・資金繰り等）の売主は深い指値にも応じやすい（レアな掘り出し物・訳ありはやや高め）
+  const urgent = rng() < (g.wake ? 0.15 : 0.07);
+  p.sellerUrgency = urgent ? { reason: URGENCY_REASONS[Math.floor(rng() * URGENCY_REASONS.length)] } : null;
   return p;
 }
 
+const URGENCY_REASONS = ['相続で現金化を急いでいる', '資金繰りで今月中に売りたい', '海外転勤が決まった', '離婚による財産分与', '高齢で管理が難しくなった'];
+
 // === Task 5: 購入フロー（指値・銀行選択・buyProperty v2） ===
+
+// v3.8: 不動産会社の「取次ライン」。この値引き幅までは普通に取り次いでもらえる。
+// 交渉力・訳あり・売れ残り・売り急ぎで広がる。
+export function maxBrokerCut(property, negotiationLv) {
+  let c = 0.15 + (negotiationLv - 1) * 0.02;
+  if (property.junkFlags?.length) c += 0.10;
+  if (property.staleFlag) c += 0.10;
+  if (property.sellerUrgency) c += 0.25;
+  return Math.min(0.95, c);
+}
+
+// 売主に「安くても売りたい背景」があるか（鬼指値のペナルティ有無の分岐に使う）
+export function hasSellerBackground(property) {
+  return !!(property.junkFlags?.length || property.staleFlag || property.sellerUrgency);
+}
 
 export function offerSuccessChance(property, cutRate, negotiationLv) {
   if (cutRate === 0) return 1;
+  const line = maxBrokerCut(property, negotiationLv);
+  if (cutRate > line) {
+    // 鬼指値ゾーン: 背景ありは「ダメ元」（柔軟度で2〜10%・1万円の奇跡もありうる）、背景なしは1%
+    if (!hasSellerBackground(property)) return 0.01;
+    let flex = 0.02;
+    if (property.sellerUrgency) flex += 0.04;
+    if (property.staleFlag) flex += 0.02;
+    if (property.junkFlags?.length) flex += 0.02;
+    return flex;
+  }
   let p = 0.5 - cutRate * 3;
   if (property.staleFlag) p += 0.25;
   if (property.junkFlags.length > 0) p += 0.15;
+  if (property.sellerUrgency) p += 0.25;
   p += (negotiationLv - 1) * 0.05;
   return Math.max(0.02, Math.min(0.95, p));
 }
@@ -255,20 +298,48 @@ export function makeOffer(state, propertyId, cutRate, rng = Math.random) {
   const s = structuredClone(state);
   const p = s.market.find(x => x.id === propertyId);
   if (!p) return { state: s, accepted: false, price: 0 };
-  if (p.refusedOffer && cutRate > 0) return { state: s, accepted: false, price: 0 };   // 再指値は不可（満額は常に成立）
+  // 再指値は原則不可（満額は常に成立）。ただし売れ残り(staleFlag)は再指値可。値下げ時はtickMarketでフラグ解除。
+  if (p.refusedOffer && cutRate > 0 && !p.staleFlag) return { state: s, accepted: false, price: 0 };
   s.actionPower -= 10;
   const lv = skillLevel(s.skills.negotiation.exp);
+  const beyondLine = cutRate > maxBrokerCut(p, lv);
   if (rng() < offerSuccessChance(p, cutRate, lv)) {
-    return { state: s, accepted: true, price: Math.round(p.price * (1 - cutRate)) };
+    // v3.8: 深い指値を通すほど交渉EXPが多く入る
+    s.skills.negotiation.exp += 5 + Math.round(cutRate * 100);
+    return { state: s, accepted: true, price: Math.max(10000, Math.round(p.price * (1 - cutRate))) };
   }
   p.refusedOffer = true;
-  return { state: s, accepted: false, price: 0 };
+  // v3.8: 背景のない物件への鬼指値は評判ダウン（交渉EXP-15・レベルが下がることもある）
+  let penalized = false;
+  if (beyondLine && !hasSellerBackground(p)) {
+    s.skills.negotiation.exp = Math.max(0, s.skills.negotiation.exp - 15);
+    penalized = true;
+  }
+  // v3.8: 鬼指値で断られたとき、約30%で不動産会社から「逆提案」（激安寄りの物件を紹介してくれる）
+  let counterProposal = null;
+  if (beyondLine && rng() < 0.30) {
+    const wk = p.genreKey.startsWith('w_') ? p.genreKey : ('w_' + p.genreKey);
+    const cp = generateProperty(GENRE[wk] ? wk : 'w_kodate', p.areaKey, rng);
+    cp.origPrice = cp.price;
+    cp.price = Math.max(10000, Math.round(cp.price * (0.55 + rng() * 0.2) / 10000) * 10000);
+    cp.askingPrice = cp.price;
+    cp.staleFlag = true;
+    cp.listedMonths = 6 + Math.floor(rng() * 6);
+    s.nextPropertyId = s.nextPropertyId || 1;
+    cp.id = 'p' + s.nextPropertyId++;
+    cp.name = propertyName(cp.genreKey, cp.builtAge, cp.id);
+    s.market.unshift(cp);
+    counterProposal = cp;
+  }
+  return { state: s, accepted: false, price: 0, penalized, counterProposal };
 }
 
-export function buyPropertyV2(state, propertyId, { method, downRatio = 0, price }) {
+export function buyPropertyV2(state, propertyId, { method, downRatio = 0, price, owner = 'personal' }) {
   const s = structuredClone(state);
   const i = s.market.findIndex(x => x.id === propertyId);
   const p = s.market[i];
+  // v3.5: 名義。法人名義は法人設立済みの場合のみ有効（それ以外は個人）
+  p.owner = (owner === 'corp' && s.isIncorporated) ? 'corp' : 'personal';
   const logs = [];
   const closing = Math.round(price * CONFIG.closingCostRate);
   if (method === 'cash') {
@@ -330,6 +401,7 @@ function loanMonthlyBreakdown(loan) {
   return { interest, principal: Math.round(pay - interest) };
 }
 
+// v3.5: 課税はstateの法人化フラグではなく物件の名義(owner)で決まる（個人=デッドクロス後40%・法人=30%）
 export function propertyMonthlyPL(p) {
   const rentIn = p.units.filter(u => u.occupied).reduce((s, u) => s + u.rent, 0);
   const vacancyLoss = p.units.filter(u => !u.occupied).reduce((s, u) => s + u.rent, 0);
@@ -340,7 +412,7 @@ export function propertyMonthlyPL(p) {
   const interest = loanBd.interest + reformBd.interest;
   const principalPay = loanBd.principal + reformBd.principal;
   const noiM = rentIn - opex;
-  const tax = p.deprRemaining > 0 ? 0 : Math.max(0, Math.round(noiM * CONFIG.deadCrossTaxRate));
+  const tax = monthlyTax(noiM * 12, p.deprRemaining, p.owner === 'corp');
   return { rentIn, vacancyLoss, opex, interest, principal: principalPay, tax,
     cf: rentIn - opex - interest - principalPay - tax };
 }
@@ -394,7 +466,9 @@ export function settleSale(state, sale) {
   const book = bookValueV2(p);
   const gain = Math.max(0, sale.price - book);
   const heldYears = (s.month - p.boughtMonth) / 12;
-  const taxRate = heldYears <= 5 ? CONFIG.capGainTaxShort : CONFIG.capGainTaxLong;
+  // v3.5: 法人名義は保有期間に関係なく法人税率（短期転売の5年ルールは個人のみ）
+  const taxRate = p.owner === 'corp' ? CONFIG.corporateTaxRate
+    : (heldYears <= 5 ? CONFIG.capGainTaxShort : CONFIG.capGainTaxLong);
   const capTax = Math.round(gain * taxRate);
   let payoff = 0;
   if (p.loan) payoff += Math.round(remainingPrincipal(p.loan.principal, p.loan.rate, p.loan.years, p.loan.monthsPaid));
@@ -446,14 +520,36 @@ export function fillVacancy(state, propertyId, unitIndex, method, rng = Math.ran
   return { state: s, success };
 }
 
+// === v3: 修繕は「工事内容」ベース。ギャップ(100-修繕度)で規模・DIYコスト・業者工期が決まる ===
+export const REPAIR_TIERS = {
+  small: { label: '清掃・草刈り・クロス補修', diyCost: 10 },
+  mid:   { label: '水回り・内装・防水工事',   diyCost: 20 },
+  large: { label: '外壁・屋根・躯体工事',     diyCost: 30 },
+};
+
+export function repairTier(gap) {
+  return gap <= 30 ? 'small' : gap <= 60 ? 'mid' : 'large';
+}
+
+export function repairTierInfo(property) {
+  const gap = Math.max(0, 100 - property.repairState);
+  const tier = repairTier(gap);
+  return { tier, gap, ...REPAIR_TIERS[tier] };
+}
+
 export function doDIY(state, propertyId) {
+  const p0 = state.properties.find(x => x.id === propertyId);
+  if (!p0 || p0.repairJob) return { state };   // 業者修繕中はDIY不可
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
-  s.actionPower -= 30;
+  s.actionPower -= repairTierInfo(p).diyCost;
   const before = p.repairState;
-  p.repairState = Math.min(100, p.repairState + 20);
+  p.repairState = Math.min(100, p.repairState + 15);
   s.skills.selfmgmt.exp += 10;
-  if (before < 100 && p.repairState === 100) p.timeValue = Math.round(p.timeValue * 1.05);
+  if (before < 100 && p.repairState === 100) {
+    p.timeValue = Math.round(p.timeValue * 1.05);
+    recordJunkRepair(s, p);
+  }
   return { state: s };
 }
 
@@ -474,11 +570,19 @@ export function reformLoanAmount(cost, creditScore) {
   return Math.round(cost * ratio / 10000) * 10000;
 }
 
-export function doProfessionalRepair(state, propertyId, financed = false) {
+// v3.1: 工期は見積金額で決まる（安い工事は早い・高い工事は長い）。月次回復もこの工期で按分される。
+export function repairMonthsForCost(cost) {
+  return cost < 500_000 ? 1 : cost < 3_000_000 ? 2 : cost < 15_000_000 ? 3 : 4;
+}
+
+// v3: 業者修繕は即時完了せず「修繕中」を経て翌月以降に回復する。発注手続きは行動力5。
+export function startProfessionalRepair(state, propertyId, financed = false) {
+  const p0 = state.properties.find(x => x.id === propertyId);
+  if (!p0 || p0.repairJob) return { state, started: false, cost: 0, loanAmount: 0, financed: false };
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
   const cost = professionalRepairCost(p);
-  s.actionPower -= 20;
+  s.actionPower -= 5;
   const canFinance = financed && !p.reformLoan;   // 既存のリフォームローン完済前は再借入不可（多重借入で残債が消える事故を防ぐ）
   let loanAmount = 0;
   if (canFinance) {
@@ -488,11 +592,9 @@ export function doProfessionalRepair(state, propertyId, financed = false) {
   } else {
     s.cash -= cost;
   }
-  const before = p.repairState;
-  p.repairState = 100;
-  s.skills.selfmgmt.exp += 15;
-  if (before < 100) p.timeValue = Math.round(p.timeValue * 1.08);
-  return { state: s, cost, loanAmount, financed: canFinance };
+  const monthsTotal = repairMonthsForCost(cost);
+  p.repairJob = { monthsTotal, monthsLeft: monthsTotal, startState: p.repairState };
+  return { state: s, started: true, cost, loanAmount, financed: canFinance, monthsTotal };
 }
 export function totalAssetsV2(state) { return state.cash + state.properties.reduce((t, p) => t + p.timeValue, 0); }
 export function netWorth(state) { return Math.round(totalAssetsV2(state) - totalDebt(state)); }
@@ -592,22 +694,23 @@ export function maxYearsForAge(age) {
   return Math.max(1, CONFIG.maxAge - age);
 }
 
-export function changeSalary(state, newSalary) {
+// v3: 種銭は労働で稼ぐ。行動力1消費で¥1,000〜10,000（100円単位）を獲得。
+export function doWork(state, rng = Math.random) {
+  if (state.actionPower < 1) return { state, earned: 0 };
   const s = structuredClone(state);
-  s.salary = Math.max(CONFIG.salaryMin, Math.min(CONFIG.salaryMax, Math.round(newSalary)));
-  return { state: s };
+  s.actionPower -= 1;
+  const earned = (10 + Math.floor(rng() * 91)) * 100;
+  s.cash += earned;
+  return { state: s, earned };
 }
 
-export function createInitialState({ attr, goalType, goalAmount, goalYears, seedCash, age, salaryMonthly }) {
+export function createInitialState({ attr, goalType, goalAmount, goalYears, seedCash, age }) {
   const emp = attr === 'employee';
   const clampedAge = Math.max(18, Math.min(CONFIG.maxAge - 1, Math.round(age ?? 30)));
   const clampedSeed = Math.max(CONFIG.seedMin, Math.min(CONFIG.seedMax, Math.round(seedCash)));
-  const defaultSalary = emp ? CONFIG.salaryEmployee : CONFIG.salarySelf;
-  const clampedSalary = Math.max(CONFIG.salaryMin, Math.min(CONFIG.salaryMax, Math.round(salaryMonthly ?? defaultSalary)));
   const clampedYears = Math.max(1, Math.min(goalYears, maxYearsForAge(clampedAge)));
   return {
     cash: clampedSeed, month: 0, attr, age: clampedAge,
-    salary: clampedSalary,
     creditScore: emp ? CONFIG.creditEmployee : CONFIG.creditSelf,
     baseActionPower: emp ? 100 : 120, actionPower: emp ? 100 : 120,
     goal: { type: goalType, amount: goalAmount, years: clampedYears },
@@ -616,13 +719,65 @@ export function createInitialState({ attr, goalType, goalAmount, goalYears, seed
     bankRelations: { kouko: { loans: 0, paidOff: 0 }, chigin: { loans: 0, paidOff: 0 },
       shinkin: { loans: 0, paidOff: 0 }, nonbank: { loans: 0, paidOff: 0 } },
     log: ['ゲーム開始。まずは営業で物件を探そう。'],
-    stats: { buys: 0, sales: 0, profitSales: 0, junkFlips: 0, hadLoan: false },
+    stats: { buys: 0, sales: 0, profitSales: 0, junkFlips: 0, hadLoan: false, junkRepairs: 0, maxMonthlyCF: 0 },
     badges: [],
     favorites: [], notifications: [], nextNotifId: 1,
+    isIncorporated: false,
+    salesSearch: { spent: 0, threshold: null },
+    nextPropertyId: 1,
   };
 }
 
-// === Phase 4: お気に入り・通知 ===
+// v3.5: 旧セーブのID衝突修復。重複IDを見つけたら後から登場した方へ新IDを振り直す
+// （名前もIDから再生成される。お気に入り・掲載などの参照は先に登場した方を指し続ける）。
+export function dedupePropertyIds(state) {
+  const s = structuredClone(state);
+  s.nextPropertyId = s.nextPropertyId || 1;
+  const seen = new Set();
+  let fixed = 0;
+  const fix = (p) => {
+    if (seen.has(String(p.id))) {
+      p.id = 'p' + s.nextPropertyId++;
+      p.name = propertyName(p.genreKey, p.builtAge, p.id);
+      fixed += 1;
+    }
+    seen.add(String(p.id));
+  };
+  (s.properties || []).forEach(fix);
+  (s.market || []).forEach(fix);
+  return { state: s, fixed };
+}
+
+// v3.5: 個人所有物件を法人へ売却（移転）。時価で取引し、個人側は譲渡税を精算、
+// 法人側は取得コスト（時価の5%）を支払う。移転後は減価償却が中古簡便法で再スタートする。
+// 抵当権が残る物件（ローン未完済）は移転できない。
+export function transferToCorp(state, propertyId) {
+  const p0 = state.properties.find(x => x.id === propertyId);
+  if (!state.isIncorporated || !p0 || p0.owner === 'corp') return { state, done: false, reason: 'invalid' };
+  if (p0.loan || p0.reformLoan) return { state, done: false, reason: 'loan' };
+  const s = structuredClone(state);
+  const p = s.properties.find(x => x.id === propertyId);
+  const price = p.timeValue;
+  const book = bookValueV2(p);
+  const gain = Math.max(0, price - book);
+  const heldYears = (s.month - (p.boughtMonth ?? s.month)) / 12;
+  const capTax = Math.round(gain * (heldYears <= 5 ? CONFIG.capGainTaxShort : CONFIG.capGainTaxLong));
+  const acqCost = Math.round(price * CONFIG.corpTransferCostRate);
+  if (s.cash < capTax + acqCost) return { state, done: false, reason: 'cash' };
+  s.cash -= capTax + acqCost;
+  p.owner = 'corp';
+  p.boughtPrice = price;
+  p.boughtMonth = s.month;
+  p.deprRemaining = deprMonthsFor(p.structure, p.builtAge);   // 償却再スタート（中古簡便法）
+  return { state: s, done: true, price, capTax, acqCost };
+}
+
+// 訳あり物件の修繕完了時にカウントアップするロジック
+export function recordJunkRepair(state, property) {
+  if (property.junkFlags && property.junkFlags.length > 0) {
+    state.stats.junkRepairs = (state.stats.junkRepairs || 0) + 1;
+  }
+}
 export const FAVORITE_LIMIT = 10;
 
 export function addFavorite(state, propertyId) {
@@ -685,6 +840,19 @@ export function evaluateBadges(state) {
   return ids;
 }
 
+// v3.7: リザルト称号。達成スピード（期限に対する消化率）と純資産の規模で決まる。
+export function resultTitle(state) {
+  if (isBankrupt(state)) return '夢半ばの破産者';
+  if (!isClearedV2(state)) return '時間切れの挑戦者';
+  const speed = state.month / Math.max(1, state.goal.years * 12);
+  const nw = netWorth(state);
+  const scale = nw >= 300_000_000 ? 'メガ大家' : nw >= 100_000_000 ? '大家' : '街の大家';
+  if (speed <= 0.35) return `電光石火の${scale}`;
+  if (speed <= 0.6) return `敏腕${scale}`;
+  if (speed <= 0.85) return `堅実な${scale}`;
+  return `執念の${scale}`;
+}
+
 export function advanceMonth(state, rng = Math.random) {
   let s = structuredClone(state);
   const logs = [];
@@ -717,8 +885,27 @@ export function advanceMonth(state, rng = Math.random) {
       s.cash -= c;
       logs.push(`${p.label} で突発修繕（-${yen(c)}）`);
     }
-    // 修繕度が20%を割ったら管理会社から修繕依頼（通知は劣化中に一度だけ・回復で再アーム）
-    if (p.repairState < 20 && !p.repairAlerted) {
+    // v3: 業者修繕の進行。毎月少しずつ回復し、最終月に100到達・時価+8%・完了通知
+    if (p.repairJob) {
+      p.repairJob.monthsLeft -= 1;
+      const j = p.repairJob;
+      if (j.monthsLeft <= 0) {
+        const before = p.repairState;
+        p.repairState = 100;
+        p.repairJob = null;
+        p.timeValue = Math.round(p.timeValue * 1.08);
+        s.skills.selfmgmt.exp += 15;
+        if (before < 100) recordJunkRepair(s, p);
+        const nm = p.name || p.label;
+        pushNotification(s, 'repair_done', p.id, nm, `${nm} の修繕が完了しました（修繕度100%・資産価値上昇）`);
+        logs.push(`${nm} の修繕が完了した（修繕度100%）`);
+      } else {
+        const k = j.monthsTotal - j.monthsLeft;
+        p.repairState = Math.min(99, Math.round(j.startState + (100 - j.startState) * k / j.monthsTotal));
+      }
+    }
+    // 修繕度が20%を割ったら管理会社から修繕依頼（通知は劣化中に一度だけ・回復で再アーム。修繕中は出さない）
+    if (p.repairState < 20 && !p.repairAlerted && !p.repairJob) {
       const nm = p.name || p.label;
       pushNotification(s, 'repair_needed', p.id, nm, `${nm} の劣化が深刻です（修繕度${p.repairState}%）。管理会社から修繕依頼が届きました`);
       p.repairAlerted = true;
@@ -727,7 +914,11 @@ export function advanceMonth(state, rng = Math.random) {
     }
   }
   if (s.month % 12 === 0) { s.properties.forEach(p => { p.builtAge += 1; }); s.age = (s.age ?? 30) + 1; }
-  s.cash += s.salary;
+  // v3.7: 生涯実績用に最大月CFを記録（リザルト画面で表示）
+  s.stats = s.stats || {};
+  const mcfNow = monthlyCF(s);
+  if (mcfNow > (s.stats.maxMonthlyCF ?? 0)) s.stats.maxMonthlyCF = mcfNow;
+  // v3: 月次給与の自動加算は廃止（種銭は doWork で稼ぐ）
   for (const l of s.listings || []) {
     l.listedMonths += 1;
     if (!l.offer) {
@@ -884,10 +1075,11 @@ export function appraise(property, appraisalLv, rng = Math.random) {
 
 export function requestAppraisal(state, propertyId, rng = Math.random) {
   const s = structuredClone(state);
-  s.actionPower -= 20;
+  s.actionPower -= 5;   // v3: 査定依頼は軽い手続き
   const p = s.properties.find(x => x.id === propertyId);
   const lv = skillLevel(s.skills?.appraisal?.exp ?? 0);
   const appraisal = appraise(p, lv, rng);
+  p.lastAppraisal = { amount: appraisal, month: s.month };   // v3.6: 査定結果は物件に記録され、一覧・詳細に残る
   return { state: s, appraisal };
 }
 
@@ -919,11 +1111,12 @@ export function bargainScore(p) {
   return Math.max(0, Math.min(1, (p.grossYield - g.yieldMin) / (g.yieldMax - g.yieldMin)));
 }
 
-function pushNotification(s, kind, propertyId, label, message) {
+function pushNotification(s, kind, propertyId, label, message, snapshot = null) {
   s.notifications = s.notifications || [];
   const id = s.nextNotifId || 1;
   s.nextNotifId = id + 1;
-  s.notifications.unshift({ id, month: s.month, kind, propertyId, label, message, read: false });
+  // snapshot: 対象物件が消えた後（他決等）でも閲覧できるよう、その時点の物件データを保持
+  s.notifications.unshift({ id, month: s.month, kind, propertyId, label, message, read: false, snapshot });
 }
 
 export function tickMarket(state, rng = Math.random) {
@@ -937,7 +1130,7 @@ export function tickMarket(state, rng = Math.random) {
       const nm = p.name || p.label;
       logs.push(`${nm} は他の買主で決まってしまった`);
       if (s.favorites.some(f => f.propertyId === p.id)) {
-        pushNotification(s, 'sold_out', p.id, nm, `${nm} は他の買主で成約しました`);
+        pushNotification(s, 'sold_out', p.id, nm, `${nm} は他の買主で成約しました`, structuredClone(p));
         s.favorites = s.favorites.filter(f => f.propertyId !== p.id);
       }
       return false;
@@ -949,6 +1142,8 @@ export function tickMarket(state, rng = Math.random) {
       const cut = 0.03 + rng() * 0.05;
       p.price = Math.max(10000, Math.round(p.price * (1 - cut) / 10000) * 10000);
       p.askingPrice = p.price;
+      p.refusedOffer = false;   // 値下げ＝売主の姿勢が軟化。指値を断られた物件も再チャレンジ可に
+
       const nm = p.name || p.label;
       logs.push(`${nm} が値下げされた（${yen(p.price)}）`);
       if (s.favorites.some(f => f.propertyId === p.id)) {
@@ -969,24 +1164,48 @@ export function searchHitChance(nGenres, nAreas, nAges, appraisalLv) {
   return Math.round(Math.max(0.30, Math.min(1.0, p)) * 100) / 100;
 }
 
-export function doSalesSearch(state, { genres, areas, ages }, rng = Math.random) {
+// === v3: 営業は1押下=行動力1消費。累計が隠し閾値(6〜40)に達すると物件情報を入手 ===
+export const SEARCH_PRESS_COST = 1;
+export const SEARCH_MIN = 6;
+export const SEARCH_MAX = 40;
+
+// 閾値抽選: threshold = 6 + 34×u^f。fは従来の発見率(0.30〜1.0)を流用し、
+// 条件が広く目利きLvが高いほど f が大きい＝低い閾値（早い発見）が出やすい。
+export function drawSearchThreshold({ genres, areas, ages }, appraisalLv, rng = Math.random) {
+  const f = searchHitChance(genres.length, areas.length, ages.length, appraisalLv);
+  return SEARCH_MIN + Math.round((SEARCH_MAX - SEARCH_MIN) * Math.pow(rng(), f));
+}
+
+export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) {
+  if (state.actionPower < SEARCH_PRESS_COST) return { state, found: null, pressed: false };
   const s = structuredClone(state);
-  s.actionPower -= 40;
-  const lv = skillLevel(s.skills.appraisal.exp);
-  if (rng() >= searchHitChance(genres.length, areas.length, ages.length, lv)) {
-    s.skills.appraisal.exp += 5;
-    return { state: s, found: null, log: '今月は良い出物なし…（目利き+5 EXP）' };
+  s.actionPower -= SEARCH_PRESS_COST;
+  s.salesSearch = s.salesSearch || { spent: 0, threshold: null };
+  if (s.salesSearch.threshold == null) {
+    const lv = skillLevel(s.skills.appraisal.exp);
+    s.salesSearch.threshold = drawSearchThreshold({ genres, areas, ages }, lv, rng);
+  }
+  s.salesSearch.spent += SEARCH_PRESS_COST;
+  s.skills.appraisal.exp += 1;
+  if (s.salesSearch.spent < s.salesSearch.threshold) {
+    return { state: s, found: null, pressed: true };
   }
   const gk = genres[Math.floor(rng() * genres.length)];
   const ak = areas[Math.floor(rng() * areas.length)];
   const p = generateProperty(gk, ak, rng, ages);
+  // v3.5: IDはセーブデータ内で採番する（モジュール変数はリロードで0に戻り、復元後に既存物件と衝突するため）
+  s.nextPropertyId = s.nextPropertyId || 1;
+  p.id = 'p' + s.nextPropertyId++;
+  p.name = propertyName(p.genreKey, p.builtAge, p.id);
   s.market.unshift(p);
   s.skills.appraisal.exp += 10;
-  return { state: s, found: p, log: `${p.name || p.label}（${p.label}）を発見（表面${(p.grossYield * 100).toFixed(1)}%・${yen(p.price)}）` };
+  s.salesSearch = { spent: 0, threshold: null };
+  return { state: s, found: p, pressed: true,
+    log: `${p.name || p.label}（${p.label}）を発見（表面${(p.grossYield * 100).toFixed(1)}%・${yen(p.price)}）` };
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, generateProperty, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, doDIY, totalDebt, professionalRepairCost, reformLoanAmount, doProfessionalRepair, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, changeSalary, createInitialState, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, advanceMonth, serialize, deserialize, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, doSalesSearch };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, REPAIR_TIERS, repairTier, repairTierInfo, doDIY, totalDebt, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, doSalesPress };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -998,8 +1217,14 @@ const FPS = 30;   // 描画上限（発熱・電池対策）
 let canvas = null, ctx = null, dpr = 1, cx = 0, cy = 0, R = 0;
 let cbs = {};
 let st = null;                       // 直近のゲームstate（参照のみ・書き換えない）
-let yaw = 0.6, pitch = -0.30, yawV = 0;
+// v3.8: 初期視点は都心コア（大陸中心）が画面中央に来る角度
+let yaw = 0, pitch = -0.03, yawV = 0;
 let dragging = false, lastX = 0, lastY = 0, moved = 0;
+// v3.4: ズーム（ホイール／2本指ピンチ）。0.7倍（引き）〜2.5倍（寄り）。建物サイズも連動する。
+let zoom = 1;
+const ZOOM_MIN = 0.7, ZOOM_MAX = 2.5;
+const activePtrs = new Map();
+let pinchDist = 0, pinching = false;
 let rafId = 0, lastFrame = 0;
 let pingItem = null;  // 一覧「地図を見る」からのピン（クリックまで維持）
 
@@ -1178,7 +1403,7 @@ function drawLandmasses() {
 function drawGrayBuilding(lat, lon, stories, emoji) {
   const p = project(lat, lon);
   if (p.z < 0.05) return;
-  const scale = 0.65 + p.z * 0.85;
+  const scale = 0.65 + p.z * 0.85;   // v3.5: ズームでもアイコンサイズは固定（間隔だけ変わる）
   const size = (12 + stories * 2.1) * scale;
   ctx.globalAlpha = 0.55 + p.z * 0.35;
   ctx.font = `${Math.round(size)}px "Segoe UI Emoji", sans-serif`;
@@ -1191,7 +1416,7 @@ function drawColorBuilding(p, lat, lon, kind) {
   const parts = L.svgBuildingParts(p);
   const pr = project(lat, lon);
   if (pr.z < 0.04) return;
-  const scale = 0.85 + pr.z * 1.15;
+  const scale = 0.85 + pr.z * 1.15;   // v3.5: ズームでもアイコンサイズは固定（間隔だけ変わる）
   const stories = SHAPE_STORIES[parts.shape] ?? 1;
   const emoji = GENRE_EMOJI[parts.shape] ?? '🏠';
   const size = (17 + stories * 2.9) * scale;
@@ -1199,11 +1424,11 @@ function drawColorBuilding(p, lat, lon, kind) {
   const isFav = kind === 'market' && (st.favorites || []).some(f => f.propertyId === p.id);
   ctx.save();
   ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-  // 密集した雰囲気建物に埋もれないよう、タップ可能な実物件（所有・お気に入り市場）の足元にだけ
-  // 淡いハロー（円形の光暈）を敷いて視認性を上げる。
-  if (kind === 'owned' || isFav) {
+  // 密集した雰囲気建物に埋もれないよう、所有物件の足元にだけ淡いハロー（円形の光暈）を敷く。
+  // v3: お気に入りは⭐のみ（所有物件より目立たないよう背景ハローは付けない）。
+  if (kind === 'owned') {
     ctx.globalAlpha = Math.min(1, 0.35 + pr.z * 0.3);
-    ctx.fillStyle = kind === 'owned' ? '#a7f3d0' : '#fde68a';
+    ctx.fillStyle = '#a7f3d0';
     ctx.beginPath(); ctx.arc(pr.x, pr.y - size * 0.35, size * 0.62, 0, TAU); ctx.fill();
   }
   if (kind === 'market') ctx.filter = 'grayscale(1) brightness(0.75)';
@@ -1219,6 +1444,11 @@ function drawColorBuilding(p, lat, lon, kind) {
     if ((st.listings || []).some(l => l.propertyId === p.id)) {
       ctx.fillStyle = '#facc15';
       ctx.beginPath(); ctx.arc(pr.x - size * 0.30, pr.y - size * 0.95, 2.6 * scale, 0, TAU); ctx.fill();
+    }
+    // v3: 業者修繕中の物件は🔨マークで一目で分かるように
+    if (p.repairJob) {
+      ctx.font = `${Math.round(12 * scale)}px sans-serif`;
+      ctx.fillText('🔨', pr.x, pr.y - size * 1.10);
     }
   } else if (kind === 'market' && (st.favorites || []).some(f => f.propertyId === p.id)) {
     // お気に入り登録した市場物件だけ⭐を付けタップ可能にする（未登録の市場物件は雰囲気建物と同じ扱い）
@@ -1269,7 +1499,7 @@ function draw(ts) {
   const w = canvas.width / dpr, h = canvas.height / dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  cx = w / 2; cy = h * 0.52; R = Math.min(w, h) * 0.44;
+  cx = w / 2; cy = h * 0.52; R = Math.min(w, h) * 0.44 * zoom;
 
   if (!dragging) { yaw += yawV * dt; yawV *= 0.92; }
 
@@ -1316,6 +1546,32 @@ function draw(ts) {
 }
 
 // 地図上でタップ対象になるのは所有物件、および★お気に入り登録済みの市場物件のみ。
+// v3.3: どの建物がタップ対象か分かるように、ホバー（マウス）／1度目のタップ（タッチ）で
+// 物件名などの簡易情報を吹き出し表示する。2度目のタップ（マウスはクリック）で詳細へ。
+let tipEl = null, tapCandidateId = null, tapCandidateTimer = 0;
+function tipHtmlFor(hit) {
+  const p = hit.p;
+  const nm = p.name || p.label;
+  if (hit.kind === 'owned') {
+    const occ = p.units && p.units.length ? Math.round(p.units.filter(u => u.occupied).length / p.units.length * 100) : 100;
+    return `🏠 <b>${nm}</b><br>${p.owner === 'corp' ? '🏢法人' : '👤個人'}・入居${occ}%・修繕度${p.repairState}%${p.repairJob ? '・🔨修繕中' : ''}`;
+  }
+  return `⭐ <b>${nm}</b><br>市場（お気に入り）・${L.yen(p.price)}`;
+}
+function showTip(hit, x, y, extra) {
+  if (!tipEl) {
+    tipEl = document.createElement('div');
+    tipEl.style.cssText = 'position:fixed;z-index:45;pointer-events:none;background:rgba(255,255,255,0.97);border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,0.28);padding:6px 10px;font-size:12px;color:#0f172a;line-height:1.5;max-width:240px;';
+    document.body.appendChild(tipEl);
+  }
+  const rect = canvas.getBoundingClientRect();
+  tipEl.innerHTML = tipHtmlFor(hit) + (extra ? `<div style="color:#64748b;font-size:10px;">${extra}</div>` : '');
+  tipEl.style.left = Math.round(rect.left + x + 14) + 'px';
+  tipEl.style.top = Math.round(rect.top + y - 14) + 'px';
+  tipEl.style.display = 'block';
+}
+function hideTip() { if (tipEl) tipEl.style.display = 'none'; }
+
 function hitTest(px, py) {
   const favIds = new Set((st?.favorites || []).map(f => f.propertyId));
   const items = coloredItems()
@@ -1370,20 +1626,57 @@ function initCity(cv, callbacks) {
     window.addEventListener('resize', resize);
   }
 
+  canvas.addEventListener('pointerleave', hideTip);
+  // v3.4: ホイールで拡大縮小（PC）
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const f = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * f));
+  }, { passive: false });
   canvas.addEventListener('pointerdown', e => {
+    activePtrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    // v3.4: 2本目の指が置かれたらピンチズームモードへ（回転ドラッグは中断）
+    if (activePtrs.size >= 2) {
+      pinching = true; dragging = false;
+      const pts = [...activePtrs.values()];
+      pinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      hideTip();
+      return;
+    }
     dragging = true; moved = 0; lastX = e.clientX; lastY = e.clientY; yawV = 0;
     try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
     canvas.style.cursor = 'grabbing';
   });
   canvas.addEventListener('pointermove', e => {
+    // バックグラウンド起動等で最初のフレームがまだ描かれていない場合の保険
+    // （R=0のままだと当たり判定が全て左上に潰れる）。draw()と同じ式で投影パラメータを確定させる。
+    if (!R && canvas.clientWidth) {
+      resize();
+      const w = canvas.width / dpr, h = canvas.height / dpr;
+      cx = w / 2; cy = h * 0.52; R = Math.min(w, h) * 0.44 * zoom;
+    }
+    if (activePtrs.has(e.pointerId)) activePtrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    // v3.4: ピンチ中は2点間距離の変化でズーム
+    if (pinching && activePtrs.size >= 2) {
+      const pts = [...activePtrs.values()];
+      const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      if (pinchDist > 0) zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * d / pinchDist));
+      pinchDist = d;
+      return;
+    }
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     if (!dragging) {
-      // ホバー時: タップできる対象（所有/お気に入り物件・ピン・🔒）の上ではカーソルを指マークに
-      const over = hitPin(mx, my) || hitLock(mx, my) || hitTest(mx, my);
+      // ホバー時: タップできる対象（所有/お気に入り物件・ピン・🔒）の上ではカーソルを指マークに。
+      // v3.3: マウスホバー中は建物の簡易情報を吹き出しで出す（どれがヒットするか一目で分かるように）。
+      const hit = hitTest(mx, my);
+      const over = hitPin(mx, my) || hitLock(mx, my) || hit;
       canvas.style.cursor = over ? 'pointer' : 'grab';
+      if (hit && e.pointerType !== 'touch') showTip(hit, mx, my, 'クリックで詳細を開く');
+      else if (!tapCandidateId) hideTip();
       return;
     }
+    hideTip();
     const dx = e.clientX - lastX, dy = e.clientY - lastY;
     moved += Math.abs(dx) + Math.abs(dy);
     yaw += dx / (R || 150);
@@ -1391,7 +1684,19 @@ function initCity(cv, callbacks) {
     yawV = dx / (R || 150) * 6;
     lastX = e.clientX; lastY = e.clientY;
   });
+  canvas.addEventListener('pointercancel', e => {
+    activePtrs.delete(e.pointerId);
+    if (activePtrs.size === 0) { pinching = false; pinchDist = 0; dragging = false; canvas.style.cursor = 'grab'; }
+  });
   canvas.addEventListener('pointerup', e => {
+    activePtrs.delete(e.pointerId);
+    // v3.4: ピンチ操作の指離しはタップとして扱わない
+    if (pinching) {
+      pinchDist = 0;
+      if (activePtrs.size === 0) pinching = false;
+      dragging = false; canvas.style.cursor = 'grab';
+      return;
+    }
     dragging = false; canvas.style.cursor = 'grab';
     if (moved < 8) {
       const rect = canvas.getBoundingClientRect();
@@ -1405,8 +1710,20 @@ function initCity(cv, callbacks) {
       // ③物件
       const hit = hitTest(mx, my);
       if (hit) {
+        // v3.3: タッチは1度目のタップで吹き出し（何がヒットしたか見せる）、同じ建物をもう一度タップで詳細。
+        // マウスはホバーで既に吹き出しが出ているため、クリックで即詳細。
+        if (e.pointerType === 'touch' && tapCandidateId !== hit.p.id) {
+          tapCandidateId = hit.p.id;
+          showTip(hit, mx, my, 'もう一度タップで詳細を開く');
+          clearTimeout(tapCandidateTimer);
+          tapCandidateTimer = setTimeout(() => { tapCandidateId = null; hideTip(); }, 2800);
+          return;
+        }
+        tapCandidateId = null; hideTip();
         if (hit.kind === 'owned' && cbs.onTapProperty) cbs.onTapProperty(hit.p.id);
         if (hit.kind === 'market' && cbs.onTapMarket) cbs.onTapMarket(hit.p.id);
+      } else {
+        tapCandidateId = null; hideTip();
       }
     }
   });
@@ -1419,6 +1736,11 @@ function initCity(cv, callbacks) {
 
 function setCityState(s) { st = s; }
 
+// v3.5: マップ以外のゲーム操作後に呼ばれ、ズームと視点を初期状態（都心コアが中央）へ戻す。
+function resetMapView() {
+  zoom = 1; yaw = 0; pitch = -0.03; yawV = 0;
+}
+
 // 物件一覧の「地図を見る」から呼ぶ: 該当の市場物件が正面に来るよう回転しピンを立てる。
 // ピンはどこかをクリックするまで維持され、ピン自体をクリックすると詳細画面が開く。
 function focusOnMarket(propertyId) {
@@ -1429,6 +1751,16 @@ function focusOnMarket(propertyId) {
   yaw = -s.lon; pitch = Math.max(-0.6, Math.min(0.2, -s.lat * 0.6));
   yawV = 0;
   pingItem = { lat: s.lat, lon: s.lon, id: propertyId, sx: null, sy: null };
+}
+
+// v3: DIY・業者修繕の演出用。該当の所有物件が正面に来るようカメラを回転させる（ピンは立てない）。
+function focusOnOwned(propertyId) {
+  if (!st) return;
+  const p = st.properties.find(x => x.id === propertyId);
+  if (!p) return;
+  const s = slotFor(p.areaKey, 'o:' + p.id);
+  yaw = -s.lon; pitch = Math.max(-0.6, Math.min(0.2, -s.lat * 0.6));
+  yawV = 0;
 }
 
 // コイン回収アニメ用: 所有建物のビューポート座標一覧
@@ -1565,7 +1897,7 @@ function openBgmModal() {
     <div class="flex justify-between items-center"><h2 class="font-bold">🎵 BGMの気分</h2><button id="bgm-close" class="text-slate-400 text-xl">✕</button></div>
     ${rows}
     <button id="bgm-off" class="w-full border rounded py-2 text-sm ${muted ? 'bg-slate-200' : ''}">🔇 BGMを止める</button>
-    <div class="text-[11px] text-slate-400">気分に合わせて選べます。いつでも変更できます。</div></div>`);
+    <div class="text-[11px] text-slate-500">気分に合わせて選べます。いつでも変更できます。</div></div>`);
   m.appendChild(box);
   box.querySelector('#bgm-close').addEventListener('click', close);
   box.querySelectorAll('.bgm-pick').forEach(b => b.addEventListener('click', () => {
@@ -1590,6 +1922,8 @@ function wireGlobalAudioHooks() {
 
 // カンマ区切りの数値入力（type="text"）。入力中は自動でカンマ整形し、取り出しは parseCommaNumber で行う。
 function parseCommaNumber(v){ return Number(String(v).replace(/[^\d-]/g, '')) || 0; }
+// 物件IDは旧セーブ=数値・v3.5以降=文字列('p1')が混在するため、datasetから読む時はこの関数で復元する
+function parsePropId(raw){ return /^\d+$/.test(raw) ? Number(raw) : raw; }
 function wireCommaInput(input, { min = 0, max = Infinity } = {}){
   input.addEventListener('input', () => {
     const digits = input.value.replace(/[^\d]/g, '');
@@ -1602,86 +1936,183 @@ function wireCommaInput(input, { min = 0, max = Infinity } = {}){
 }
 function setCommaValue(input, n){ input.value = Number(n).toLocaleString('en-US'); }
 
-function showSetup() {
+// v3.7: タイトル画面。回る地球儀＋瞬く星空＋金色ロゴ。セーブがあれば「続きから」。
+function showTitle(hasSave) {
   const m = document.getElementById('setup-modal');
   m.classList.remove('hidden'); m.innerHTML = '';
-  m.appendChild(el(`
-    <div class="bg-white rounded-xl p-6 w-full max-w-md space-y-4 max-h-[90vh] overflow-y-auto">
-      <h2 class="text-xl font-bold">レバレッジ・マスター 〜メガ大家への道〜</h2>
-      <div><div class="font-bold text-sm mb-1">あなたの属性</div>
-        <select id="in-attr" class="w-full border rounded p-2">
-          <option value="employee">サラリーマン（信用度60）</option>
-          <option value="self">自営業（信用度10・行動力120）</option>
-        </select></div>
-      <div><div class="font-bold text-sm mb-1">年齢</div>
-        <input id="in-age" type="number" min="18" max="79" value="30" class="w-full border rounded p-2">
-        <div class="text-xs text-slate-400 mt-1">融資は80歳までに完済できる期間しか組めません。高齢になるほど融資の審査は厳しくなります。</div></div>
-      <div><div class="font-bold text-sm mb-1">月の余剰資金（給与等の手取りから生活費を引いた額。0〜500万円・後で変更可）</div>
-        <input id="in-salary" type="text" inputmode="numeric" class="w-full border rounded p-2"></div>
-      <div><div class="font-bold text-sm mb-1">種銭（0〜5,000万円）</div>
-        <input id="in-seed" type="text" inputmode="numeric" class="w-full border rounded p-2"></div>
-      <div><div class="font-bold text-sm mb-1">目標タイプ</div>
-        <div class="flex gap-2">
-          <label class="flex-1 border rounded p-2 text-sm text-center"><input type="radio" name="goaltype" value="networth" checked> 純資産</label>
-          <label class="flex-1 border rounded p-2 text-sm text-center"><input type="radio" name="goaltype" value="cashflow"> 月間CF</label>
-        </div></div>
-      <div><div class="font-bold text-sm mb-1">目標金額</div>
-        <div id="goal-presets" class="flex gap-2 text-xs"></div>
-        <input id="in-goalval" type="text" inputmode="numeric" class="w-full border rounded p-2 mt-1"></div>
-      <div><div class="font-bold text-sm mb-1">期限（年）<span id="years-max-hint" class="text-xs text-slate-400"></span></div>
-        <input id="in-years" type="number" min="1" value="20" class="w-full border rounded p-2"></div>
-      <button id="btn-start" class="w-full bg-navy text-white rounded py-2 font-bold">ゲーム開始</button>
-    </div>`));
+  const stars = Array.from({ length: 40 }, () =>
+    `<div class="absolute rounded-full bg-white" style="width:2px;height:2px;left:${(Math.random() * 100).toFixed(1)}%;top:${(Math.random() * 70).toFixed(1)}%;animation: ttl-tw ${(1.5 + Math.random() * 2.5).toFixed(1)}s ease-in-out ${(Math.random() * 2).toFixed(1)}s infinite alternate;"></div>`).join('');
+  const box = el(`<div class="fixed inset-0 flex flex-col items-center justify-center text-center overflow-hidden" style="background:radial-gradient(ellipse at 50% 120%, #1e3a5f 0%, #0f172a 55%, #020617 100%);">
+    <style>
+      @keyframes ttl-tw { from { opacity: 0.1; } to { opacity: 0.9; } }
+      @keyframes ttl-in { 0% { transform: scale(0.6); opacity: 0; } 60% { transform: scale(1.06); opacity: 1; } 100% { transform: scale(1); } }
+      @keyframes ttl-pulse { 0%,100% { opacity: 0.6; } 50% { opacity: 1; } }
+      @keyframes ttl-globe { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    </style>
+    ${stars}
+    <div class="text-7xl mb-4" style="animation: ttl-globe 60s linear infinite;">🌏</div>
+    <div style="animation: ttl-in 0.9s cubic-bezier(.2,1.3,.4,1) both;">
+      <div class="text-4xl md:text-5xl font-black tracking-widest"><span style="background:linear-gradient(180deg,#fde68a,#f59e0b);-webkit-background-clip:text;background-clip:text;color:transparent;">レバレッジ・マスター</span></div>
+      <div class="text-white/80 text-sm mt-2 tracking-[0.4em]">〜 メガ大家への道 〜</div>
+    </div>
+    <div class="mt-10 space-y-2 w-64">
+      ${hasSave ? `
+        <button id="ttl-continue" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-xl py-3 font-bold">▶ 続きから</button>
+        <button id="ttl-new" class="w-full border border-white/40 text-white/90 rounded-xl py-2.5 text-sm">🔁 最初からはじめる</button>`
+      : `<button id="ttl-start" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-xl py-3 font-bold text-lg" style="animation: ttl-pulse 1.6s ease-in-out infinite;">タップしてはじめる</button>`}
+    </div>
+    <div class="absolute bottom-4 text-white/40 text-[11px]">不動産投資リアルシミュレーション</div>
+  </div>`);
+  m.appendChild(box);
+  box.querySelector('#ttl-start')?.addEventListener('click', () => showSetup());
+  box.querySelector('#ttl-continue')?.addEventListener('click', () => { m.classList.add('hidden'); m.innerHTML = ''; render(); });
+  box.querySelector('#ttl-new')?.addEventListener('click', () => {
+    if (confirm('セーブデータを消して最初からはじめますか？')) { localStorage.removeItem(SAVE_KEY); location.reload(); }
+  });
+}
+
+// v3.7: 初回チュートリアル。先輩大家🧑‍🏫の吹き出しが基本動作を順番に案内（スキップ可・完了は端末に記録）。
+const TUTORIAL_STEPS = [
+  { target: 'btn-work', text: 'まずは💼「働く」で種銭を作ろう。長押しで連続で稼げるぞ。' },
+  { target: 'btn-open-search', text: '次は🏘️「物件を探す」。1回ごとに行動力1。何度も足を運ぶほど出物に近づく。' },
+  { target: 'btn-open-listings', text: '見つけた物件は🗂️市場一覧に並ぶ。「買付を検討」から満額か指値で申し込もう。指値は断られることもある。' },
+  { target: 'btn-open-listings', text: '支払いは現金一括か融資。融資なら頭金をスライダーで自由に決めて、4つの銀行の審査結果を見比べよう。' },
+  { target: 'btn-next-month-desk', text: '📅「翌月へ進む」と家賃が入り、行動力が全回復する。ここからは君の腕次第だ！' },
+];
+let tutIdx = -1, tutBubble = null;
+function startTutorial() { tutIdx = 0; renderTutStep(); }
+function endTutorial() {
+  localStorage.setItem('lm_tutorial_done', '1');
+  tutBubble?.remove(); tutBubble = null;
+  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl', 'ring-4', 'ring-amber-400'));
+  tutIdx = -1;
+}
+function renderTutStep() {
+  if (tutIdx < 0) return;
+  tutBubble?.remove(); tutBubble = null;
+  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl', 'ring-4', 'ring-amber-400'));
+  if (tutIdx >= TUTORIAL_STEPS.length) { endTutorial(); return; }
+  const stp = TUTORIAL_STEPS[tutIdx];
+  const target = document.getElementById(stp.target);
+  if (!target) { tutIdx += 1; renderTutStep(); return; }
+  target.classList.add('tut-hl', 'ring-4', 'ring-amber-400');
+  const r = target.getBoundingClientRect();
+  tutBubble = el(`<div class="fixed z-[65]" style="left:${Math.max(8, Math.round(r.left - 258))}px; top:${Math.max(8, Math.round(r.top - 10))}px; width:248px;">
+    <div class="bg-white rounded-xl shadow-2xl p-3 text-xs space-y-2 border-2 border-amber-400">
+      <div class="font-bold text-slate-800">🧑‍🏫 先輩大家（${tutIdx + 1}/${TUTORIAL_STEPS.length}）</div>
+      <div class="text-slate-700 leading-relaxed">${stp.text}</div>
+      <div class="flex gap-2">
+        <button class="tut-next flex-1 bg-amber-500 hover:bg-amber-600 text-white rounded py-1.5 font-bold">${tutIdx === TUTORIAL_STEPS.length - 1 ? 'はじめる！' : '次へ ▶'}</button>
+        <button class="tut-skip text-slate-500 px-2">スキップ</button>
+      </div></div></div>`);
+  document.body.appendChild(tutBubble);
+  tutBubble.querySelector('.tut-next').addEventListener('click', () => { tutIdx += 1; renderTutStep(); });
+  tutBubble.querySelector('.tut-skip').addEventListener('click', endTutorial);
+}
+
+// v3.7: 初期設定をウィザード形式（1問ずつ・フレーバー付き）に。最後に「あなたの物語」で確認してから開始。
+function showSetup() {
+  const m = document.getElementById('setup-modal');
+  m.classList.remove('hidden');
+  const data = { attr: 'employee', age: 30, seed: 10_000_000, goalType: 'networth', goalAmount: 100_000_000, years: 20,
+    tutorial: localStorage.getItem('lm_tutorial_done') !== '1' };
   const PRESETS = {
     networth: [[30_000_000, '3,000万'], [100_000_000, '1億'], [300_000_000, '3億']],
     cashflow: [[300_000, '30万'], [1_000_000, '100万'], [3_000_000, '300万']],
   };
-  const attrSel = m.querySelector('#in-attr');
-  const salaryInput = m.querySelector('#in-salary');
-  const seedInput = m.querySelector('#in-seed');
-  const ageInput = m.querySelector('#in-age');
-  const yearsInput = m.querySelector('#in-years');
-  const yearsHint = m.querySelector('#years-max-hint');
-  wireCommaInput(salaryInput, { min: L.CONFIG.salaryMin, max: L.CONFIG.salaryMax });
-  wireCommaInput(seedInput, { min: L.CONFIG.seedMin, max: L.CONFIG.seedMax });
-  wireCommaInput(m.querySelector('#in-goalval'), { min: 0, max: Infinity });
-  const applyDefaultSalary = () => setCommaValue(salaryInput, attrSel.value === 'employee' ? 150000 : 100000);
-  attrSel.addEventListener('change', applyDefaultSalary);
-  applyDefaultSalary();
-  setCommaValue(seedInput, 10_000_000);
-  const updateYearsCap = () => {
-    const age = Math.max(18, Math.min(79, Number(ageInput.value) || 30));
-    const maxYears = L.maxYearsForAge(age);
-    yearsInput.max = String(maxYears);
-    yearsHint.textContent = `（80歳までの上限 ${maxYears}年）`;
-    if (Number(yearsInput.value) > maxYears) yearsInput.value = maxYears;
-  };
-  ageInput.addEventListener('input', updateYearsCap);
-  updateYearsCap();
-  const renderPresets = () => {
-    const t = m.querySelector('input[name="goaltype"]:checked').value;
-    const box = m.querySelector('#goal-presets'); box.innerHTML = '';
-    PRESETS[t].forEach(([v, lab]) => {
-      const b = el(`<button class="flex-1 border rounded py-1">${lab}</button>`);
-      b.addEventListener('click', () => { setCommaValue(m.querySelector('#in-goalval'), v); });
-      box.appendChild(b);
+  let step = 0;
+  const TOTAL = 6;
+  const frame = (title, flavor, inner, opts = {}) => `
+    <div class="bg-white rounded-xl p-6 w-full max-w-md space-y-4 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between text-[11px] text-slate-500">
+        <span>あなたの物語 ${step + 1} / ${TOTAL}</span>
+        <span>${'●'.repeat(step + 1)}${'○'.repeat(TOTAL - step - 1)}</span></div>
+      <h2 class="text-lg font-bold">${title}</h2>
+      ${flavor ? `<div class="text-xs text-slate-500 italic">${flavor}</div>` : ''}
+      ${inner}
+      <div class="flex gap-2 pt-1">
+        ${step > 0 ? '<button id="wz-back" class="border rounded-lg px-4 py-2.5 text-sm">← 戻る</button>' : ''}
+        ${opts.noNext ? '' : `<button id="wz-next" class="flex-1 bg-navy text-white rounded-lg py-2.5 font-bold">${step === TOTAL - 1 ? 'この人生ではじめる ▶' : '次へ ▶'}</button>`}
+      </div></div>`;
+  const draw = () => {
+    m.innerHTML = '';
+    let inner = '', collect = () => true;
+    if (step === 0) {
+      inner = `<div class="grid grid-cols-1 gap-2">
+        <button class="wz-attr border-2 rounded-xl p-3 text-left ${data.attr === 'employee' ? 'border-navy bg-slate-50' : ''}" data-v="employee">
+          <div class="font-bold">💼 サラリーマン</div><div class="text-xs text-slate-600">信用度60・行動力100。<b>信用こそ融資の武器だ。</b></div></button>
+        <button class="wz-attr border-2 rounded-xl p-3 text-left ${data.attr === 'self' ? 'border-navy bg-slate-50' : ''}" data-v="self">
+          <div class="font-bold">🛠️ 自営業</div><div class="text-xs text-slate-600">信用度10・行動力120。<b>自由な時間は最大の資本。</b></div></button></div>`;
+      m.appendChild(el(frame('あなたは、何者だ？', '大家への道はここから始まる。', inner)));
+      m.querySelectorAll('.wz-attr').forEach(b => b.addEventListener('click', () => { data.attr = b.dataset.v; step = 1; draw(); }));
+      m.querySelector('#wz-next')?.addEventListener('click', () => { step = 1; draw(); });
+      return;
+    } else if (step === 1) {
+      inner = `<input id="wz-age" type="number" min="18" max="79" value="${data.age}" class="w-full border rounded p-2 text-lg font-bold text-center">
+        <div class="text-xs text-slate-500 mt-1">融資は80歳までに完済できる期間しか組めない。若さも、また資本。</div>`;
+      collect = () => { data.age = Math.max(18, Math.min(79, Number(m.querySelector('#wz-age').value) || 30)); return true; };
+      m.appendChild(el(frame('いくつになった？', '', inner)));
+    } else if (step === 2) {
+      inner = `<input id="wz-seed" type="text" inputmode="numeric" class="w-full border rounded p-2 text-lg font-bold text-right">
+        <div class="flex gap-1 text-xs mt-1">${[[1_000_000, '100万'], [10_000_000, '1,000万'], [30_000_000, '3,000万']].map(([v, l]) => `<button class="wz-seedp flex-1 border rounded py-1" data-v="${v}">${l}</button>`).join('')}</div>
+        <div class="text-xs text-slate-500 mt-1">これまで貯めた元手（0〜5,000万円）。足りない分は💼働いて稼げばいい。</div>`;
+      m.appendChild(el(frame('種銭は、いくらある？', '最初の一歩は種銭づくりから。', inner)));
+      const si = m.querySelector('#wz-seed');
+      wireCommaInput(si, { min: L.CONFIG.seedMin, max: L.CONFIG.seedMax });
+      setCommaValue(si, data.seed);
+      m.querySelectorAll('.wz-seedp').forEach(b => b.addEventListener('click', () => setCommaValue(si, Number(b.dataset.v))));
+      collect = () => { data.seed = parseCommaNumber(si.value); return true; };
+    } else if (step === 3) {
+      inner = `<div class="flex gap-2">
+          <label class="flex-1 border-2 rounded-xl p-2 text-sm text-center ${data.goalType === 'networth' ? 'border-navy bg-slate-50 font-bold' : ''}"><input type="radio" name="wz-goaltype" value="networth" ${data.goalType === 'networth' ? 'checked' : ''} class="mr-1">純資産</label>
+          <label class="flex-1 border-2 rounded-xl p-2 text-sm text-center ${data.goalType === 'cashflow' ? 'border-navy bg-slate-50 font-bold' : ''}"><input type="radio" name="wz-goaltype" value="cashflow" ${data.goalType === 'cashflow' ? 'checked' : ''} class="mr-1">月間CF</label></div>
+        <div id="wz-goalp" class="flex gap-1 text-xs mt-2"></div>
+        <input id="wz-goal" type="text" inputmode="numeric" class="w-full border rounded p-2 mt-1 text-lg font-bold text-right">
+        <div class="text-xs text-slate-500 mt-1">純資産＝資産から負債を引いた本当の財産。月間CF＝毎月の不労所得。</div>`;
+      m.appendChild(el(frame('目指す頂は？', '目標なき航海に、追い風は吹かない。', inner)));
+      const gi = m.querySelector('#wz-goal');
+      wireCommaInput(gi, { min: 0, max: Infinity });
+      const renderP = () => {
+        const box = m.querySelector('#wz-goalp'); box.innerHTML = '';
+        PRESETS[data.goalType].forEach(([v, l]) => {
+          const b = el(`<button class="flex-1 border rounded py-1">${l}</button>`);
+          b.addEventListener('click', () => setCommaValue(gi, v));
+          box.appendChild(b);
+        });
+      };
+      m.querySelectorAll('input[name="wz-goaltype"]').forEach(r => r.addEventListener('change', e => {
+        data.goalType = e.target.value; data.goalAmount = PRESETS[data.goalType][1][0]; setCommaValue(gi, data.goalAmount); renderP();
+      }));
+      renderP(); setCommaValue(gi, data.goalAmount);
+      collect = () => { data.goalAmount = Math.max(1, parseCommaNumber(gi.value)); return true; };
+    } else if (step === 4) {
+      const maxYears = L.maxYearsForAge(data.age);
+      if (data.years > maxYears) data.years = maxYears;
+      inner = `<input id="wz-years" type="number" min="1" max="${maxYears}" value="${data.years}" class="w-full border rounded p-2 text-lg font-bold text-center">
+        <div class="text-xs text-slate-500 mt-1">${data.age}歳なら80歳までの上限 ${maxYears}年。期限が迫るほど、融資の扉は狭くなる。</div>`;
+      m.appendChild(el(frame('期限は、何年？', '', inner)));
+      collect = () => { data.years = Math.max(1, Math.min(maxYears, Number(m.querySelector('#wz-years').value) || 1)); return true; };
+    } else {
+      const attrLabel = data.attr === 'employee' ? '💼サラリーマン' : '🛠️自営業';
+      inner = `<div class="bg-slate-50 rounded-xl p-4 text-sm leading-relaxed">
+          <b>${data.age}歳の${attrLabel}</b>、手元の種銭は<b>${L.yen(data.seed)}</b>。<br>
+          目標は <b>${data.goalType === 'networth' ? '純資産' : '月間CF'} ${L.yen(data.goalAmount)}</b> を <b>${data.years}年以内</b> に。<br>
+          さあ、メガ大家への道を歩みはじめよう。</div>
+        <label class="flex items-center gap-2 text-sm"><input id="wz-tut" type="checkbox" ${data.tutorial ? 'checked' : ''} class="w-4 h-4">🧑‍🏫 先輩大家のチュートリアルを見る（初めての方におすすめ）</label>`;
+      m.appendChild(el(frame('あなたの物語', '', inner)));
+      collect = () => { data.tutorial = m.querySelector('#wz-tut').checked; return true; };
+    }
+    m.querySelector('#wz-back')?.addEventListener('click', () => { step -= 1; draw(); });
+    m.querySelector('#wz-next')?.addEventListener('click', () => {
+      if (!collect()) return;
+      if (step < TOTAL - 1) { step += 1; draw(); return; }
+      state = L.createInitialState({ attr: data.attr, age: data.age, goalType: data.goalType,
+        goalAmount: data.goalAmount, goalYears: data.years, seedCash: data.seed });
+      m.classList.add('hidden'); m.innerHTML = ''; save(); render();
+      if (data.tutorial) startTutorial();
     });
-    setCommaValue(m.querySelector('#in-goalval'), PRESETS[t][1][0]);
   };
-  m.querySelectorAll('input[name="goaltype"]').forEach(r => r.addEventListener('change', renderPresets));
-  renderPresets();
-  m.querySelector('#btn-start').addEventListener('click', () => {
-    state = L.createInitialState({
-      attr: attrSel.value,
-      age: Math.max(18, Math.min(79, Number(ageInput.value) || 30)),
-      salaryMonthly: parseCommaNumber(salaryInput.value),
-      goalType: m.querySelector('input[name="goaltype"]:checked').value,
-      goalAmount: parseCommaNumber(m.querySelector('#in-goalval').value),
-      goalYears: Number(yearsInput.value) || 1,
-      seedCash: parseCommaNumber(seedInput.value),
-    });
-    m.classList.add('hidden'); save(); render();
-  });
+  draw();
 }
 
 function save(){ localStorage.setItem(SAVE_KEY, L.serialize(state)); }
@@ -1690,14 +2121,26 @@ function load(){
   if(!raw) return false;
   state = L.deserialize(raw);
   state.stats = state.stats || { buys: 0, sales: 0, profitSales: 0, junkFlips: 0, hadLoan: false };
+  state.stats.junkRepairs = state.stats.junkRepairs || 0;
   state.badges = state.badges || [];
   state.favorites = state.favorites || [];
   state.notifications = state.notifications || [];
   state.nextNotifId = state.nextNotifId || 1;
+  state.salesSearch = state.salesSearch || { spent: 0, threshold: null };   // v3: 営業進捗
+  state.nextPropertyId = state.nextPropertyId || 1;
+  // v3.5: 旧採番バグで衝突したIDを修復（一覧と詳細が別物件を指す不具合の根治）
+  const dd = L.dedupePropertyIds(state);
+  if (dd.fixed) { state = dd.state; console.info(`物件IDの重複を${dd.fixed}件修復しました`); }
   return true;
 }
 
-function render(){ setCityState(state); renderPanelLeft(); renderPanelRight(); checkEnd(); checkNewBadges(); save(); showExpFloats(); }
+// v3.5: ゲーム操作（購入・修繕・翌月など）のたびに地図のズーム・視点を初期状態へ戻す。
+// 地図側の操作（ドラッグ・ズーム・タップ）や「地図で場所を見る」はrender()を通らないため維持される。
+function render(){
+  setCityState(state); resetMapView(); renderPanelLeft(); renderPanelRight(); checkEnd(); checkNewBadges(); save(); showExpFloats();
+  document.getElementById('btn-result')?.classList.toggle('hidden', !state?.freePlay);   // v3.7: クリア後はいつでもリザルトへ
+  if (tutIdx >= 0) renderTutStep();   // v3.7: チュートリアル中は吹き出しを追従させる
+}
 
 function pushLog(msg){ state.log = state.log || []; state.log.unshift(msg); if(state.log.length>50) state.log.pop(); }
 function gainExp(skill, base){ state.skills[skill].exp += Math.round(base * (state.expMult||1)); }
@@ -1713,50 +2156,52 @@ function renderPanelLeft() {
   const risk = L.taxRiskLevelV2(state);
   const mcf = L.monthlyCF(state);
   c.appendChild(el(`
-    <div class="hud-panel pointer-events-auto rounded-lg shadow p-2 text-[11px] space-y-1">
-      <div class="text-[10px] text-slate-400">${Math.floor(state.month / 12)}年${state.month % 12}ヶ月・${state.age ?? '-'}歳</div>
-      <div class="grid grid-cols-2 gap-1">
-        <button class="kpi-btn text-left hover:bg-slate-100 rounded p-0.5" data-kpi="cash">💰<div class="font-bold truncate" id="hud-cash">${L.yen(state.cash)}</div></button>
-        <button class="kpi-btn text-left hover:bg-slate-100 rounded p-0.5" data-kpi="props">🏠<div class="font-bold">${state.properties.length}件</div></button>
-        <button class="kpi-btn text-left hover:bg-slate-100 rounded p-0.5" data-kpi="cf">📈<div class="font-bold truncate ${mcf >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(mcf)}</div></button>
-        <button class="kpi-btn text-left hover:bg-slate-100 rounded p-0.5" data-kpi="credit">📊<div class="font-bold">信用${state.creditScore}</div></button>
+    <div class="hud-panel pointer-events-auto rounded-xl bg-white/90 shadow-lg p-3 text-xs space-y-3">
+      <div class="flex justify-between items-center text-xs font-bold text-slate-800">
+        <div>📆 ${Math.floor(state.month / 12)}年${state.month % 12}ヶ月</div>
+        <div>${state.age ?? '-'}歳</div>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="cash">
+          <div class="text-[11px] font-bold text-slate-700">💰 現金</div>
+          <div class="font-bold truncate" id="hud-cash">${L.yen(state.cash)}</div>
+        </button>
+        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="props">
+          <div class="text-[11px] font-bold text-slate-700">🏠 物件</div>
+          <div class="font-bold">${state.properties.length}件</div>
+        </button>
+        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="cf">
+          <div class="text-[11px] font-bold text-slate-700">📈 月CF</div>
+          <div class="font-bold truncate ${mcf >= 0 ? 'text-emerald-600' : 'text-red-600'}">${L.yen(mcf)}</div>
+        </button>
+        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="credit">
+          <div class="text-[11px] font-bold text-slate-700">📊 信用度</div>
+          <div class="font-bold">${state.creditScore}</div>
+        </button>
+      </div>
+      <div class="border-t pt-2">
+        <div class="flex justify-between text-[11px] font-bold text-slate-700 mb-1"><span>🎯 目標達成度</span><span>${pct}%</span></div>
+        <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden"><div class="bg-emerald-500 h-2 rounded-full" style="width:${pct}%"></div></div>
+      </div>
+      <button id="btn-bs-toggle" class="w-full text-[11px] font-bold text-slate-700 underline">${bsDetailOpen ? '▲ バランスシートを閉じる' : '▶ バランスシート詳細'}</button>
+      <div id="bs-detail" class="space-y-1 text-xs border-t pt-2 ${bsDetailOpen ? '' : 'hidden'}">
+        <div class="flex justify-between"><span>純資産</span><b class="text-emerald-700">${L.yen(L.netWorth(state))}</b></div>
+        <div class="flex justify-between"><span>総資産</span><b>${L.yen(L.totalAssetsV2(state))}</b></div>
+        <div class="flex justify-between"><span>総負債</span><b class="text-red-600">${L.yen(L.totalDebt(state))}</b></div>
+        <div class="flex justify-between"><span>税リスク</span><span class="${risk === '低' ? 'text-blue-600' : risk === '中' ? 'text-yellow-600' : 'text-red-600'} font-bold">${risk}</span></div>
       </div>
     </div>
   `));
   c.querySelectorAll('.kpi-btn').forEach(b => b.addEventListener('click', () => openKpiModal(b.dataset.kpi)));
-  c.appendChild(el(`
-    <div class="hud-panel pointer-events-auto rounded-lg shadow p-2 text-[11px]">
-      🎯 ${pct}% 達成
-      <div class="w-full bg-slate-200 rounded h-1.5 mt-1"><div class="bg-emerald h-1.5 rounded" style="width:${pct}%"></div></div>
-      <button id="btn-bs-toggle" class="text-[10px] text-slate-400 underline mt-1">${bsDetailOpen ? '▲ 閉じる' : '▶ 詳細'}</button>
-      <div id="bs-detail" class="mt-1 space-y-1 max-h-32 overflow-y-auto ${bsDetailOpen ? '' : 'hidden'}">
-        <div>純資産 <b>${L.yen(L.netWorth(state))}</b></div>
-        <div>総資産 <b>${L.yen(L.totalAssetsV2(state))}</b></div>
-        <div>総負債 <b>${L.yen(L.totalDebt(state))}</b></div>
-        <div>税リスク <span class="${risk === '低' ? 'bg-blue-100 text-blue-700' : risk === '中' ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'} rounded px-1">${risk}</span></div>
-        <div class="border-t pt-1">給与 <b>${L.yen(state.salary)}</b>
-          <div class="flex gap-1 mt-1">
-            <input id="in-salary-edit" type="text" inputmode="numeric" class="flex-1 min-w-0 border rounded px-1 py-0.5 text-[10px]" value="${Number(state.salary).toLocaleString('en-US')}">
-            <button id="btn-salary-apply" class="border rounded px-1 text-[10px] shrink-0">変更</button>
-          </div></div>
-      </div>
-    </div>
-  `));
   c.querySelector('#btn-bs-toggle').addEventListener('click', () => { bsDetailOpen = !bsDetailOpen; renderPanelLeft(); });
-  const salaryInput = c.querySelector('#in-salary-edit');
-  salaryInput.addEventListener('input', () => {
-    const digits = salaryInput.value.replace(/[^\d]/g, '');
-    salaryInput.value = digits ? Number(digits).toLocaleString('en-US') : '';
-  });
-  c.querySelector('#btn-salary-apply').addEventListener('click', () => {
-    const n = Number(salaryInput.value.replace(/[^\d]/g, '')) || 0;
-    const r = L.changeSalary(state, n);
-    state = r.state; pushLog(`月の余剰資金を ${L.yen(state.salary)} に変更した`); save(); render();
-  });
 }
 
+// v3.5: 売却センターの一括査定モード状態（モーダルをHUDから開き直すとリセット）
+let bulkMode = false;
+
 // 左上の4KPIアイコン（💰🏠📈📊）をタップすると、それぞれの内訳・詳細を表示する。
-function openKpiModal(which) {
+function openKpiModal(which, keepBulk = false) {
+  if (which === 'props' && !keepBulk) bulkMode = false;
   const m = document.getElementById('kpi-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
@@ -1768,17 +2213,47 @@ function openKpiModal(which) {
       <tr class="border-t"><td>総資産（現金＋物件時価）</td><td class="text-right">${L.yen(L.totalAssetsV2(state))}</td></tr>
       <tr><td>総負債（残債）</td><td class="text-right text-red-600">-${L.yen(L.totalDebt(state))}</td></tr>
       <tr class="border-t font-bold"><td>純資産</td><td class="text-right text-emerald">${L.yen(L.netWorth(state))}</td></tr>
-      <tr class="border-t"><td>月の余剰資金（給与等）</td><td class="text-right">${L.yen(state.salary)}</td></tr>
-    </table>`;
+    </table>
+    ${!state.isIncorporated ? `<div class="mt-4 pt-4 border-t">
+      <h3 class="font-bold text-sm mb-1">🏢 法人化</h3>
+      <p class="text-[11px] text-slate-500 mb-2">設立費用 ${L.yen(L.CONFIG.corporateSetupCost)}。以降、NOIへの課税が法人税率（${L.CONFIG.corporateTaxRate * 100}%）に固定されます。</p>
+      <button id="btn-incorporate" class="w-full bg-navy text-white rounded py-2 text-sm ${state.cash < L.CONFIG.corporateSetupCost ? 'opacity-40' : ''}" ${state.cash < L.CONFIG.corporateSetupCost ? 'disabled' : ''}>法人を設立する</button>
+    </div>` : '<div class="mt-4 pt-4 border-t text-sm font-bold text-navy">🏢 法人化済み</div>'}`;
   } else if (which === 'props') {
-    title = `🏠 所有物件（${state.properties.length}件）`;
-    body = state.properties.length ? `<div class="space-y-1">${state.properties.map(p => {
+    // v3.5: 売却センター。名義・売出中・修繕中・入居状況をバッジで常時表示し、複数まとめて査定できる。
+    const corpN = state.properties.filter(p => p.owner === 'corp').length;
+    const persN = state.properties.length - corpN;
+    title = `🏠 所有物件・売却センター（${state.properties.length}件）`;
+    const header = state.properties.length ? `
+      <div class="flex items-center justify-between text-xs mb-1">
+        <div class="font-bold text-slate-700">👤個人${persN}件 ・ 🏢法人${corpN}件</div>
+        <button id="kpi-bulk-toggle" class="border rounded px-2 py-1 font-bold ${bulkMode ? 'bg-navy text-white' : 'text-navy'}">${bulkMode ? '✕ まとめて査定を終了' : '☑ まとめて査定'}</button>
+      </div>
+      ${bulkMode ? '<div class="text-[11px] text-slate-500 mb-1">査定したい物件にチェック → 下の「査定する」（1件につき行動力-5）</div>' : ''}` : '';
+    body = state.properties.length ? `${header}<div class="space-y-1">${state.properties.map(p => {
       const occ = p.units.length ? Math.round(p.units.filter(u => u.occupied).length / p.units.length * 100) : 0;
-      const alert = p.repairState < 20 ? ' <span class="text-red-600">⚠️要修繕</span>' : '';
-      return `<button class="kpi-prop w-full text-left border rounded p-2 text-xs hover:bg-slate-50" data-id="${p.id}">
-        <div class="font-bold">${p.name || p.label}</div>
-        <div class="text-slate-500">${p.label}｜利回り${(p.grossYield * 100).toFixed(1)}%・修繕度${p.repairState}%・入居${occ}%${alert}</div></button>`;
-    }).join('')}</div>` : '<div class="text-slate-400 text-sm">まだ物件を所有していません。営業→買付で増やしましょう。</div>';
+      const listing = (state.listings || []).find(l => l.propertyId === p.id);
+      const badges = [
+        p.owner === 'corp' ? '<span class="bg-navy text-white rounded px-1">🏢法人</span>' : '<span class="bg-slate-200 text-slate-700 rounded px-1">👤個人</span>',
+        listing ? `<span class="bg-amber-500 text-white rounded px-1">📢売出中${listing.listedMonths + 1}ヶ月目</span>` : '',
+        p.repairJob ? `<span class="bg-amber-100 text-amber-700 rounded px-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : '',
+        (!p.repairJob && p.repairState < 20) ? '<span class="bg-red-100 text-red-700 rounded px-1">⚠️要修繕</span>' : '',
+        occ >= 100 ? '<span class="bg-emerald-100 text-emerald-700 rounded px-1">満室</span>' : `<span class="bg-slate-100 text-slate-600 rounded px-1">入居${occ}%</span>`,
+      ].filter(Boolean).join(' ');
+      const la = p.lastAppraisal;   // v3.6: 査定結果は物件に保存され、一覧に残り続ける
+      const laAge = la ? (state.month - la.month === 0 ? '今月' : `${state.month - la.month}ヶ月前`) : '';
+      return `<div class="w-full border rounded p-2 text-xs ${bulkMode ? '' : 'hover:bg-slate-50'}">
+        <div class="kpi-prop flex items-center gap-2 ${bulkMode ? '' : 'cursor-pointer'}" data-id="${p.id}">
+          ${bulkMode ? `<input type="checkbox" class="kpi-check w-4 h-4 shrink-0" data-id="${p.id}">` : ''}
+          ${renderBuildingSVG(p, 'w-10 h-10')}
+          <div class="min-w-0 flex-1"><div class="font-bold">${p.name || p.label}</div>
+          <div class="text-slate-500">${p.label}｜利回り${(p.grossYield * 100).toFixed(1)}%・修繕度${p.repairState}%</div>
+          <div class="mt-0.5 space-x-1 text-[11px]">${badges}</div></div>
+        </div>
+        ${la ? `<div class="mt-1 pt-1 border-t flex items-center justify-between"><span>査定額 <b class="text-emerald-700">${L.yen(la.amount)}</b> <span class="text-slate-500">（${laAge}）</span></span><button class="kpi-sell bg-emerald text-white rounded px-2 py-1" data-id="${p.id}">売出設定へ</button></div>` : ''}
+      </div>`;
+    }).join('')}</div>
+    ${bulkMode ? '<button id="kpi-bulk-run" class="w-full bg-navy text-white rounded py-2 text-sm font-bold mt-2">🔍 チェックした物件をまとめて査定する</button>' : ''}` : '<div class="text-slate-500 text-sm">まだ物件を所有していません。営業→買付で増やしましょう。</div>';
   } else if (which === 'cf') {
     title = '📈 月間キャッシュフロー内訳';
     const total = L.monthlyCF(state);
@@ -1786,9 +2261,9 @@ function openKpiModal(which) {
       const cf = p.history.at(-1)?.cf ?? 0;
       return `<tr class="border-t"><td>${p.name || p.label}</td><td class="text-right ${cf >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(cf)}</td></tr>`;
     }).join('');
-    body = `<table class="w-full text-sm">${rows || '<tr><td class="text-slate-400 py-2">まだ物件収支の記録がありません（買付後、翌月から計上）</td></tr>'}
+    body = `<table class="w-full text-sm">${rows || '<tr><td class="text-slate-500 py-2">まだ物件収支の記録がありません（買付後、翌月から計上）</td></tr>'}
       <tr class="border-t-2 font-bold"><td>物件からの月CF合計</td><td class="text-right ${total >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(total)}</td></tr></table>
-      <div class="text-[11px] text-slate-400 mt-2">※ 給与等の余剰資金（${L.yen(state.salary)}/月）は上記CFとは別枠で手元現金に加算されます。</div>`;
+      <div class="text-[11px] text-slate-500 mt-2">※ 種銭は「💼 働く」で行動力を使って稼げます（自動では増えません）。</div>`;
   } else if (which === 'credit') {
     title = '📊 信用度と銀行取引実績';
     const rel = state.bankRelations || {};
@@ -1797,7 +2272,7 @@ function openKpiModal(which) {
       return `<tr class="border-t"><td>${L.BANKS[k].label}</td><td class="text-right">融資${r.loans}件・完済${r.paidOff}件</td></tr>`;
     }).join('');
     body = `<div class="text-sm mb-2">現在の信用度: <b>${state.creditScore}</b></div>
-      <div class="text-[11px] text-slate-400 mb-1">信用度が高いほど審査に通りやすく、取引実績（完済）が増えると金利優遇を受けやすくなります。</div>
+      <div class="text-[11px] text-slate-500 mb-1">信用度が高いほど審査に通りやすく、取引実績（完済）が増えると金利優遇を受けやすくなります。</div>
       <table class="w-full text-sm">${bankRows}</table>`;
   }
   const boxEl = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2">
@@ -1805,7 +2280,53 @@ function openKpiModal(which) {
     <div>${body}</div></div>`);
   m.appendChild(boxEl);
   boxEl.querySelector('#kpi-close').addEventListener('click', close);
-  boxEl.querySelectorAll('.kpi-prop').forEach(b => b.addEventListener('click', () => { close(); openDetail(Number(b.dataset.id), 'owned', () => openKpiModal('props')); }));
+  if (which === 'cash' && !state.isIncorporated && state.cash >= L.CONFIG.corporateSetupCost) {
+    boxEl.querySelector('#btn-incorporate').addEventListener('click', () => {
+      const r = L.incorporate(state);
+      state = r.state;
+      pushLog('🏢 法人を設立した（法人名義の購入・法人への移転が可能に）');
+      save(); render(); close();
+      playIncorporationCelebration();
+    });
+  }
+  boxEl.querySelectorAll('.kpi-prop').forEach(b => b.addEventListener('click', () => {
+    if (bulkMode) return;   // まとめて査定中は行クリックで詳細を開かない（チェック操作を優先）
+    close(); openDetail(parsePropId(b.dataset.id), 'owned', () => openKpiModal('props', true)); }));
+  boxEl.querySelector('#kpi-bulk-toggle')?.addEventListener('click', () => {
+    bulkMode = !bulkMode; close(); openKpiModal('props', true);
+  });
+  boxEl.querySelector('#kpi-bulk-run')?.addEventListener('click', () => {
+    const ids = [...boxEl.querySelectorAll('.kpi-check')].filter(c => c.checked).map(c => parsePropId(c.dataset.id));
+    if (!ids.length) { alert('査定したい物件にチェックを入れてください'); return; }
+    const cost = ids.length * 5;
+    if (state.actionPower < cost) { alert(`行動力が足りません（${ids.length}件で${cost}必要）`); return; }
+    ids.forEach(id => { const r = L.requestAppraisal(state, id, Math.random); state = r.state; });
+    pushLog(`まとめて査定を依頼した（${ids.length}件・行動力-${cost}）`);
+    save(); renderPanelRight();
+    close(); openKpiModal('props', true);
+  });
+  boxEl.querySelectorAll('.kpi-sell').forEach(b => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const id = parsePropId(b.dataset.id);
+    const pp = state.properties.find(x => x.id === id);
+    if (!pp?.lastAppraisal) return;
+    close();
+    openSellWithAppraisal(id, pp.lastAppraisal.amount);
+  }));
+}
+
+// v3.5: 一括査定の結果から直接売出設定へ（査定は取得済み。既に売出中なら管理画面へ）
+// v3.6: 売り出し後・戻るボタンで売却センターへ戻る
+function openSellWithAppraisal(propId, appraisal) {
+  const p = state.properties.find(x => x.id === propId);
+  if (!p) return;
+  const m = document.getElementById('sell-modal');
+  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
+  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const back = () => openKpiModal('props', true);
+  const listing = (state.listings || []).find(l => l.propertyId === propId);
+  if (listing) { drawListingManage(m, p, listing, close); return; }
+  drawPricing(m, p, appraisal, close, back);
 }
 
 // back を渡すと「← 戻る」を表示し、閉じたあと元のモーダルへ戻れる（別モーダルから開いた場合の重なりも解消）。
@@ -1819,19 +2340,25 @@ function openDetail(propId, from, back) {
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   const draw = () => {
     m.innerHTML = '';
+    const repairing = from === 'owned' && p.repairJob;
     const footer = from === 'owned' ? `<div class="p-2 border-t flex gap-2">
-        <button class="dt-diy flex-1 border rounded py-1.5 text-sm" ${p.repairState >= 100 ? 'disabled' : ''}>🖌️ DIY(-30)</button>
-        <button class="dt-repair flex-1 border rounded py-1.5 text-sm" ${p.repairState >= 100 ? 'disabled' : ''}>業者修繕</button>
+        ${repairing ? `<div class="flex-[2] text-center text-xs text-amber-600 font-bold py-1.5">🔨 修繕中（残り${p.repairJob.monthsLeft}ヶ月）</div>` : `
+        <button class="dt-diy flex-1 border rounded py-1.5 text-sm" ${p.repairState >= 100 ? 'disabled' : ''}>🖌️ DIY(-${L.repairTierInfo(p).diyCost})</button>
+        <button class="dt-repair flex-1 border rounded py-1.5 text-sm" ${p.repairState >= 100 ? 'disabled' : ''}>業者修繕</button>`}
         <button class="dt-sell flex-1 border rounded py-1.5 text-sm">売却</button></div>` : '';
     const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
       <div class="p-3 border-b shrink-0">
         <div class="flex justify-between items-center mb-1">
           ${back ? '<button id="dt-back" class="text-xs text-navy">← 戻る</button>' : '<span></span>'}
-          <button id="dt-close" class="text-slate-400 text-xl leading-none">✕</button></div>
+          <div class="flex items-center gap-3">
+            ${from === 'market' ? `<button id="dt-fav" class="text-2xl leading-none text-amber-500" title="お気に入り">${(state.favorites || []).some(f => f.propertyId === p.id) ? '★' : '☆'}</button>` : ''}
+            <button id="dt-close" class="text-slate-400 text-xl leading-none">✕</button>
+          </div></div>
         <div class="flex items-center gap-2">${renderBuildingSVG(p, 'w-14 h-14')}
-          <div class="min-w-0"><div class="font-bold truncate">${p.name || p.label}</div><div class="text-[11px] text-slate-400">${p.label}</div></div></div>
+          <div class="min-w-0"><div class="font-bold truncate">${p.name || p.label} ${from === 'owned' ? `<span class="text-[11px] align-middle ${p.owner === 'corp' ? 'bg-navy text-white' : 'bg-slate-200 text-slate-700'} rounded px-1.5 py-0.5">${p.owner === 'corp' ? '🏢法人' : '👤個人'}</span>` : ''}</div><div class="text-[11px] text-slate-500">${p.label}</div></div></div>
       </div>
-      <div class="flex border-b text-sm shrink-0">${tabs.map((t, i) => `<button class="dt-tab flex-1 py-2 ${i === active ? 'border-b-2 border-navy font-bold' : 'text-slate-400'}" data-i="${i}">${t}</button>`).join('')}</div>
+      ${from === 'market' ? `<div class="px-3 py-2 border-b shrink-0"><button id="dt-buy" class="w-full bg-navy hover:bg-navy-dark text-white rounded-lg py-2 text-sm font-bold shadow">💰 この物件に買付を入れる（行動力-10）</button></div>` : ''}
+      <div class="flex border-b text-sm shrink-0">${tabs.map((t, i) => `<button class="dt-tab flex-1 py-2 ${i === active ? 'border-b-2 border-navy font-bold' : 'text-slate-500'}" data-i="${i}">${t}</button>`).join('')}</div>
       <div id="dt-body" class="p-4 text-sm overflow-y-auto min-h-0 flex-1"></div>
       ${footer}</div>`);
     m.appendChild(box);
@@ -1839,15 +2366,33 @@ function openDetail(propId, from, back) {
     if (back) box.querySelector('#dt-back').addEventListener('click', () => { close(); back(); });
     box.querySelectorAll('.dt-tab').forEach(b => b.addEventListener('click', () => { active = Number(b.dataset.i); draw(); }));
     const body = box.querySelector('#dt-body');
-    if (active === 0) body.innerHTML = overviewTab(p, from);
+    if (active === 0) {
+      body.innerHTML = overviewTab(p, from);
+      body.querySelector('.dt-map-jump')?.addEventListener('click', () => { close(); jumpToMapWithBubble(p, from); });
+      body.querySelector('.dt-to-corp')?.addEventListener('click', () => { close(); openCorpTransfer(p.id); });
+    }
     if (active === 1) { body.innerHTML = rentRollTab(p, from); wireFillButtons(body, p, from); }
     if (active === 2) body.innerHTML = plTab(p);
     if (active === 3) body.innerHTML = financeTab(p);
     if (from === 'owned') {
-      box.querySelector('.dt-diy').addEventListener('click', () => { close(); openDiyGame(p.id); });
-      box.querySelector('.dt-repair').addEventListener('click', () => { close(); openRepairService(p.id); });
+      box.querySelector('.dt-diy')?.addEventListener('click', () => { close(); openDiyGame(p.id); });
+      box.querySelector('.dt-repair')?.addEventListener('click', () => { close(); openRepairService(p.id); });
       box.querySelector('.dt-sell').addEventListener('click', () => { close(); openSell(p.id); });
     }
+    // v3.1: 市場物件はタブの上の固定「買付」ボタンからいつでも買付へ（買付画面から「戻る」でここへ戻れる）
+    box.querySelector('#dt-buy')?.addEventListener('click', () => { close(); openPurchase(p.id, () => openDetail(propId, from, back)); });
+    // v3.3: 詳細画面からお気に入りをトグル（★は地図の⭐表示にも即反映）
+    box.querySelector('#dt-fav')?.addEventListener('click', () => {
+      const fav = (state.favorites || []).some(f => f.propertyId === p.id);
+      if (fav) {
+        state = L.removeFavorite(state, p.id).state;
+      } else {
+        const r = L.addFavorite(state, p.id);
+        if (!r.added) { if (r.reason === 'limit') alert(`お気に入りは最大${L.FAVORITE_LIMIT}件までです`); return; }
+        state = r.state;
+      }
+      save(); render(); draw();
+    });
   };
   draw();
 }
@@ -1855,7 +2400,7 @@ function openDetail(propId, from, back) {
 // 修繕度ゲージ: 緑(60%以上)→黄(20〜59%)→赤(20%未満)で一目で分かる。20%割れは管理会社アラートを併記。
 function repairGauge(pct) {
   const color = pct >= 60 ? 'bg-emerald' : pct >= 20 ? 'bg-yellow-400' : 'bg-red-500';
-  const warn = pct < 20 ? '<span class="text-red-600 text-[10px] ml-1">⚠️管理会社から修繕依頼</span>' : '';
+  const warn = pct < 20 ? '<span class="text-red-600 text-[11px] font-bold ml-1">⚠️管理会社から修繕依頼</span>' : '';
   return `<span class="inline-flex items-center gap-1 align-middle">
     <span class="inline-block w-24 bg-slate-200 rounded h-2 overflow-hidden"><span class="${color} block h-2" style="width:${Math.max(0, Math.min(100, pct))}%"></span></span>
     <b>${pct}%</b>${warn}</span>`;
@@ -1873,39 +2418,43 @@ function noiTable(p) {
 }
 
 function overviewTab(p, from) {
-  // 所有物件は「日々の管理ダッシュボード」（現況入居率・直近月CF・現在時価・購入時比較）を主表示にする。
+  const svg = renderBuildingSVG(p, 'w-24 h-24 mb-2');
   if (from === 'owned') {
     const occN = p.units.filter(u => u.occupied).length, occ = p.units.length ? Math.round(occN / p.units.length * 100) : 0;
     const lastCf = p.history.at(-1)?.cf;
     const gain = (p.timeValue || 0) - (p.boughtPrice || 0);
-    return `<div class="space-y-1">
-      <div class="text-[11px] text-slate-400">日々の管理ダッシュボード（現況ベース）</div>
-      <div class="grid grid-cols-2 gap-1 text-xs">
-        <div class="border rounded p-1">現況入居率<div class="font-bold ${occ >= 100 ? 'text-emerald' : occ > 0 ? 'text-amber-600' : 'text-red-600'}">${occ}%（${occN}/${p.units.length}戸）</div></div>
-        <div class="border rounded p-1">直近の月CF<div class="font-bold ${(lastCf ?? 0) >= 0 ? 'text-emerald' : 'text-red-600'}">${lastCf == null ? '—' : L.yen(lastCf)}</div></div>
-        <div class="border rounded p-1">現在の時価<div class="font-bold">${L.yen(p.timeValue)}</div></div>
-        <div class="border rounded p-1">購入時との差<div class="font-bold ${gain >= 0 ? 'text-emerald' : 'text-red-600'}">${gain >= 0 ? '+' : ''}${L.yen(gain)}</div></div>
+    return `<div class="flex flex-col items-center">${svg}</div>
+      <div class="space-y-2">
+      <div class="grid grid-cols-2 gap-2 text-xs">
+        <div class="bg-slate-50 rounded-lg p-2">現況入居率<div class="font-bold ${occ >= 100 ? 'text-emerald-600' : occ > 0 ? 'text-amber-600' : 'text-red-600'}">${occ}%</div></div>
+        <div class="bg-slate-50 rounded-lg p-2">直近月CF<div class="font-bold ${(lastCf ?? 0) >= 0 ? 'text-emerald-600' : 'text-red-600'}">${lastCf == null ? '—' : L.yen(lastCf)}</div></div>
+        <div class="bg-slate-50 rounded-lg p-2">現在の時価<div class="font-bold">${L.yen(p.timeValue)}</div></div>
+        <div class="bg-slate-50 rounded-lg p-2">購入差額<div class="font-bold ${gain >= 0 ? 'text-emerald-600' : 'text-red-600'}">${gain >= 0 ? '+' : ''}${L.yen(gain)}</div></div>
       </div>
-      <div class="flex items-center gap-1">🔧 修繕度 ${repairGauge(p.repairState)}</div>
-      <div>${p.structure}造・築${p.builtAge}年・${p.units.length}戸／残存償却 ${p.deprRemaining}ヶ月 ${p.deprRemaining === 0 ? '⚠️デッドクロス中' : ''}</div>
-      <div class="text-[11px] text-slate-400">購入時 ${L.yen(p.boughtPrice)}（${Math.floor((p.boughtMonth ?? 0) / 12)}年${(p.boughtMonth ?? 0) % 12}ヶ月目に取得）</div>
-      ${p.junkFlags.length ? `<div class="text-red-600">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
+      <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">🔧 修繕度 ${repairGauge(p.repairState)}${p.repairJob ? `<span class="text-amber-600 font-bold ml-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : ''}</div>
+      <div class="text-xs text-slate-600">${p.structure}造・築${p.builtAge}年・${p.units.length}戸／残存償却 ${p.deprRemaining}ヶ月</div>
+      ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
+      <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>名義</span><b>${p.owner === 'corp' ? '🏢 法人' : '👤 個人'}</b></div>
+      ${p.lastAppraisal ? `<div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>査定額（参考）</span><b>${L.yen(p.lastAppraisal.amount)} <span class="text-slate-500 font-normal">（${state.month - p.lastAppraisal.month === 0 ? '今月' : `${state.month - p.lastAppraisal.month}ヶ月前`}）</span></b></div>` : ''}
+      ${(state.isIncorporated && p.owner !== 'corp') ? `<button class="dt-to-corp w-full border border-navy text-navy rounded-lg py-2 text-xs font-bold hover:bg-slate-50 ${(p.loan || p.reformLoan) ? 'opacity-40' : ''}" ${(p.loan || p.reformLoan) ? 'disabled' : ''}>🏢 法人へ売却（移転）${(p.loan || p.reformLoan) ? '｜ローン完済後に可能' : ''}</button>` : ''}
+      <button class="dt-map-jump w-full border rounded-lg py-2 text-xs text-navy font-bold hover:bg-slate-50">📍 地図で場所を見る</button>
       ${noiTable(p)}</div>`;
   }
-  // 市場物件は売出情報を主表示。
   const cut = p.origPrice && p.price < p.origPrice;
-  return `<div class="space-y-1">
-    <div>売出価格: ${cut ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}<b>${L.yen(p.price)}</b>${cut ? ' <span class="text-[10px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}</div>
-    <div>${p.structure}造・築${p.builtAge}年・${p.units.length}戸</div>
-    <div class="flex items-center gap-1">🔧 修繕度 ${repairGauge(p.repairState)}</div>
-    <div>残存償却: ${p.deprRemaining}ヶ月 ${p.deprRemaining === 0 ? '⚠️デッドクロス中' : ''}</div>
-    ${p.junkFlags.length ? `<div class="text-red-600">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
+  return `<div class="flex flex-col items-center">${svg}</div>
+    <div class="space-y-2 text-sm">
+    <div class="font-bold text-center">売出価格: ${cut ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> ` : ''}<span class="text-emerald-700 text-lg">${L.yen(p.price)}</span></div>
+    <div class="text-center text-xs text-slate-500">${p.structure}造・築${p.builtAge}年・${p.units.length}戸</div>
+    <div class="flex items-center justify-center text-xs p-2 bg-slate-50 rounded-lg">🔧 修繕度 ${repairGauge(p.repairState)}</div>
+    ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold text-center">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
+    ${p.sellerUrgency ? `<div class="text-xs text-rose-600 font-bold text-center">🏃 売り急ぎ: ${p.sellerUrgency.reason}そうだ</div>` : ''}
+    <button class="dt-map-jump w-full border rounded-lg py-2 text-xs text-navy font-bold hover:bg-slate-50">📍 地図で場所を見る</button>
     ${noiTable(p)}</div>`;
 }
 
 function rentRollTab(p, from) {
   return `<table class="w-full text-xs">
-    <tr class="text-slate-400"><th class="text-left">部屋</th><th>家賃</th><th>状況</th><th></th></tr>
+    <tr class="text-slate-500"><th class="text-left">部屋</th><th>家賃</th><th>状況</th><th></th></tr>
     ${p.units.map((u, i) => `<tr class="border-t"><td>${i + 1}号室</td><td class="text-center">${L.yen(u.rent)}</td>
       <td class="text-center">${u.occupied ? '<span class="text-emerald">入居中</span>' : `<span class="text-red-600">空室${u.vacantMonths}ヶ月</span>`}</td>
       <td class="text-right">${!u.occupied && from === 'owned' ? `<button class="fill-ad text-xs border rounded px-1" data-i="${i}">広告料(家賃1ヶ月)</button>
@@ -1914,12 +2463,12 @@ function rentRollTab(p, from) {
 }
 
 function plTab(p) {
-  if (!p.history.length) return '<div class="text-slate-400">購入後、月が進むと収支が記録されます。</div>';
+  if (!p.history.length) return '<div class="text-slate-500">購入後、月が進むと収支が記録されます。</div>';
   const equity = p.boughtPrice ? p.boughtPrice - (p.loan ? p.loan.principal : 0) + Math.round(p.boughtPrice * L.CONFIG.closingCostRate) : 0;
   const ccr = equity > 0 ? (p.cum.cf / equity * 100).toFixed(1) : '-';
   return `<div class="mb-1">累計CF: <b class="${p.cum.cf >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(p.cum.cf)}</b>（${p.cum.months}ヶ月）／ 自己資金回収率 ${ccr}%</div>
     <div class="max-h-60 overflow-y-auto"><table class="w-full text-xs">
-    <tr class="text-slate-400"><th>月</th><th>家賃</th><th>空室損</th><th>運営費</th><th>利息</th><th>元金</th><th>税</th><th>CF</th></tr>
+    <tr class="text-slate-500"><th>月</th><th>家賃</th><th>空室損</th><th>運営費</th><th>利息</th><th>元金</th><th>税</th><th>CF</th></tr>
     ${[...p.history].reverse().map(h => `<tr class="border-t"><td>${h.month}</td><td>${L.yen(h.rentIn)}</td><td>${L.yen(h.vacancyLoss)}</td>
       <td>${L.yen(h.opex)}</td><td>${L.yen(h.interest)}</td><td>${L.yen(h.principal)}</td><td>${L.yen(h.tax)}</td>
       <td class="${h.cf >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(h.cf)}</td></tr>`).join('')}
@@ -1934,7 +2483,7 @@ function financeTab(p) {
       <div>残債: <b>${L.yen(rem)}</b></div></div>`;
   }
   const rs = L.reviewAllBanks(p, p.price, 0.2, state);
-  return `<div class="text-xs text-slate-400 mb-1">頭金2割とした場合の事前審査見込み:</div>` + bankReviewList(rs);
+  return `<div class="text-xs text-slate-500 mb-1">頭金2割とした場合の事前審査見込み:</div>` + bankReviewList(rs);
 }
 
 function bankReviewList(rs) {
@@ -1964,42 +2513,131 @@ function openPurchase(propId, back) {
   const m = document.getElementById('purchase-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const blocked = p.refusedOffer && !p.staleFlag;   // 指値を断られた物件（満額は常に可）
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
     <div class="flex justify-between items-center gap-2">
       ${back ? '<button id="of-back" class="text-xs text-navy">← 戻る</button>' : '<span></span>'}
       <button id="of-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
-    <div><h2 class="font-bold">${p.name || p.label} に買付を入れる（行動力-10）</h2><div class="text-[11px] text-slate-400">${p.label}</div></div>
-    <div class="text-sm">売出価格: ${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}<b>${L.yen(p.price)}</b>${p.origPrice && p.price < p.origPrice ? ' <span class="text-[10px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}${p.staleFlag ? '（売れ残り中・指値チャンス）' : ''}</div>
+    <div><h2 class="font-bold">${p.name || p.label} に買付を入れる（行動力-10）</h2><div class="text-[11px] text-slate-500">${p.label}</div></div>
+    <div class="text-sm">売出価格: ${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}<b>${L.yen(p.price)}</b>${p.origPrice && p.price < p.origPrice ? ' <span class="text-[11px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}${p.staleFlag ? ' <span class="text-[11px] bg-amber-500 text-white rounded px-1">売れ残り中</span>' : ''}</div>
+    ${p.sellerUrgency ? `<div class="text-xs"><span class="bg-rose-100 text-rose-700 rounded px-1.5 py-0.5 font-bold">🏃 売り急ぎ</span> <span class="text-slate-600">${p.sellerUrgency.reason}そうだ</span></div>` : ''}
     <button id="of-detail" class="w-full text-xs text-navy underline">📋 レントロール・収支・融資の詳細を見る</button>
-    ${[0, 0.05, 0.10, 0.15].map(c => `<button class="of-btn w-full border rounded py-2 text-sm" data-c="${c}" ${p.refusedOffer && c > 0 ? 'disabled' : ''}>
-      ${c === 0 ? `満額 ${L.yen(p.price)}（必ず通る）` : `指値 -${Math.round(c * 100)}% → ${L.yen(Math.round(p.price * (1 - c)))}`}</button>`).join('')}
-    <button id="of-cancel" class="w-full text-slate-400 text-sm">やめる</button></div>`);
+    <button id="of-full" class="w-full border rounded py-2 text-sm font-bold">満額 ${L.yen(p.price)}（必ず通る）</button>
+    <div class="pt-1 border-t ${blocked ? 'opacity-50' : ''}">
+      <div class="text-sm">指値 <b id="of-cutpct">5%</b>引き → <b id="of-cutprice">${L.yen(Math.round(p.price * 0.95))}</b></div>
+      <input id="of-slider" type="range" min="1" max="99" step="1" value="5" class="w-full" ${blocked ? 'disabled' : ''}>
+      <div class="flex items-center gap-2 text-xs">
+        <span class="text-slate-500 shrink-0">成功率</span>
+        <div class="flex-1 bg-slate-100 rounded-full h-2 overflow-hidden"><div id="of-gauge" class="h-2 rounded-full"></div></div>
+        <span id="of-chance" class="font-bold w-12 text-right"></span></div>
+      <div id="of-note" class="text-[11px] mt-1"></div>
+      <button id="of-submit" class="w-full bg-navy text-white rounded py-2 text-sm font-bold mt-1" ${blocked ? 'disabled' : ''}>この指値で申し込む（行動力-10）</button>
+      ${blocked ? '<div class="text-[11px] text-red-600 mt-1">指値を断られた物件です（値下げか売れ残りのタイミングで再交渉できます）</div>' : ''}
+    </div>
+    <button id="of-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
   m.appendChild(box);
   // 詳細は買付モーダルを閉じてから開く（重なりで見えなくなる問題を解消）。詳細から買付へ「戻る」で戻れる。
   box.querySelector('#of-detail').addEventListener('click', () => { close(); openDetail(propId, 'market', () => openPurchase(propId, back)); });
   box.querySelector('#of-cancel').addEventListener('click', close);
   box.querySelector('#of-x').addEventListener('click', close);
   if (back) box.querySelector('#of-back').addEventListener('click', () => { close(); back(); });
-  box.querySelectorAll('.of-btn').forEach(b => b.addEventListener('click', () => {
+  // v3.8: 指値スライダー。取次ライン内は通常交渉、超えると「ダメ元」（背景あり）／「非常識」（背景なし・評判リスク）に変化
+  const lv = L.skillLevel(state.skills.negotiation.exp);
+  const line = L.maxBrokerCut(p, lv);
+  const slider = box.querySelector('#of-slider');
+  const submit = box.querySelector('#of-submit');
+  const noteEl = box.querySelector('#of-note');
+  const gauge = box.querySelector('#of-gauge');
+  const update = () => {
+    const cut = Number(slider.value) / 100;
+    const chance = L.offerSuccessChance(p, cut, lv);
+    box.querySelector('#of-cutpct').textContent = `${slider.value}%`;
+    box.querySelector('#of-cutprice').textContent = L.yen(Math.max(10000, Math.round(p.price * (1 - cut))));
+    box.querySelector('#of-chance').textContent = `${Math.round(chance * 100)}%`;
+    gauge.style.width = `${Math.max(3, Math.round(chance * 100))}%`;
+    gauge.style.background = chance >= 0.5 ? '#059669' : chance >= 0.2 ? '#f59e0b' : '#dc2626';
+    if (cut <= line) {
+      noteEl.textContent = `🏢「頑張って交渉します」（取次ライン: ${Math.round(line * 100)}%引きまで）`;
+      noteEl.className = 'text-[11px] mt-1 text-slate-600';
+      submit.textContent = 'この指値で申し込む（行動力-10）';
+      submit.className = 'w-full bg-navy text-white rounded py-2 text-sm font-bold mt-1';
+    } else if (L.hasSellerBackground(p)) {
+      noteEl.textContent = '🏢「売主さんには事情があるようです。ダメ元で当たってみます…」（失敗してもペナルティなし）';
+      noteEl.className = 'text-[11px] mt-1 text-amber-700 font-bold';
+      submit.textContent = '🙏 ダメ元で打診してもらう（行動力-10）';
+      submit.className = 'w-full bg-amber-500 hover:bg-amber-600 text-white rounded py-2 text-sm font-bold mt-1';
+    } else {
+      noteEl.textContent = '🏢「この価格はさすがに…無謀な指値は評判に関わりますよ」（失敗すると交渉力の評判ダウン）';
+      noteEl.className = 'text-[11px] mt-1 text-red-600 font-bold';
+      submit.textContent = '⚠️ 非常識な指値を強行する（行動力-10）';
+      submit.className = 'w-full bg-red-600 hover:bg-red-700 text-white rounded py-2 text-sm font-bold mt-1';
+    }
+  };
+  slider.addEventListener('input', update);
+  update();
+  const doOffer = (cut) => {
     if (state.actionPower < 10) { alert('行動力が足りません'); return; }
-    const cut = Number(b.dataset.c);
     const r = L.makeOffer(state, propId, cut, Math.random);
     state = r.state; save();
     // 買付は一番ドキドキするポイント。結果を即出さず「交渉中…」の溜め演出を挟んでから発表する。
     playOfferSuspense(r.accepted, cut, () => {
-      if (!r.accepted) { pushLog(`${p.label} への指値は断られた…（この物件には再指値できない）`); render(); close(); return; }
-      pushLog(`${p.label} の買付が通った！（${L.yen(r.price)}）`);
+      if (!r.accepted) {
+        pushLog(r.penalized
+          ? `${p.label} への無謀な指値で評判を落とした…（交渉-15 EXP）`
+          : `${p.label} への指値は断られた…（値下げか売れ残りを待てば再指値できる）`);
+        render(); close();
+        if (r.counterProposal) showCounterProposal(r.counterProposal);
+        return;
+      }
+      pushLog(`${p.label} の買付が通った！（${L.yen(r.price)}・交渉+${5 + Math.round(cut * 100)} EXP）`);
       showPayment(propId, r.price, close);
     });
-  }));
+  };
+  box.querySelector('#of-full').addEventListener('click', () => doOffer(0));
+  submit.addEventListener('click', () => doOffer(Number(slider.value) / 100));
+}
+
+// v3.8: 鬼指値で断られたときの「逆提案」。不動産会社が予算感に合う激安寄りの物件を紹介してくれる。
+function showCounterProposal(cp) {
+  const m = document.getElementById('purchase-modal');
+  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
+  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3">
+    <div class="flex justify-between items-center"><h2 class="font-bold">🙋 不動産会社からの逆提案</h2><button id="cp-x" class="text-slate-400 text-xl leading-none">✕</button></div>
+    <div class="text-sm text-slate-700 bg-slate-50 rounded-lg p-3">「その予算感でしたら…実は<b>こういう物件</b>がありますよ。訳ありですが、価格は頑張れます」</div>
+    <div class="flex items-center gap-2 border rounded-lg p-2">${renderBuildingSVG(cp, 'w-14 h-14')}
+      <div class="min-w-0 flex-1 text-left">
+        <div class="font-bold truncate">${cp.name || cp.label}</div>
+        <div class="text-[11px] text-slate-500">${cp.label}</div>
+        <div class="text-sm"><span class="line-through text-slate-400">${L.yen(cp.origPrice)}</span> → <b class="text-emerald-700">${L.yen(cp.price)}</b>・表面${(cp.grossYield * 100).toFixed(1)}%</div>
+        ${cp.junkFlags?.length ? `<div class="text-[11px] text-red-600 font-bold">訳あり: ${cp.junkFlags.join('・')}</div>` : ''}
+        ${cp.sellerUrgency ? `<div class="text-[11px] text-rose-600 font-bold">🏃 売り急ぎ: ${cp.sellerUrgency.reason}そうだ</div>` : ''}
+      </div></div>
+    <button id="cp-detail" class="w-full bg-navy text-white rounded-lg py-2 text-sm font-bold">📋 詳細を見る</button>
+    <button id="cp-later" class="w-full text-slate-500 text-sm">あとで（🗂️市場一覧に追加されています）</button></div>`);
+  m.appendChild(box);
+  box.querySelector('#cp-x').addEventListener('click', close);
+  box.querySelector('#cp-later').addEventListener('click', close);
+  box.querySelector('#cp-detail').addEventListener('click', () => { close(); openDetail(cp.id, 'market'); });
 }
 
 // 買付の結果発表: 交渉中の溜め（ドラムロール＋鼓動）→ ドラマチックな成立/残念の発表 → done()。
+// v3.2: 買付の結果発表をリッチに。暗転＋金色の鼓動リング→成立は放射バースト＋判子風「成立」スタンプ、
+// 見送りは画面シェイク＋「見送り」スタンプ。コスト・確率などのロジックは一切変更しない。
 function playOfferSuspense(accepted, cut, done) {
-  const overlay = el(`<div class="fixed inset-0 z-[70] bg-black/70 flex items-center justify-center p-4">
-    <div class="text-center text-white space-y-4">
-      <div id="ofs-emoji" class="text-6xl">🧑‍💼📄</div>
-      <div id="ofs-title" class="text-2xl font-bold">交渉中<span id="ofs-dots"></span></div>
+  const overlay = el(`<div class="fixed inset-0 z-[70] overflow-hidden flex items-center justify-center p-4" style="background:radial-gradient(ellipse at center, rgba(15,23,42,0.88) 0%, rgba(2,6,23,0.97) 100%);">
+    <style>
+      @keyframes ofs-ring { 0% { transform: scale(0.55); opacity: 0.9; } 100% { transform: scale(2.6); opacity: 0; } }
+      @keyframes ofs-stamp { 0% { transform: scale(3.2) rotate(14deg); opacity: 0; } 55% { transform: scale(0.92) rotate(-8deg); opacity: 1; } 75% { transform: scale(1.07) rotate(-8deg); } 100% { transform: scale(1) rotate(-8deg); opacity: 1; } }
+      @keyframes ofs-shake { 0%,100% { transform: translateX(0); } 20% { transform: translateX(-14px); } 40% { transform: translateX(11px); } 60% { transform: translateX(-7px); } 80% { transform: translateX(4px); } }
+      @keyframes ofs-burst { 0% { transform: scale(0.2) rotate(0deg); opacity: 1; } 100% { transform: scale(1.8) rotate(22deg); opacity: 0; } }
+      @keyframes ofs-float { 0% { transform: translateY(0) scale(1); opacity: 1; } 100% { transform: translateY(-110px) scale(1.4); opacity: 0; } }
+    </style>
+    <div id="ofs-rings" class="absolute inset-0 flex items-center justify-center pointer-events-none"></div>
+    <div id="ofs-burst-layer" class="absolute inset-0 flex items-center justify-center pointer-events-none"></div>
+    <div id="ofs-box" class="relative text-center text-white space-y-4">
+      <div id="ofs-emoji" class="text-7xl" style="filter: drop-shadow(0 0 25px rgba(251,191,36,0.4));">🤝</div>
+      <div id="ofs-title" class="text-2xl font-bold tracking-[0.3em]">交 渉 中<span id="ofs-dots" class="tracking-normal"></span></div>
       <div id="ofs-sub" class="text-sm opacity-80">${cut > 0 ? `指値 -${Math.round(cut * 100)}% で相手の返事を待っています…` : '満額で申し込み中…'}</div>
     </div></div>`);
   document.body.appendChild(overlay);
@@ -2007,30 +2645,57 @@ function playOfferSuspense(accepted, cut, done) {
   const emojiEl = overlay.querySelector('#ofs-emoji');
   const titleEl = overlay.querySelector('#ofs-title');
   const subEl = overlay.querySelector('#ofs-sub');
-  // 溜め: ドット点滅＋鼓動アニメ＋ドラムロール音
+  const ringsEl = overlay.querySelector('#ofs-rings');
+  const boxEl = overlay.querySelector('#ofs-box');
+  // 溜め: ドット点滅＋鼓動＋外へ広がる金色リング＋ドラムロール音
   let dots = 0;
   const dotTimer = setInterval(() => { dots = (dots + 1) % 4; dotsEl.textContent = '.'.repeat(dots); }, 300);
   emojiEl.style.transition = 'transform 0.35s ease-in-out';
   const beatTimer = setInterval(() => {
     emojiEl.style.transform = emojiEl.style.transform === 'scale(1.15)' ? 'scale(1)' : 'scale(1.15)';
   }, 350);
+  const ringTimer = setInterval(() => {
+    const ring = el(`<div class="absolute rounded-full" style="width:190px;height:190px;border:2px solid rgba(251,191,36,0.55);animation: ofs-ring 1.1s ease-out forwards;"></div>`);
+    ringsEl.appendChild(ring);
+    setTimeout(() => ring.remove(), 1150);
+  }, 420);
   sfxDrumroll();
   const suspenseMs = cut > 0 ? 2000 : 1100;   // 満額は必ず通るので溜めは短め
   setTimeout(() => {
-    clearInterval(dotTimer); clearInterval(beatTimer);
-    emojiEl.style.transition = 'transform 0.4s cubic-bezier(.2,1.5,.4,1)';
+    clearInterval(dotTimer); clearInterval(beatTimer); clearInterval(ringTimer);
+    ringsEl.innerHTML = '';
     if (accepted) {
-      emojiEl.textContent = '🎉'; emojiEl.style.transform = 'scale(1.6)';
-      titleEl.textContent = '買付 成立！'; titleEl.className = 'text-3xl font-bold text-emerald-400';
+      // 金色の放射バースト＋判子風「成立」スタンプ＋キラキラ
+      overlay.querySelector('#ofs-burst-layer').appendChild(el(
+        `<div style="width:460px;height:460px;border-radius:50%;background:repeating-conic-gradient(rgba(251,191,36,0.45) 0 10deg, transparent 10deg 30deg);animation: ofs-burst 0.9s ease-out forwards;"></div>`));
+      emojiEl.remove();
+      boxEl.insertBefore(el(
+        `<div class="mx-auto w-44 h-44 rounded-full bg-white/95 shadow-2xl flex items-center justify-center" style="border:9px solid #dc2626;animation: ofs-stamp 0.55s cubic-bezier(.2,1.4,.4,1) forwards;">
+          <span class="text-5xl font-black" style="color:#dc2626;">成立</span></div>`), titleEl);
+      ['✨', '💴', '✨', '🎉', '💴', '✨'].forEach((c, i) => {
+        const sp = el(`<div class="absolute text-3xl pointer-events-none" style="left:${18 + i * 13}%;top:58%;animation: ofs-float 1.2s ease-out ${i * 0.09}s forwards;opacity:0;">${c}</div>`);
+        overlay.appendChild(sp);
+      });
+      titleEl.textContent = '買付 成立！';
+      titleEl.className = 'text-3xl font-black tracking-widest';
+      titleEl.style.background = 'linear-gradient(180deg,#fde68a,#f59e0b)';
+      titleEl.style.webkitBackgroundClip = 'text';
+      titleEl.style.backgroundClip = 'text';
+      titleEl.style.color = 'transparent';
       subEl.textContent = '契約に進みましょう';
       sfxFanfare();
     } else {
-      emojiEl.textContent = '😢'; emojiEl.style.transform = 'scale(1.2)';
-      titleEl.textContent = '残念…見送りに'; titleEl.className = 'text-3xl font-bold text-red-400';
-      subEl.textContent = 'この物件へはもう指値できません';
+      boxEl.style.animation = 'ofs-shake 0.5s';
+      emojiEl.remove();
+      boxEl.insertBefore(el(
+        `<div class="mx-auto w-44 h-44 rounded-full flex items-center justify-center" style="border:9px solid #94a3b8;background:rgba(255,255,255,0.06);animation: ofs-stamp 0.55s cubic-bezier(.2,1.4,.4,1) forwards;">
+          <span class="text-5xl font-black" style="color:#cbd5e1;">見送り</span></div>`), titleEl);
+      titleEl.textContent = '残念…見送りに';
+      titleEl.className = 'text-3xl font-bold text-red-400 tracking-widest';
+      subEl.textContent = '値下げか売れ残りのタイミングで再指値できます';
       sfxFail();
     }
-    setTimeout(() => { overlay.remove(); done(); }, accepted ? 1200 : 1500);
+    setTimeout(() => { overlay.remove(); done(); }, accepted ? 1400 : 1600);
   }, suspenseMs);
 }
 
@@ -2039,20 +2704,27 @@ function showPayment(propId, price, close) {
   const m = document.getElementById('purchase-modal');
   const cashNeed = price + Math.round(price * L.CONFIG.closingCostRate);
   let downRatio = 0.2;
+  let buyOwner = 'personal';   // v3.5: 法人設立済みなら購入名義を選べる
   const draw = () => {
     m.innerHTML = '';
+    // v3.6: 頭金は0%〜「手持ち現金で払える上限」まで1%刻みで自由に設定できる（3割上限を撤廃）
+    const closing = Math.round(price * L.CONFIG.closingCostRate);
+    const maxDownPct = Math.max(0, Math.min(100, Math.floor((state.cash - closing) / price * 100)));
+    if (downRatio > maxDownPct / 100) downRatio = maxDownPct / 100;
     const rs = L.reviewAllBanks(p, price, downRatio, state);
     const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2 max-h-[85vh] overflow-y-auto">
       <div class="flex justify-between items-start gap-2"><h2 class="font-bold">支払い方法（成約価格 ${L.yen(price)}）</h2><button id="pay-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+      ${state.isIncorporated ? `<div class="flex gap-2 text-sm items-center"><span class="font-bold shrink-0">名義:</span>
+        <label class="flex-1 border rounded p-1.5 text-center cursor-pointer ${buyOwner === 'personal' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="personal" ${buyOwner === 'personal' ? 'checked' : ''} class="mr-1">👤 個人</label>
+        <label class="flex-1 border rounded p-1.5 text-center cursor-pointer ${buyOwner === 'corp' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="corp" ${buyOwner === 'corp' ? 'checked' : ''} class="mr-1">🏢 法人</label></div>` : ''}
       <button id="pay-cash" class="w-full border rounded py-2 text-sm ${state.cash < cashNeed ? 'opacity-40' : ''}" ${state.cash < cashNeed ? 'disabled' : ''}>現金一括（必要 ${L.yen(cashNeed)}）</button>
-      <div class="text-sm font-bold pt-2 border-t">融資（4行同時審査）・頭金:
-        <select id="pay-down" class="border rounded p-1 text-sm">
-          <option value="0.1" ${downRatio === 0.1 ? 'selected' : ''}>1割</option>
-          <option value="0.2" ${downRatio === 0.2 ? 'selected' : ''}>2割</option>
-          <option value="0.3" ${downRatio === 0.3 ? 'selected' : ''}>3割</option>
-        </select></div>
+      <div class="text-sm font-bold pt-2 border-t">融資（4行同時審査）</div>
+      <div class="text-sm">頭金 <b id="pay-down-pct">${Math.round(downRatio * 100)}%</b>＝<span id="pay-down-amt" class="font-bold">${L.yen(Math.round(price * downRatio))}</span>
+        <span class="text-[11px] text-slate-500">（諸費用込み必要現金 <span id="pay-down-need">${L.yen(Math.round(price * downRatio) + Math.round(price * L.CONFIG.closingCostRate))}</span>）</span></div>
+      <input id="pay-down-range" type="range" min="0" max="${maxDownPct}" step="1" value="${Math.round(downRatio * 100)}" class="w-full">
+      <div class="text-[11px] text-slate-500">スライドで自由に設定できます（手持ち現金で払える上限 ${maxDownPct}%）。離すと審査結果が更新されます。</div>
       <div id="pay-banks"></div>
-      <button id="pay-cancel" class="w-full text-slate-400 text-sm">買付を取り下げる（ペナルティなし）</button></div>`);
+      <button id="pay-cancel" class="w-full text-slate-500 text-sm">買付を取り下げる（ペナルティなし）</button></div>`);
     m.appendChild(box);
     const banksDiv = box.querySelector('#pay-banks');
     banksDiv.innerHTML = rs.map(r => r.approved
@@ -2061,21 +2733,73 @@ function showPayment(propId, price, close) {
           <div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要自己資金${L.yen(r.terms.requiredCash)}</div></div>`
       : `<div class="border rounded p-2 mb-1 bg-slate-50"><b>✕ ${r.label}</b>
           <div class="text-xs text-red-600">${r.reasons.map(x => x.msg).join('／')}</div></div>`).join('');
-    box.querySelector('#pay-down').addEventListener('change', e => { downRatio = Number(e.target.value); draw(); });
+    const range = box.querySelector('#pay-down-range');
+    range.addEventListener('input', () => {
+      const pct = Number(range.value);
+      box.querySelector('#pay-down-pct').textContent = `${pct}%`;
+      box.querySelector('#pay-down-amt').textContent = L.yen(Math.round(price * pct / 100));
+      box.querySelector('#pay-down-need').textContent = L.yen(Math.round(price * pct / 100) + closing);
+    });
+    range.addEventListener('change', () => { downRatio = Number(range.value) / 100; draw(); });
+    box.querySelectorAll('input[name="buy-owner"]').forEach(rb => rb.addEventListener('change', e => { buyOwner = e.target.value; draw(); }));
+    const ownerLabel = () => buyOwner === 'corp' ? '🏢法人名義' : '👤個人名義';
     box.querySelector('#pay-cash').addEventListener('click', () => {
-      const r = L.buyPropertyV2(state, propId, { method: 'cash', price });
+      const r = L.buyPropertyV2(state, propId, { method: 'cash', price, owner: buyOwner });
       state = r.state; r.logs.forEach(pushLog); save(); render(); close(); checkEnd();
-      celebrate('マイホーム(?)ゲット！', `${p.name || p.label} を ${L.yen(price)} で購入`, '🏠✨');
+      playPurchaseCelebration(p.name || p.label, `${L.yen(price)}（現金一括・${ownerLabel()}）`);
     });
     box.querySelectorAll('.pay-bank').forEach(b => b.addEventListener('click', () => {
-      const r = L.buyPropertyV2(state, propId, { method: b.dataset.k, downRatio, price });
+      const r = L.buyPropertyV2(state, propId, { method: b.dataset.k, downRatio, price, owner: buyOwner });
       state = r.state; r.logs.forEach(pushLog); save(); render(); close(); checkEnd();
-      celebrate('新しい大家さんの誕生！', `${p.name || p.label} を ${L.yen(price)} で購入`, '🏠✨');
+      playPurchaseCelebration(p.name || p.label, `${L.yen(price)}（融資利用・${ownerLabel()}）`);
     }));
     box.querySelector('#pay-cancel').addEventListener('click', () => { pushLog('買付を取り下げた'); close(); });
     box.querySelector('#pay-x').addEventListener('click', () => { pushLog('買付を取り下げた'); close(); });
   };
   draw();
+}
+
+// v3.5: 個人所有物件を法人へ売却（移転）する確認画面。時価取引・譲渡税・取得コスト・償却再スタートを明示。
+function openCorpTransfer(propId) {
+  const p = state.properties.find(x => x.id === propId);
+  if (!p) return;
+  const m = document.getElementById('sell-modal');
+  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
+  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const price = p.timeValue;
+  const book = L.bookValueV2(p);
+  const gain = Math.max(0, price - book);
+  const heldYears = (state.month - (p.boughtMonth ?? state.month)) / 12;
+  const capTax = Math.round(gain * (heldYears <= 5 ? L.CONFIG.capGainTaxShort : L.CONFIG.capGainTaxLong));
+  const acqCost = Math.round(price * L.CONFIG.corpTransferCostRate);
+  const total = capTax + acqCost;
+  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
+    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">🏢 ${p.name || p.label} を法人へ売却（移転）</h2><button id="tc-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+    <table class="w-full text-sm">
+      <tr><td>移転価格（現在の時価）</td><td class="text-right font-bold">${L.yen(price)}</td></tr>
+      <tr class="border-t"><td>譲渡税（個人側・${heldYears <= 5 ? '短期39%' : '長期20%'}）</td><td class="text-right text-red-600">-${L.yen(capTax)}</td></tr>
+      <tr><td>取得コスト（法人側・5%）</td><td class="text-right text-red-600">-${L.yen(acqCost)}</td></tr>
+      <tr class="border-t font-bold"><td>支払い合計</td><td class="text-right text-red-600">${L.yen(total)}</td></tr>
+    </table>
+    <div class="text-xs text-slate-600 bg-slate-50 rounded p-2 space-y-1">
+      <div>✅ 以後の課税は法人税率30%（デッドクロス後も40%にならない）</div>
+      <div>✅ <b>減価償却が再スタート</b>（中古簡便法・取得価額=現在の時価）</div>
+      <div>✅ 売却時の譲渡税が保有期間に関係なく30%に</div>
+    </div>
+    <button id="tc-run" class="w-full bg-navy text-white rounded py-2 text-sm font-bold ${state.cash < total ? 'opacity-40' : ''}" ${state.cash < total ? 'disabled' : ''}>法人へ移転する（${L.yen(total)} 支払い）</button>
+    <button id="tc-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
+  m.appendChild(box);
+  box.querySelector('#tc-x').addEventListener('click', close);
+  box.querySelector('#tc-cancel').addEventListener('click', close);
+  box.querySelector('#tc-run').addEventListener('click', () => {
+    const r = L.transferToCorp(state, propId);
+    if (!r.done) { alert(r.reason === 'cash' ? '現金が足りません' : '移転できませんでした'); return; }
+    state = r.state;
+    pushLog(`${p.name || p.label} を法人へ移転（譲渡税${L.yen(r.capTax)}・取得コスト${L.yen(r.acqCost)}・償却再スタート）`);
+    save(); render(); close();
+    // v3.6: 移転も決定的イベントとして判子スタンプ演出に統一
+    playStampFx({ stamp: '移転完了', title: '法人名義へ！', sub: `${p.name || p.label}（課税30%・償却再スタート）`, emojis: ['🏢', '📋', '✨', '💴', '✨'] });
+  });
 }
 
 function openSell(propId) {
@@ -2088,45 +2812,62 @@ function openSell(propId) {
   if (listing) { drawListingManage(m, p, listing, close); return; }
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3">
     <div class="flex justify-between items-start gap-2"><h2 class="font-bold">${p.name || p.label} の売却</h2><button id="sl-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
-    <div class="text-sm">まず不動産屋に査定を依頼しよう（行動力-20）</div>
+    <div class="text-sm">まず不動産屋に査定を依頼しよう（行動力-5）</div>
     <button id="sl-appraise" class="w-full bg-navy text-white rounded py-2">査定を依頼する</button>
-    <button id="sl-cancel" class="w-full text-slate-400 text-sm">やめる</button></div>`);
+    <button id="sl-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
   m.appendChild(box);
   box.querySelector('#sl-cancel').addEventListener('click', close);
   box.querySelector('#sl-x').addEventListener('click', close);
   box.querySelector('#sl-appraise').addEventListener('click', () => {
-    if (state.actionPower < 20) { alert('行動力が足りません'); return; }
+    if (state.actionPower < 5) { alert('行動力が足りません'); return; }
     const r = L.requestAppraisal(state, propId, Math.random);
     state = r.state; save();
     drawPricing(m, p, r.appraisal, close);
   });
 }
 
-function drawPricing(m, p, appraisal, close) {
+// v3.5: 売出価格は自由入力。査定はあくまで参考値として表示し、利回りをリアルタイムに見ながら自分で決める。
+// v3.6: backを渡すと「← 戻る」を表示し、売り出し後・戻る押下でひとつ前の画面（売却センター等）へ戻る。
+function drawPricing(m, p, appraisal, close, back) {
   m.innerHTML = '';
   let price = appraisal;
   const gpi = L.gpiAnnual(p);
   const yieldOf = (v) => (v > 0 ? (gpi / v * 100).toFixed(1) : '-');
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3">
-    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">売出価格を決める</h2><button id="sl-x2" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
-    <div class="text-sm">査定額: <b>${L.yen(appraisal)}</b></div>
-    <input id="sl-range" type="range" min="${Math.round(appraisal * 0.7)}" max="${Math.round(appraisal * 1.3)}" value="${appraisal}" step="10000" class="w-full">
-    <div class="text-center font-bold text-lg" id="sl-price">${L.yen(appraisal)}</div>
-    <div class="text-center text-sm text-slate-500">表面利回り <span id="sl-yield" class="font-bold">${yieldOf(appraisal)}</span>%（満室想定・年間家賃収入 ${L.yen(gpi)} 基準）</div>
-    <div class="text-xs text-slate-400">安くすれば早く売れる。高くすると時間がかかり、売れ残ると指値が入りやすくなる。</div>
+    <div class="flex justify-between items-center gap-2">${back ? '<button id="sl-back" class="text-xs text-navy shrink-0">← 戻る</button>' : ''}<h2 class="font-bold flex-1">売出価格を決める</h2><button id="sl-x2" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+    <div class="text-sm">不動産会社の査定額（参考）: <b>${L.yen(appraisal)}</b>（利回り${yieldOf(appraisal)}%）</div>
+    <div class="text-sm font-bold">売出価格（自由に設定できます）</div>
+    <input id="sl-price-input" type="text" inputmode="numeric" class="w-full border-2 border-navy rounded p-2 text-lg font-bold text-right">
+    <div class="flex gap-1 text-xs">
+      ${[0.9, 1.0, 1.1, 1.2].map(f => `<button class="sl-preset flex-1 border rounded py-1" data-f="${f}">査定×${Math.round(f * 100)}%</button>`).join('')}
+    </div>
+    <div class="text-center text-sm text-slate-600">この価格の表面利回り <span id="sl-yield" class="font-bold text-lg text-emerald-700">${yieldOf(appraisal)}</span>%
+      <div class="text-[11px] text-slate-500">（満室想定・年間家賃収入 ${L.yen(gpi)} 基準）</div></div>
+    <div class="text-xs text-slate-500">安くすれば早く売れ、高いほど時間がかかる。訳あり物件を高利回りで仕入れ、通常の利回り水準の価格で売り抜く戦略も。</div>
     <button id="sl-list" class="w-full bg-emerald text-white rounded py-2">この価格で売りに出す</button>
-    <button id="sl-cancel2" class="w-full text-slate-400 text-sm">やめる</button></div>`);
+    <button id="sl-cancel2" class="w-full text-slate-500 text-sm">やめる</button></div>`);
   m.appendChild(box);
-  box.querySelector('#sl-range').addEventListener('input', e => {
-    price = Number(e.target.value);
-    box.querySelector('#sl-price').textContent = L.yen(price);
+  const input = box.querySelector('#sl-price-input');
+  wireCommaInput(input, { min: 10000, max: 10_000_000_000 });
+  setCommaValue(input, appraisal);
+  const updatePrice = () => {
+    price = Math.max(10000, parseCommaNumber(input.value) || appraisal);
     box.querySelector('#sl-yield').textContent = yieldOf(price);
-  });
+  };
+  input.addEventListener('input', updatePrice);
+  input.addEventListener('blur', updatePrice);
+  box.querySelectorAll('.sl-preset').forEach(b => b.addEventListener('click', () => {
+    setCommaValue(input, Math.round(appraisal * Number(b.dataset.f) / 10000) * 10000);
+    updatePrice();
+  }));
   box.querySelector('#sl-list').addEventListener('click', () => {
+    updatePrice();
     state = L.listForSale(state, p.id, price, appraisal).state;
-    pushLog(`${p.label} を ${L.yen(price)} で売りに出した`);
+    pushLog(`${p.label} を ${L.yen(price)} で売りに出した（表面${yieldOf(price)}%）`);
     save(); render(); close();
+    back?.();   // v3.6: 売りに出したらひとつ前の画面（売却センター等）へ戻る
   });
+  box.querySelector('#sl-back')?.addEventListener('click', () => { close(); back(); });
   box.querySelector('#sl-cancel2').addEventListener('click', close);
   box.querySelector('#sl-x2').addEventListener('click', close);
 }
@@ -2139,7 +2880,7 @@ function drawListingManage(m, p, listing, close) {
     <div class="text-sm">売出価格: <b>${L.yen(listing.askingPrice)}</b></div>
     <button id="sl-down" class="w-full border rounded py-2 text-sm">5%値下げする → ${L.yen(downTo)}</button>
     <button id="sl-delist" class="w-full border rounded py-2 text-sm">掲載を取り下げる</button>
-    <button id="sl-close" class="w-full text-slate-400 text-sm">閉じる</button></div>`);
+    <button id="sl-close" class="w-full text-slate-500 text-sm">閉じる</button></div>`);
   m.appendChild(box);
   box.querySelector('#sl-down').addEventListener('click', () => {
     state = L.updateListing(state, p.id, downTo).state;
@@ -2223,10 +2964,32 @@ function renderBuildingSVG(p, sizeClass = 'w-16 h-16') {
   </svg>`;
 }
 
+// v3.2: 概要の「地図で場所を見る」。詳細を閉じて地図の該当地点へ飛び、
+// 「タップすると詳細に戻れる」ことを吹き出しで数秒示す（市場物件はピンも立つ）。
+function jumpToMapWithBubble(p, from) {
+  if (from === 'owned') focusOnOwned(p.id); else focusOnMarket(p.id);
+  const canvas = document.getElementById('city-canvas');
+  const r = canvas ? canvas.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  const bubble = el(`<div class="fixed z-[55] pointer-events-none" style="left:${Math.round(r.left + r.width / 2)}px; top:${Math.round(r.top + r.height * 0.30)}px; transform:translate(-50%,-100%); transition: opacity 0.5s;">
+    <div class="bg-white rounded-xl shadow-xl px-4 py-2 text-sm font-bold text-navy">📍 ここ！ ${from === 'market' ? 'ピンや建物' : 'この建物'}をタップ（クリック）すると詳細に戻れます</div>
+    <div style="width:0;height:0;border-left:10px solid transparent;border-right:10px solid transparent;border-top:12px solid #fff;margin:0 auto;filter:drop-shadow(0 2px 2px rgba(0,0,0,0.15));"></div>
+  </div>`);
+  document.body.appendChild(bubble);
+  setTimeout(() => { bubble.style.opacity = '0'; }, 3800);
+  setTimeout(() => bubble.remove(), 4400);
+}
+
 function doDIYClick(propId) {
-  if (state.actionPower < 30) { alert('行動力が足りません'); return; }
-  const r = L.doDIY(state, propId);
-  state = r.state; pushLog('DIYで修繕した（修繕度+20%・自主管理+10 EXP）'); save(); render();
+  const p0 = state.properties.find(x => x.id === propId);
+  if (!p0 || p0.repairJob) return;
+  const info = L.repairTierInfo(p0);
+  if (state.actionPower < info.diyCost) { alert('行動力が足りません'); return; }
+  const before = p0.repairState;
+  const r = L.doDIY(state, propId);   // 訳あり修繕実績の記録もロジック側で行われる
+  state = r.state;
+  const p = state.properties.find(x => x.id === propId);
+  pushLog(`DIYで修繕した（${info.label}・修繕度+15%・自主管理+10 EXP）`); save(); render();
+  showRepairEffect(propId, `🔨 修繕度 ${before}% → ${p.repairState}%${p.repairState === 100 ? '・資産価値UP！' : ''}`);
 }
 
 // DIYは専用画面を開き、建物の壊れた箇所（🕸️ひび・💧雨漏り・🌿雑草）をタップで直していくミニゲームに。
@@ -2238,7 +3001,9 @@ const DIY_SPOT_POOL = [
 function openDiyGame(propId) {
   const p = state.properties.find(x => x.id === propId);
   if (!p) return;
-  if (state.actionPower < 30) { alert('行動力が足りません。翌月へ進むと回復します。'); return; }
+  if (p.repairJob) { alert('業者修繕が進行中です。完了までお待ちください。'); return; }
+  const diyCost = L.repairTierInfo(p).diyCost;
+  if (state.actionPower < diyCost) { alert('行動力が足りません。翌月へ進むと回復します。'); return; }
   const m = document.getElementById('diy-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
@@ -2246,13 +3011,13 @@ function openDiyGame(propId) {
   const spots = DIY_SPOT_POOL.slice(0, n);
   let fixed = 0;
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-2">
-    <div class="flex justify-between items-center"><h2 class="font-bold truncate">🖌️ ${p.name || p.label} をDIY修繕（-30）</h2><button id="diy-close" class="text-slate-400 text-xl shrink-0">✕</button></div>
-    <div class="text-xs text-slate-500">壊れている箇所（${n}か所）をタップして直そう！</div>
+    <div class="flex justify-between items-center"><h2 class="font-bold truncate">🖌️ ${p.name || p.label} をDIY修繕（-${diyCost}）</h2><button id="diy-close" class="text-slate-400 text-xl shrink-0">✕</button></div>
+    <div class="text-xs text-slate-500">工事内容: ${L.repairTierInfo(p).label}。壊れている箇所（${n}か所）をタップして直そう！</div>
     <div id="diy-stage" class="relative mx-auto rounded-lg bg-sky-50" style="width:220px;height:176px;">
       <div class="absolute inset-0 flex items-center justify-center">${renderBuildingSVG(p, 'w-40 h-32')}</div>
     </div>
     <div class="text-center text-sm font-bold" id="diy-progress">0 / ${n} 直した</div>
-    <button id="diy-cancel" class="w-full text-slate-400 text-sm">やめる（進捗は破棄）</button></div>`);
+    <button id="diy-cancel" class="w-full text-slate-500 text-sm">やめる（進捗は破棄）</button></div>`);
   m.appendChild(box);
   const stage = box.querySelector('#diy-stage');
   spots.forEach(sp => {
@@ -2277,40 +3042,47 @@ function openDiyGame(propId) {
 function openRepairService(propId) {
   const p = state.properties.find(x => x.id === propId);
   if (!p) return;
+  if (p.repairJob) { alert('既に業者修繕が進行中です'); return; }
   const m = document.getElementById('repair-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const info = L.repairTierInfo(p);
   const cost = L.professionalRepairCost(p);
+  const months = L.repairMonthsForCost(cost);   // v3.1: 工期は見積金額で決まる
   const hasReformLoan = !!p.reformLoan;
   const loanAmount = L.reformLoanAmount(cost, state.creditScore);
   const down = cost - loanAmount;
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
-    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">${p.name || p.label} を業者に依頼（行動力-20・修繕度100%に）</h2><button id="rp-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
-    <div class="text-sm">見積もり: <b>${L.yen(cost)}</b></div>
+    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">${p.name || p.label} を業者に依頼（行動力-5）</h2><button id="rp-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+    <div class="text-sm">工事内容: <b>${info.label}</b></div>
+    <div class="text-sm">見積もり: <b>${L.yen(cost)}</b>・工期 <b>${months}ヶ月</b>（完了時に修繕度100%）</div>
     <button id="rp-cash" class="w-full border rounded py-2 text-sm ${state.cash < cost ? 'opacity-40' : ''}" ${state.cash < cost ? 'disabled' : ''}>現金で支払う（${L.yen(cost)}）</button>
     <button id="rp-loan" class="w-full bg-navy text-white rounded py-2 text-sm ${hasReformLoan ? 'opacity-40' : ''}" ${hasReformLoan ? 'disabled' : ''}>
       リフォームローンを利用（頭金${L.yen(down)} + 借入${L.yen(loanAmount)}・金利${(L.CONFIG.reformLoanRate * 100).toFixed(1)}%・${L.CONFIG.reformLoanYears}年）</button>
-    ${hasReformLoan ? '<div class="text-xs text-red-600">既存のリフォームローンが残っているため、完済まで新たな借入はできません（現金払いは可）</div>' : '<div class="text-xs text-slate-400">借入可能額は信用度で変動します</div>'}
-    <button id="rp-cancel" class="w-full text-slate-400 text-sm">やめる</button></div>`);
+    ${hasReformLoan ? '<div class="text-xs text-red-600">既存のリフォームローンが残っているため、完済まで新たな借入はできません（現金払いは可）</div>' : '<div class="text-xs text-slate-500">借入可能額は信用度で変動します</div>'}
+    <div class="text-xs text-slate-500">工事中はDIY・追加発注はできません。完了は通知でお知らせします。</div>
+    <button id="rp-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
   m.appendChild(box);
   box.querySelector('#rp-cancel').addEventListener('click', close);
   box.querySelector('#rp-x').addEventListener('click', close);
-  box.querySelector('#rp-cash').addEventListener('click', () => {
-    if (state.actionPower < 20) { alert('行動力が足りません'); return; }
-    const r = L.doProfessionalRepair(state, propId, false);
-    state = r.state; pushLog(`${p.label} を業者に依頼（現金${L.yen(r.cost)}・修繕度100%）`); save(); render(); close();
-  });
-  box.querySelector('#rp-loan').addEventListener('click', () => {
-    if (state.actionPower < 20) { alert('行動力が足りません'); return; }
-    if (state.cash < down) { alert('頭金分の現金が足りません'); return; }
-    const r = L.doProfessionalRepair(state, propId, true);
-    state = r.state; pushLog(`${p.label} を業者に依頼（リフォームローン${L.yen(r.loanAmount)}・修繕度100%）`); save(); render(); close();
-  });
+  const order = (financed) => {
+    if (state.actionPower < 5) { alert('行動力が足りません'); return; }
+    if (financed && state.cash < down) { alert('頭金分の現金が足りません'); return; }
+    const r = L.startProfessionalRepair(state, propId, financed);
+    if (!r.started) { alert('発注できませんでした'); return; }
+    state = r.state;
+    const pp = state.properties.find(x => x.id === propId);
+    pushLog(`${pp.label} の修繕を発注（${financed && r.financed ? `リフォームローン${L.yen(r.loanAmount)}` : `現金${L.yen(r.cost)}`}・工期${r.monthsTotal}ヶ月）`);
+    save(); render(); close();
+    showRepairEffect(propId, `🔨 修繕開始（${info.label}・工期${r.monthsTotal}ヶ月）`);
+  };
+  box.querySelector('#rp-cash').addEventListener('click', () => order(false));
+  box.querySelector('#rp-loan').addEventListener('click', () => order(true));
 }
 
 function skillRow(name, key){
   const exp = state.skills[key].exp, lv = L.skillLevel(exp), next = L.expToNext(exp);
-  return `<div class="flex justify-between text-sm relative" data-skill="${key}"><span>${name} Lv${lv}</span><span class="text-slate-400">${next===null?'MAX':'次まで'+next}</span></div>`;
+  return `<div class="flex justify-between text-sm relative" data-skill="${key}"><span class="font-bold text-slate-800">${name} Lv${lv}</span><span class="font-bold text-slate-600">${next===null?'MAX':'次まで'+next}</span></div>`;
 }
 
 // EXPフロート表示・実績バッジトースト。render()の後で毎回呼び、直前状態との差分から自動検知する。
@@ -2321,10 +3093,11 @@ function showExpFloats() {
     for (const key of Object.keys(state.skills)) {
       const before = lastSkillExp[key] ?? state.skills[key].exp;
       const gained = state.skills[key].exp - before;
-      if (gained > 0) {
+      if (gained !== 0) {
         const row = document.querySelector(`[data-skill="${key}"]`);
         if (row) {
-          const f = el(`<span class="absolute right-0 -top-3 text-xs font-bold text-emerald exp-float">+${gained} EXP</span>`);
+          // v3.8: 評判ダウン（EXP減少）は赤色で見せる
+          const f = el(`<span class="absolute right-0 -top-3 text-xs font-bold ${gained > 0 ? 'text-emerald' : 'text-red-600'} exp-float">${gained > 0 ? '+' : ''}${gained} EXP</span>`);
           row.appendChild(f);
           setTimeout(() => f.remove(), 1200);
         }
@@ -2332,6 +3105,62 @@ function showExpFloats() {
     }
   }
   lastSkillExp = Object.fromEntries(Object.keys(state.skills).map(k => [k, state.skills[k].exp]));
+}
+
+// v3.6: 決定的イベント共通の判子スタンプ演出。買付・購入・売却成立・法人化・法人移転で同じトーンに統一。
+// ロジックは呼び出し元で完了済み・演出のみ（pointer-events無効で操作は妨げない）。
+function playStampFx({ stamp, title, sub, emojis = ['✨', '🎉', '✨'] }) {
+  sfxFanfare();
+  const overlay = el(`<div class="fixed inset-0 z-[70] overflow-hidden pointer-events-none flex items-center justify-center" style="background:radial-gradient(ellipse at center, rgba(15,23,42,0.82) 0%, rgba(2,6,23,0.94) 100%);transition:opacity 0.45s;">
+    <style>
+      @keyframes pc-stamp { 0% { transform: scale(3.2) rotate(14deg); opacity: 0; } 55% { transform: scale(0.92) rotate(-8deg); opacity: 1; } 75% { transform: scale(1.07) rotate(-8deg); } 100% { transform: scale(1) rotate(-8deg); opacity: 1; } }
+      @keyframes pc-burst { 0% { transform: scale(0.2) rotate(0deg); opacity: 1; } 100% { transform: scale(1.9) rotate(24deg); opacity: 0; } }
+      @keyframes pc-float { 0% { transform: translateY(0) scale(1); opacity: 1; } 100% { transform: translateY(-130px) scale(1.5); opacity: 0; } }
+    </style>
+    <div class="absolute inset-0 flex items-center justify-center"><div style="width:500px;height:500px;border-radius:50%;background:repeating-conic-gradient(rgba(251,191,36,0.4) 0 10deg, transparent 10deg 30deg);animation: pc-burst 1.0s ease-out forwards;"></div></div>
+    <div class="relative text-center text-white space-y-3">
+      <div class="mx-auto w-44 h-44 rounded-full bg-white/95 shadow-2xl flex items-center justify-center" style="border:9px solid #dc2626;animation: pc-stamp 0.55s cubic-bezier(.2,1.4,.4,1) forwards;">
+        <span class="${stamp.length >= 4 ? 'text-4xl' : 'text-5xl'} font-black" style="color:#dc2626;">${stamp}</span></div>
+      <div class="text-3xl font-black tracking-widest"><span style="background:linear-gradient(180deg,#fde68a,#f59e0b);-webkit-background-clip:text;background-clip:text;color:transparent;">${title}</span></div>
+      <div class="text-sm opacity-90">${sub}</div>
+    </div></div>`);
+  document.body.appendChild(overlay);
+  emojis.forEach((c, i) => {
+    const sp = el(`<div class="absolute text-3xl" style="left:${16 + i * 13}%;top:60%;animation: pc-float 1.3s ease-out ${i * 0.1}s forwards;opacity:0;">${c}</div>`);
+    overlay.appendChild(sp);
+  });
+  setTimeout(() => { overlay.style.opacity = '0'; }, 2100);
+  setTimeout(() => overlay.remove(), 2600);
+}
+
+function playPurchaseCelebration(name, priceText) {
+  playStampFx({ stamp: '契約成立', title: '物件購入！', sub: `${name} ／ ${priceText}`, emojis: ['🔑', '🏠', '✨', '💴', '🎉', '✨'] });
+}
+
+// v3.5: 法人設立の演出。買付・購入と同トーンの判子スタンプ＋「何が変わったか」の明示リスト。
+function playIncorporationCelebration() {
+  sfxFanfare();
+  const overlay = el(`<div class="fixed inset-0 z-[70] overflow-hidden flex items-center justify-center p-4" style="background:radial-gradient(ellipse at center, rgba(15,23,42,0.86) 0%, rgba(2,6,23,0.96) 100%);">
+    <style>
+      @keyframes ic-stamp { 0% { transform: scale(3.2) rotate(14deg); opacity: 0; } 55% { transform: scale(0.92) rotate(-8deg); opacity: 1; } 75% { transform: scale(1.07) rotate(-8deg); } 100% { transform: scale(1) rotate(-8deg); opacity: 1; } }
+      @keyframes ic-burst { 0% { transform: scale(0.2) rotate(0deg); opacity: 1; } 100% { transform: scale(1.9) rotate(24deg); opacity: 0; } }
+    </style>
+    <div class="absolute inset-0 flex items-center justify-center pointer-events-none"><div style="width:520px;height:520px;border-radius:50%;background:repeating-conic-gradient(rgba(251,191,36,0.4) 0 10deg, transparent 10deg 30deg);animation: ic-burst 1.0s ease-out forwards;"></div></div>
+    <div class="relative text-center text-white space-y-4 max-w-md w-full">
+      <div class="mx-auto w-40 h-40 rounded-full bg-white/95 shadow-2xl flex items-center justify-center" style="border:9px solid #dc2626;animation: ic-stamp 0.55s cubic-bezier(.2,1.4,.4,1) forwards;">
+        <span class="text-4xl font-black" style="color:#dc2626;">法人設立</span></div>
+      <div class="text-3xl font-black tracking-widest">🏢 <span style="background:linear-gradient(180deg,#fde68a,#f59e0b);-webkit-background-clip:text;background-clip:text;color:transparent;">法人成り！</span></div>
+      <div class="bg-white/95 rounded-xl p-4 text-left text-sm text-slate-800 space-y-2">
+        <div class="font-bold text-navy">ここが変わりました</div>
+        <div>✅ 購入時に<b>名義（👤個人／🏢法人）</b>を選べるように</div>
+        <div>✅ 法人名義の物件は<b>デッドクロス後の課税が30%</b>に軽減（個人は40%）</div>
+        <div>✅ 法人名義の売却は<b>保有期間に関係なく譲渡税30%</b>（個人の短期39%より転売に有利）</div>
+        <div>✅ 既存の物件は<b>👤個人名義のまま</b>。詳細画面の「🏢法人へ売却」で移転できます（ローン完済物件のみ・移転すると減価償却が再スタート）</div>
+      </div>
+      <button id="ic-close" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-xl py-3 font-bold">経営を続ける ▶</button>
+    </div></div>`);
+  document.body.appendChild(overlay);
+  overlay.querySelector('#ic-close').addEventListener('click', () => overlay.remove());
 }
 
 // 購入・売却成立時のお祝い演出（人生の大イベント感を出す：コンフェッティ+ファンファーレ+バナー）
@@ -2394,31 +3223,90 @@ function renderPanelRight() {
   const c = document.getElementById('panel-right'); c.innerHTML = '';
   const unread = (state.notifications || []).filter(n => !n.read).length;
   c.appendChild(el(`
-    <div class="hud-panel pointer-events-auto rounded-lg shadow p-2 space-y-1">
-      <button id="btn-open-search" class="w-full bg-navy text-white rounded py-1.5 text-xs font-bold">🏘️ 営業する</button>
-      <div class="grid grid-cols-2 gap-1">
-        <button id="btn-open-listings" class="border rounded py-1.5 text-[10px]">🗂️ (${state.market.length})</button>
-        <button id="btn-open-notifs" class="border rounded py-1.5 text-[10px] relative">🔔 (${unread})</button>
+    <div class="hud-panel pointer-events-auto rounded-xl bg-white/90 shadow-lg p-3 space-y-2">
+      <button id="btn-open-search" class="w-full bg-navy text-white rounded-lg py-2 text-xs font-bold shadow-md hover:bg-navy-dark">🏘️ 物件を探す</button>
+      <button id="btn-work" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-lg py-2 text-xs font-bold shadow-md select-none touch-none">💼 働く（行動力-1・長押しOK）</button>
+      <div class="grid grid-cols-2 gap-2">
+        <button id="btn-open-listings" class="bg-slate-50 border rounded-lg py-2 text-[11px] font-bold text-slate-800 hover:bg-slate-100">🗂️ 市場(${state.market.length})</button>
+        <button id="btn-open-notifs" class="bg-slate-50 border rounded-lg py-2 text-[11px] font-bold text-slate-800 hover:bg-slate-100 relative">🔔 通知(${unread})</button>
       </div>
-      <button id="btn-open-log" class="w-full border rounded py-1.5 text-xs">📜 ログ</button>
-      <div class="text-[10px] text-slate-400 text-center">行動力 ${state.actionPower}%</div>
+      <button id="btn-open-log" class="w-full bg-slate-50 border rounded-lg py-1.5 text-xs hover:bg-slate-100">📜 ログ履歴</button>
+      <div id="hud-ap" class="text-xs font-bold text-slate-800 text-center font-mono">⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}</div>
     </div>
   `));
   c.appendChild(el(`
-    <div class="hud-panel pointer-events-auto rounded-lg shadow p-2 text-[10px] space-y-0.5">
-      ${skillRow('目利き力', 'appraisal')}${skillRow('融資交渉力', 'negotiation')}${skillRow('自主管理', 'selfmgmt')}
+    <div class="hud-panel pointer-events-auto rounded-xl bg-white/90 shadow-lg p-3 text-[11px] space-y-1">
+      <div class="text-[11px] font-bold text-slate-700 mb-2">🎓 スキル状況</div>
+      ${skillRow('目利き力', 'appraisal')}${skillRow('交渉力', 'negotiation')}${skillRow('自主管理', 'selfmgmt')}
     </div>
   `));
   c.appendChild(el(`
-    <div class="mt-auto hud-panel pointer-events-auto rounded-lg shadow p-1.5">
-      <button id="btn-next-month-desk" class="w-full bg-emerald text-white rounded-lg py-2.5 font-bold text-sm">翌月へ ▶</button>
+    <div class="mt-auto hud-panel pointer-events-auto rounded-xl bg-white/95 shadow-xl p-2">
+      <button id="btn-next-month-desk" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-xl py-4 font-bold text-base shadow-lg">📅 翌月へ進む ▶</button>
+      <div class="text-[11px] text-amber-700 font-bold text-center mt-1">⚡ 進むと行動力が全回復</div>
     </div>
   `));
   c.querySelector('#btn-open-search').addEventListener('click', openSearchModal);
+  wireWorkButton(c.querySelector('#btn-work'));
   c.querySelector('#btn-open-listings').addEventListener('click', openListingsModal);
   c.querySelector('#btn-open-notifs').addEventListener('click', openNotificationsModal);
   c.querySelector('#btn-open-log').addEventListener('click', openLogModal);
   c.querySelector('#btn-next-month-desk').addEventListener('click', onNextMonth);
+}
+
+// === v3: 💼働く。1回タップ=1回、長押しで約120msごとに連続実行（行動力1につき¥1,000〜10,000）===
+function floatEarn(btn, earned) {
+  const r = btn.getBoundingClientRect();
+  const f = el(`<div class="fixed z-[60] pointer-events-none font-bold text-emerald-600 text-sm" style="left:${Math.round(r.left + r.width / 2 + (Math.random() * 44 - 22))}px; top:${Math.round(r.top - 6)}px; transition: top 0.8s ease-out, opacity 0.8s;">+${L.yen(earned)}</div>`);
+  document.body.appendChild(f);
+  requestAnimationFrame(() => { f.style.top = (r.top - 44) + 'px'; f.style.opacity = '0'; });
+  setTimeout(() => f.remove(), 850);
+}
+
+// v3: DIY・業者発注の直後、地図を該当物件へ向け、どの物件に何が起きたかをフロート表示する（約2.5秒）。
+function showRepairEffect(propId, text) {
+  focusOnOwned(propId);
+  const canvas = document.getElementById('city-canvas');
+  const r = canvas ? canvas.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  const f = el(`<div class="fixed z-[55] pointer-events-none font-bold text-amber-700 bg-white/95 rounded-xl shadow-lg px-4 py-2 text-sm" style="left:${Math.round(r.left + r.width / 2)}px; top:${Math.round(r.top + r.height * 0.34)}px; transform:translate(-50%,-50%); transition: top 2.0s ease-out, opacity 0.6s;">${text}</div>`);
+  document.body.appendChild(f);
+  setTimeout(() => { f.style.top = Math.round(r.top + r.height * 0.24) + 'px'; }, 60);
+  setTimeout(() => { f.style.opacity = '0'; }, 1900);
+  setTimeout(() => f.remove(), 2600);
+}
+
+function wireWorkButton(btn) {
+  let timer = null, sessionEarned = 0, sessionCount = 0;
+  const workOnce = () => {
+    const r = L.doWork(state, Math.random);
+    if (!r.earned) { stopWork(); return; }
+    state = r.state; sessionEarned += r.earned; sessionCount += 1;
+    const cashEl = document.getElementById('hud-cash');
+    if (cashEl) cashEl.textContent = L.yen(state.cash);
+    const apEl = document.getElementById('hud-ap');
+    if (apEl) apEl.textContent = `⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}`;
+    sfxCoin();
+    floatEarn(btn, r.earned);
+  };
+  const startWork = (e) => {
+    e.preventDefault();
+    if (timer) return;
+    if (state.actionPower < 1) { alert('行動力が足りません。翌月へ進むと回復します。'); return; }
+    workOnce();
+    timer = setInterval(workOnce, 120);
+  };
+  const stopWork = () => {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (sessionCount) {
+      pushLog(`働いて ${L.yen(sessionEarned)} 稼いだ（行動力-${sessionCount}）`);
+      sessionEarned = 0; sessionCount = 0;
+      save(); render();
+    }
+  };
+  btn.addEventListener('pointerdown', startWork);
+  btn.addEventListener('pointerup', stopWork);
+  btn.addEventListener('pointerleave', stopWork);
+  btn.addEventListener('pointercancel', stopWork);
 }
 
 function openLogModal() {
@@ -2426,7 +3314,7 @@ function openLogModal() {
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[70vh] overflow-y-auto">
     <div class="flex justify-between items-center mb-2"><h2 class="font-bold">📜 ログ</h2><button id="log-close" class="text-slate-400 text-xl">✕</button></div>
-    <div class="text-xs space-y-0.5">${(state.log || []).map(l => `<div>・${l}</div>`).join('') || '<div class="text-slate-400">まだログはありません</div>'}</div></div>`);
+    <div class="text-xs space-y-0.5">${(state.log || []).map(l => `<div>・${l}</div>`).join('') || '<div class="text-slate-500">まだログはありません</div>'}</div></div>`);
   m.appendChild(box);
   box.querySelector('#log-close').addEventListener('click', () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; });
 }
@@ -2441,34 +3329,35 @@ function openListingsModal() {
     return `
     <div class="border rounded p-2 text-xs space-y-1">
       <div class="flex justify-between items-start gap-1">
-        <div class="min-w-0"><div class="font-bold truncate">${p.name || p.label}</div><div class="text-[10px] text-slate-400">${p.label}</div></div>
+        <div class="flex items-center gap-2 min-w-0">${renderBuildingSVG(p, 'w-10 h-10')}
+          <div class="min-w-0"><div class="font-bold truncate">${p.name || p.label}</div><div class="text-[11px] text-slate-500">${p.label}</div></div></div>
         <button class="fav-toggle text-base leading-none shrink-0" data-id="${p.id}" title="お気に入り">${fav ? '★' : '☆'}</button>
       </div>
-      <div>${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}${L.yen(p.price)}${p.origPrice && p.price < p.origPrice ? ' <span class="text-[10px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}・表面利回り${(p.grossYield * 100).toFixed(1)}%${p.staleFlag ? '・<span class="text-amber-600">売れ残り中</span>' : ''}</div>
-      ${fav ? `<div class="text-slate-400">お気に入り登録から${state.month - fav.addedMonth}ヶ月</div>` : ''}
+      <div>${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}${L.yen(p.price)}${p.origPrice && p.price < p.origPrice ? ' <span class="text-[11px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}・表面利回り${(p.grossYield * 100).toFixed(1)}%${p.staleFlag ? '・<span class="text-amber-600">売れ残り中</span>' : ''}${p.sellerUrgency ? '・<span class="text-rose-600 font-bold">🏃売り急ぎ</span>' : ''}</div>
+      ${fav ? `<div class="text-slate-500">お気に入り登録から${state.month - fav.addedMonth}ヶ月</div>` : ''}
       <div class="grid grid-cols-3 gap-1">
         <button class="listing-detail border rounded py-1" data-id="${p.id}">📋 詳細</button>
         <button class="listing-locate border rounded py-1" data-id="${p.id}">📍 地図を見る</button>
         <button class="listing-buy bg-navy text-white rounded py-1" data-id="${p.id}">買付を検討</button>
       </div>
     </div>`;
-  }).join('') : '<div class="text-slate-400 text-sm">まだ見つかった物件はありません。営業してみましょう。</div>';
+  }).join('') : '<div class="text-slate-500 text-sm">まだ見つかった物件はありません。営業してみましょう。</div>';
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2">
     <div class="flex justify-between items-center"><h2 class="font-bold">🗂️ 物件情報（${state.market.length}件）</h2><button id="listings-close" class="text-slate-400 text-xl">✕</button></div>
     ${rows}</div>`);
   m.appendChild(box);
   box.querySelector('#listings-close').addEventListener('click', close);
   box.querySelectorAll('.listing-detail').forEach(b => b.addEventListener('click', () => {
-    close(); openDetail(Number(b.dataset.id), 'market', () => openListingsModal());
+    close(); openDetail(parsePropId(b.dataset.id), 'market', () => openListingsModal());
   }));
   box.querySelectorAll('.listing-locate').forEach(b => b.addEventListener('click', () => {
-    focusOnMarket(Number(b.dataset.id)); close();
+    focusOnMarket(parsePropId(b.dataset.id)); close();
   }));
   box.querySelectorAll('.listing-buy').forEach(b => b.addEventListener('click', () => {
-    close(); openPurchase(Number(b.dataset.id), () => openListingsModal());
+    close(); openPurchase(parsePropId(b.dataset.id), () => openListingsModal());
   }));
   box.querySelectorAll('.fav-toggle').forEach(b => b.addEventListener('click', () => {
-    const id = Number(b.dataset.id);
+    const id = parsePropId(b.dataset.id);
     const already = (state.favorites || []).some(f => f.propertyId === id);
     if (already) {
       state = L.removeFavorite(state, id).state;
@@ -2481,13 +3370,48 @@ function openListingsModal() {
   }));
 }
 
-// お気に入り登録物件の値下げ・他決を知らせる通知一覧。開くと未読は既読になる。
-// 通知に紐づく物件の詳細を開く。既に市場からも所有からも消えている（他決済み等）場合は素直に諦める。
-function openPropertyFromNotif(propertyId) {
+// 通知に紐づく物件の詳細を開く。市場からも所有からも消えている場合（他決済み等）は、
+// v3: 通知に保存されたスナップショットがあれば閲覧専用画面で「最後に見る」ことができる。
+function openPropertyFromNotif(n) {
+  const propertyId = typeof n === 'object' ? n?.propertyId : n;
+  const snapshot = typeof n === 'object' ? n?.snapshot : null;
   if (propertyId == null) return;
   if (state.properties.some(p => p.id === propertyId)) { openDetail(propertyId, 'owned'); return; }
   if (state.market.some(p => p.id === propertyId)) { openDetail(propertyId, 'market'); return; }
+  if (snapshot) { openSoldSnapshot(snapshot); return; }
   alert('その物件は既に取引済みのため詳細を表示できません');
+}
+
+// v3: 他決済み物件の閲覧専用詳細。買付・指値・お気に入りは不可、見るだけ。
+function openSoldSnapshot(p) {
+  const m = document.getElementById('detail-modal');
+  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
+  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const occ = p.units?.length ? Math.round(p.units.filter(u => u.occupied).length / p.units.length * 100) : 100;
+  const rows = (p.units || []).map((u, i) => `<tr class="border-t"><td>${i + 1}号室</td><td class="text-right">${L.yen(u.rent)}</td><td class="text-right">${u.occupied ? '入居中' : '空室'}</td></tr>`).join('');
+  const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
+    <div class="p-3 border-b shrink-0">
+      <div class="flex justify-between items-center mb-1">
+        <span class="text-[11px] bg-slate-500 text-white rounded px-2 py-0.5">🚫 他決済み（閲覧のみ）</span>
+        <button id="ss-close" class="text-slate-400 text-xl leading-none">✕</button></div>
+      <div class="flex items-center gap-2">${renderBuildingSVG(p, 'w-14 h-14')}
+        <div class="min-w-0"><div class="font-bold truncate">${p.name || p.label}</div><div class="text-[11px] text-slate-500">${p.label}</div></div></div>
+    </div>
+    <div class="p-4 text-sm overflow-y-auto min-h-0 flex-1 space-y-2">
+      <table class="w-full text-sm">
+        <tr><td>売出価格</td><td class="text-right font-bold">${L.yen(p.price)}</td></tr>
+        <tr class="border-t"><td>表面利回り</td><td class="text-right">${(p.grossYield * 100).toFixed(1)}%</td></tr>
+        <tr class="border-t"><td>構造・築年</td><td class="text-right">${p.structure}・築${p.builtAge}年</td></tr>
+        <tr class="border-t"><td>修繕度</td><td class="text-right">${p.repairState}%</td></tr>
+        <tr class="border-t"><td>入居率</td><td class="text-right">${occ}%</td></tr>
+        ${p.junkFlags?.length ? `<tr class="border-t"><td>訳あり</td><td class="text-right text-red-600">${p.junkFlags.join('・')}</td></tr>` : ''}
+      </table>
+      <div class="text-xs font-bold pt-2 border-t">レントロール</div>
+      <table class="w-full text-xs">${rows || '<tr><td class="text-slate-500">データなし</td></tr>'}</table>
+      <div class="text-[11px] text-slate-500">この物件は他の買主で成約済みのため、買付・お気に入り登録はできません。</div>
+    </div></div>`);
+  m.appendChild(box);
+  box.querySelector('#ss-close').addEventListener('click', close);
 }
 
 // 通知は一覧を開いただけでは既読にならず、✓（詳細へ）か✕（閉じる）を個別に押して初めてチェック済みになる。
@@ -2498,15 +3422,15 @@ function openNotificationsModal() {
   const rows = notifs.length ? notifs.map(n => `
     <div class="notif-row border rounded p-2 text-xs space-y-1 ${n.read ? 'opacity-50' : 'bg-amber-50'}" data-id="${n.id}">
       <div class="flex justify-between items-center">
-        <div class="text-slate-400 text-[10px]">${Math.floor(n.month / 12)}年${n.month % 12}ヶ月</div>
+        <div class="text-slate-500 text-[11px]">${Math.floor(n.month / 12)}年${n.month % 12}ヶ月</div>
         ${n.read ? '' : '<span class="text-[9px] bg-amber-500 text-white rounded px-1">未読</span>'}
       </div>
-      <div>${n.kind === 'sold_out' ? '🚫' : n.kind === 'repair_needed' ? '🔧' : '💸'} ${n.message}</div>
+      <div>${n.kind === 'sold_out' ? '🚫' : n.kind === 'repair_needed' ? '🔧' : n.kind === 'repair_done' ? '✅' : '💸'} ${n.message}</div>
       <div class="flex gap-1 justify-end">
-        <button class="notif-check border rounded px-2 py-0.5" data-id="${n.id}">✓ 物件詳細へ</button>
+        ${n.kind === 'sold_out' && !n.snapshot ? '' : `<button class="notif-check border rounded px-2 py-0.5" data-id="${n.id}">${n.kind === 'sold_out' ? '✓ 確認（物件を見る）' : '✓ 物件詳細へ'}</button>`}
         <button class="notif-dismiss border rounded px-2 py-0.5" data-id="${n.id}">✕ 閉じる</button>
       </div>
-    </div>`).join('') : '<div class="text-slate-400 text-sm">通知はまだありません</div>';
+    </div>`).join('') : '<div class="text-slate-500 text-sm">通知はまだありません</div>';
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2">
     <div class="flex justify-between items-center"><h2 class="font-bold">🔔 通知</h2><button id="notifs-close" class="text-slate-400 text-xl">✕</button></div>
     ${rows}</div>`);
@@ -2523,7 +3447,7 @@ function openNotificationsModal() {
     const n = notifs.find(x => x.id === id);
     state = L.markNotificationRead(state, id).state;
     save(); renderPanelRight(); close();
-    if (n) openPropertyFromNotif(n.propertyId);
+    if (n) openPropertyFromNotif(n);
   }));
 }
 
@@ -2555,7 +3479,7 @@ function showNotifToast(n) {
     if (n.id != null) state = L.markNotificationRead(state, n.id).state;
     save(); renderPanelRight();
     dismissToast(t);
-    openPropertyFromNotif(n.propertyId);
+    openPropertyFromNotif(n);
   });
 }
 // Enterキーで一番上（最初に出た）トーストから順に閉じる。
@@ -2571,7 +3495,7 @@ function openSearchModal() {
   const genreBoxes = BASE_GENRE_ORDER.map(k =>
     `<label class="flex items-center gap-1 text-xs border rounded px-1 py-0.5"><input type="checkbox" class="sel-genre" value="${k}" ${searchSelection.genres.includes(k) ? 'checked' : ''}> ${L.GENRE[k].label}</label>`).join('');
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
-    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">🏘️ 不動産屋へ営業（行動力-40）</h2><button id="search-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">🏘️ 物件情報を探す（1回 行動力-1）</h2><button id="search-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
     <div class="grid grid-cols-2 gap-1">${genreBoxes}</div>
     <label class="flex items-center gap-1 text-xs"><input type="checkbox" id="sel-wakeari" ${searchSelection.wakeari ? 'checked' : ''}> 訳あり物件も含める</label>
     <div class="flex gap-3 text-xs">
@@ -2583,57 +3507,78 @@ function openSearchModal() {
       <label><input type="checkbox" class="sel-age" value="mid" ${searchSelection.ages.includes('mid') ? 'checked' : ''}> 11〜25年</label>
       <label><input type="checkbox" class="sel-age" value="old" ${searchSelection.ages.includes('old') ? 'checked' : ''}> 築古26年〜</label>
     </div>
-    <button id="btn-search" class="w-full bg-navy text-white rounded py-2 text-sm font-bold">この条件で探す</button>
-    <button id="btn-search-close" class="w-full text-slate-400 text-sm">閉じる</button></div>`);
+    <div id="sr-progress" class="text-[11px] font-bold text-slate-600 text-center">${(state.salesSearch?.spent || 0) > 0 ? `調査継続中（累計 行動力${state.salesSearch.spent}消費）` : '足で稼いだ情報が出物につながる'}</div>
+    <button id="btn-search" class="w-full bg-navy text-white rounded py-2 text-sm font-bold select-none touch-none">🔍 動いて情報を集める（行動力-1・長押しOK）</button>
+    <div id="sr-feed" class="text-[11px] leading-relaxed h-28 overflow-y-auto space-y-0.5 bg-slate-50 rounded p-2"><div class="sr-empty text-slate-500">ここに調査ログが流れます。物件を見つけたらログをタップで詳細へ。</div></div>
+    <button id="btn-search-close" class="w-full text-slate-500 text-sm">閉じる</button></div>`);
   m.appendChild(box);
   box.querySelectorAll('.sel-genre, .sel-area, .sel-age, #sel-wakeari').forEach(cb =>
     cb.addEventListener('change', () => { searchSelection = readSearchSelection(); }));
-  box.querySelector('#btn-search').addEventListener('click', e => onSearchClick(e, close));
+  // v3.8: 働くと同様の長押し対応。押している間は約0.2秒ごとに連続調査し、発見か行動力切れで自動停止。
+  const searchBtn = box.querySelector('#btn-search');
+  let srTimer = null;
+  const srStop = () => { if (srTimer) { clearInterval(srTimer); srTimer = null; } };
+  const srOnce = () => {
+    const res = onSearchPress(box, close);
+    if (!res || !res.pressed || res.found) srStop();
+  };
+  searchBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); if (srTimer) return; srOnce(); srTimer = setInterval(srOnce, 200); });
+  searchBtn.addEventListener('pointerup', srStop);
+  searchBtn.addEventListener('pointerleave', srStop);
+  searchBtn.addEventListener('pointercancel', srStop);
   box.querySelector('#btn-search-close').addEventListener('click', close);
   box.querySelector('#search-x').addEventListener('click', close);
 }
 
-// 営業ボタン: ポップオーバーを閉じ、電話＆街を駆け回る大げさな全画面演出を挟んでから検索(doSearch)を実行する。
-function onSearchClick(e, closeModal) {
-  const sel = readSearchSelection();
-  if (!sel.genres.length || !sel.areas.length || !sel.ages.length) { alert('ジャンル・エリア・築年帯を1つ以上選んでください'); return; }
-  if (state.actionPower < 40) { alert('行動力が足りません。翌月へ進むと回復します。'); return; }
-  searchSelection = sel;   // モーダルを閉じる前に条件を確定（doSearchはこの値を使う。閉じたDOMを読み直さない）
-  closeModal();
-  playSearchMinigame(() => { const found = doSearch(); if (found) openListingsModal(); });
-}
+// v3: 営業は1押し=行動力2。ポータルサイト巡回・電話・訪問などの行動がランダムに出て、
+// 累計消費が隠し閾値（6〜40）に達すると物件情報を入手する。進捗は月・条件変更を跨いで維持。
+const SEARCH_ACTIONS = [
+  '🖥️ ポータルサイトを巡回した',
+  '📞 不動産屋に電話をかけた',
+  '🏢 不動産屋へ飛び込み訪問した',
+  '📮 投函チラシ・広告をチェックした',
+  '👂 大家仲間の噂話を聞いた',
+  '🗺️ 気になるエリアを車で流した',
+];
+const SEARCH_MISS = [
+  '…収穫なし',
+  '…それらしい話はあったが空振り',
+  '…「良いのが出たら連絡しますよ」',
+  '…惜しい物件は既に他で決まっていた',
+  '…掘り出し物はまだ見つからない',
+];
 
-// 営業ミニゲーム: DIYと同様、📞電話でヒアリング・📄資料を集める・🏢不動産屋を訪問の各ステップを
-// タップして進める。3つ全部こなすと doSearch を実行する（コスト・確率はロジックのまま不変）。
-function playSearchMinigame(done) {
-  const steps = [
-    { icon: '📞', label: '不動産屋に電話でヒアリング' },
-    { icon: '📄', label: '資料・図面を集める' },
-    { icon: '🏢', label: '不動産屋を訪問して交渉' },
-  ];
-  let doneCount = 0;
-  const overlay = el(`<div class="fixed inset-0 z-[70] bg-black/60 flex items-center justify-center p-4">
-    <div class="bg-white rounded-xl p-5 w-full max-w-sm space-y-2 text-center">
-      <h2 class="font-bold">🕵️ 物件を探す（営業活動）</h2>
-      <div class="text-xs text-slate-500">各ステップをタップして営業を進めよう！</div>
-      <div id="sm-steps" class="space-y-2"></div>
-      <div class="text-[11px] text-slate-400">3つ全部こなすと出物が見つかるかも…</div>
-    </div></div>`);
-  document.body.appendChild(overlay);
-  const stepsDiv = overlay.querySelector('#sm-steps');
-  steps.forEach(stp => {
-    const b = el(`<button class="sm-step w-full border rounded py-3 text-sm flex items-center justify-center gap-2"><span class="text-2xl">${stp.icon}</span>${stp.label}</button>`);
-    stepsDiv.appendChild(b);
-    b.addEventListener('click', () => {
-      if (b.dataset.done) return;
-      b.dataset.done = '1';
-      b.classList.add('bg-emerald', 'text-white');
-      b.innerHTML = `<span class="text-2xl">✅</span>${stp.label} 完了！`;
-      sfxKnock();
-      doneCount++;
-      if (doneCount >= steps.length) setTimeout(() => { overlay.remove(); done(); }, 520);
-    });
-  });
+function onSearchPress(box, closeModal) {
+  const sel = readSearchSelection();
+  if (!sel.genres.length || !sel.areas.length || !sel.ages.length) { alert('ジャンル・エリア・築年帯を1つ以上選んでください'); return { pressed: false }; }
+  if (state.actionPower < 1) { alert('行動力が足りません。翌月へ進むと回復します。'); return { pressed: false }; }
+  searchSelection = sel;
+  const genres = sel.wakeari ? sel.genres.flatMap(k => [k, WAKEARI_MAP[k]]) : sel.genres;
+  const r = L.doSalesPress(state, { genres, areas: sel.areas, ages: sel.ages }, Math.random);
+  if (!r.pressed) { alert('行動力が足りません。翌月へ進むと回復します。'); return { pressed: false }; }
+  state = r.state; save();
+  setCityState(state);   // v3.8fix: 新着物件を地図側の状態にも反映（これがないと「地図を見る」が効かない）
+  const feed = box.querySelector('#sr-feed');
+  feed.querySelector('.sr-empty')?.remove();
+  const act = SEARCH_ACTIONS[Math.floor(Math.random() * SEARCH_ACTIONS.length)];
+  const apEl = document.getElementById('hud-ap');
+  if (apEl) apEl.textContent = `⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}`;
+  if (r.found) {
+    // v3.5: 自動で一覧へ飛ばず、発見ログをタップで詳細へ（ログは消えず残る）
+    const line = el(`<div class="sr-found font-bold text-emerald-700 underline cursor-pointer">${act}…おっ！ ${r.found.name || r.found.label} の情報を掴んだ（タップで詳細）</div>`);
+    line.addEventListener('click', () => { closeModal(); openDetail(r.found.id, 'market', openSearchModal); });
+    feed.insertBefore(line, feed.firstChild);
+    sfxKnock();
+    pushLog(r.log);
+    box.querySelector('#sr-progress').textContent = '発見！ 続けて探すこともできます';
+    renderPanelRight();
+    return { pressed: true, found: true };
+  }
+  const miss = SEARCH_MISS[Math.floor(Math.random() * SEARCH_MISS.length)];
+  feed.insertBefore(el(`<div>${act}${miss}</div>`), feed.firstChild);
+  box.querySelector('#sr-progress').textContent = `調査継続中（累計 行動力${state.salesSearch.spent}消費）`;
+  renderPanelRight();
+  return { pressed: true, found: false };
 }
 
 // 🔒未開拓エリアをタップしたときの気の利いたティーザー（今後のアップデート解放を匂わせる）。
@@ -2643,25 +3588,13 @@ function openLockTeaser() {
       <div class="text-5xl">🔒🏝️</div>
       <h2 class="font-bold text-lg">未開拓エリア</h2>
       <p class="text-sm text-slate-600">ここはまだ手つかずの原野。<br>君がもっと大物大家になるか、時が満ちれば……いつか新しい街が広がるかも。</p>
-      <p class="text-[11px] text-slate-400">🚧 今後のアップデートで解放予定</p>
+      <p class="text-[11px] text-slate-500">🚧 今後のアップデートで解放予定</p>
       <button id="lock-ok" class="w-full bg-navy text-white rounded py-2 text-sm">わくわく…！</button>
     </div></div>`);
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
   overlay.querySelector('#lock-ok').addEventListener('click', close);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-}
-
-// 物件が見つかったかどうかを返す（呼び出し元が「見つかったら一覧を開く」判断に使う）。
-// 条件は呼び出し前に searchSelection へ確定済み（モーダルを閉じた後に呼ばれるためDOMは読み直さない）。
-function doSearch() {
-  const { genres: baseGenres, areas, ages, wakeari } = searchSelection;
-  if (!baseGenres.length || !areas.length || !ages.length) { alert('ジャンル・エリア・築年帯を1つ以上選んでください'); return false; }
-  if (state.actionPower < 40) { alert('行動力が足りません。翌月へ進むと回復します。'); return false; }
-  const genres = wakeari ? baseGenres.flatMap(k => [k, WAKEARI_MAP[k]]) : baseGenres;
-  const r = L.doSalesSearch(state, { genres, areas, ages }, Math.random);
-  state = r.state; pushLog(r.log); save(); render();
-  return !!r.found;
 }
 
 // 翌月へ進む瞬間、シティビューの各建物から現金表示へコインが飛ぶ「回収」の動き。
@@ -2694,8 +3627,11 @@ function onNextMonth() {
   save(); render();
   const freshNotifs = (state.notifications || []).filter(n => !priorNotifIds.has(n.id));
   freshNotifs.forEach((n, i) => setTimeout(() => showNotifToast(n), 500 + i * 900));
-  settling.forEach((s, i) => setTimeout(() => celebrate('売買成立！おめでとうございます',
-    `${s.label} を ${L.yen(s.sale.price)} で売却`, '💰🎉'), i * 2200));
+  // v3.6: 売却成立も買付・購入と同じ判子スタンプ演出に統一
+  settling.forEach((s, i) => setTimeout(() => playStampFx({
+    stamp: '売却成立', title: '売り抜けた！', sub: `${s.label} ／ ${L.yen(s.sale.price)}`,
+    emojis: ['💰', '📈', '✨', '💴', '🎉', '✨'],
+  }), i * 2700));
   if (r.pendingEvent) { showEvent(r.pendingEvent); return; }
   const withOffer = (state.listings || []).find(l => l.offer);
   if (withOffer) { showOfferModal(withOffer); return; }
@@ -2724,18 +3660,167 @@ function showEvent(pending) {
   m.appendChild(box);
 }
 
-function endScreen(title, detail, color){
+// === v3.7: フィナーレ＆リザルト ===
+let endFxShown = false;   // 演出の多重再生ガード（フリープレイ移行後はstate.freePlayで抑止）
+
+// クリア専用フィナーレ。夜空に打ち上げ花火＋街のライトアップ＋巨大スタンプ。他のどの演出より一段派手に。
+function playClearFinale(done) {
+  sfxFanfare();
+  const overlay = el(`<div class="fixed inset-0 z-[80]" style="background:linear-gradient(180deg,#020617 0%,#0f172a 70%,#1e293b 100%);"></div>`);
+  const cv = document.createElement('canvas');
+  cv.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;';
+  overlay.appendChild(cv);
+  const label = el(`<div class="absolute inset-0 flex flex-col items-center justify-center text-center pointer-events-none" style="opacity:0;transition:opacity 0.6s;">
+    <style>@keyframes fin-stamp { 0% { transform: scale(3.4) rotate(14deg); opacity: 0; } 55% { transform: scale(0.92) rotate(-8deg); opacity: 1; } 75% { transform: scale(1.08) rotate(-8deg); } 100% { transform: scale(1) rotate(-8deg); } }</style>
+    <div class="mx-auto w-52 h-52 rounded-full bg-white/95 shadow-2xl flex items-center justify-center" style="border:12px solid #dc2626;animation: fin-stamp 0.6s cubic-bezier(.2,1.4,.4,1) 0.2s both;">
+      <span class="text-4xl font-black" style="color:#dc2626;">目標達成</span></div>
+    <div class="mt-6 text-4xl md:text-5xl font-black tracking-widest"><span style="background:linear-gradient(180deg,#fde68a,#f59e0b);-webkit-background-clip:text;background-clip:text;color:transparent;">🏆 メガ大家、達成!!</span></div>
+    <div class="mt-3 text-white/90 text-lg font-bold">開始から ${Math.floor(state.month / 12)}年${state.month % 12}ヶ月</div>
+  </div>`);
+  overlay.appendChild(label);
+  document.body.appendChild(overlay);
+  const ctx2 = cv.getContext('2d');
+  const W = cv.width = overlay.clientWidth || window.innerWidth;
+  const H = cv.height = overlay.clientHeight || window.innerHeight;
+  const bldgs = Array.from({ length: 18 }, (_, i) => ({ x: i * (W / 18) + Math.random() * 10, w: W / 22, h: 40 + Math.random() * 90 }));
+  const COLORS = ['#fbbf24', '#f472b6', '#60a5fa', '#34d399', '#f87171', '#c084fc', '#fde047'];
+  const rockets = [], parts = [];
+  let launched = 0;
+  const launchTimer = setInterval(() => {
+    if (launched >= 14) { clearInterval(launchTimer); return; }
+    launched += 1;
+    rockets.push({ x: W * (0.15 + Math.random() * 0.7), y: H, vy: -(H * 0.012 + Math.random() * H * 0.004),
+      color: COLORS[launched % COLORS.length], fuse: H * (0.30 + Math.random() * 0.28) });
+    sfxKnock();
+  }, 330);
+  let raf;
+  const step = () => {
+    ctx2.clearRect(0, 0, W, H);
+    bldgs.forEach(b => {
+      ctx2.fillStyle = '#0b1220';
+      ctx2.fillRect(b.x, H - b.h, b.w, b.h);
+      ctx2.fillStyle = 'rgba(253,224,71,0.85)';
+      for (let wy = H - b.h + 8; wy < H - 6; wy += 14) for (let wx = b.x + 4; wx < b.x + b.w - 4; wx += 10)
+        if ((Math.round(wx) * 7 + Math.round(wy) * 13) % 5 < 2) ctx2.fillRect(wx, wy, 4, 6);
+    });
+    for (let i = rockets.length - 1; i >= 0; i--) {
+      const r = rockets[i];
+      r.y += r.vy;
+      ctx2.fillStyle = '#fff'; ctx2.fillRect(r.x - 1.5, r.y, 3, 10);
+      if (r.y <= r.fuse) {
+        rockets.splice(i, 1);
+        for (let k = 0; k < 46; k++) {
+          const a = Math.random() * Math.PI * 2, sp = 1.5 + Math.random() * 3.6;
+          parts.push({ x: r.x, y: r.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, color: r.color });
+        }
+      }
+    }
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p2 = parts[i];
+      p2.x += p2.vx; p2.y += p2.vy; p2.vy += 0.035; p2.life -= 0.012;
+      if (p2.life <= 0) { parts.splice(i, 1); continue; }
+      ctx2.globalAlpha = Math.max(0, p2.life);
+      ctx2.fillStyle = p2.color;
+      ctx2.fillRect(p2.x, p2.y, 3, 3);
+    }
+    ctx2.globalAlpha = 1;
+    raf = requestAnimationFrame(step);
+  };
+  raf = requestAnimationFrame(step);
+  setTimeout(() => { label.style.opacity = '1'; sfxFanfare(); }, 1400);
+  setTimeout(() => { cancelAnimationFrame(raf); clearInterval(launchTimer); overlay.remove(); done(); }, 6200);
+}
+
+// 敗北演出（破産=暗転＋ひび割れトーン／期限切れ=夕暮れトーン）。この後リザルトで最終チェックできる。
+function playDefeatFx(kind, done) {
+  sfxFail();
+  const conf = kind === 'bankrupt'
+    ? { tint: 'rgba(15,23,42,0.95)', stamp: '破産', title: '資金が尽きた…', sub: '手元現金がマイナスになりました' }
+    : { tint: 'rgba(69,26,3,0.93)', stamp: '期限切れ', title: '時間切れ…', sub: '期限までに目標へ届きませんでした' };
+  const overlay = el(`<div class="fixed inset-0 z-[80] flex items-center justify-center" style="background:${conf.tint};">
+    <style>@keyframes df-stamp { 0% { transform: scale(3) rotate(12deg); opacity: 0; } 60% { transform: scale(0.95) rotate(-8deg); opacity: 1; } 100% { transform: scale(1) rotate(-8deg); } }</style>
+    <div class="text-center text-white space-y-4">
+      <div class="mx-auto w-44 h-44 rounded-full flex items-center justify-center" style="border:10px solid #94a3b8;background:rgba(255,255,255,0.05);animation: df-stamp 0.5s cubic-bezier(.2,1.4,.4,1) both;">
+        <span class="${conf.stamp.length >= 4 ? 'text-3xl' : 'text-4xl'} font-black" style="color:#cbd5e1;">${conf.stamp}</span></div>
+      <div class="text-2xl font-bold">${conf.title}</div>
+      <div class="text-sm opacity-80">${conf.sub}</div>
+    </div></div>`);
+  document.body.appendChild(overlay);
+  setTimeout(() => { overlay.remove(); done(); }, 2300);
+}
+
+// リザルト画面。最終バランスシート・ポートフォリオ・生涯実績・称号をまとめて最終チェックできる。
+function openResultScreen(kind) {
   const m = document.getElementById('setup-modal');
-  m.classList.remove('hidden'); m.innerHTML='';
-  m.appendChild(el(`<div class="bg-white rounded-xl p-6 text-center space-y-3 max-w-md">
-    <h2 class="font-bold text-2xl ${color}">${title}</h2><p class="text-sm">${detail}</p>
-    <button onclick="localStorage.removeItem('${SAVE_KEY}');location.reload()" class="bg-navy text-white rounded px-4 py-2">もう一度プレイ</button></div>`));
+  m.classList.remove('hidden'); m.innerHTML = '';
+  const nw = L.netWorth(state), ta = L.totalAssetsV2(state), td = L.totalDebt(state);
+  const title = L.resultTitle(state);
+  const goalText = `${state.goal.type === 'networth' ? '純資産' : '月間CF'} ${L.yen(state.goal.amount)}`;
+  const persProps = state.properties.filter(p => p.owner !== 'corp');
+  const corpProps = state.properties.filter(p => p.owner === 'corp');
+  const sumTv = (arr) => arr.reduce((t, p) => t + p.timeValue, 0);
+  const propRows = state.properties.length ? state.properties.map(p => `
+    <div class="flex items-center gap-2 border rounded p-1.5">${renderBuildingSVG(p, 'w-8 h-8')}
+      <div class="min-w-0 flex-1 text-left"><div class="font-bold truncate text-[11px]">${p.name || p.label}</div>
+      <div class="text-[11px] text-slate-500">${p.owner === 'corp' ? '🏢法人' : '👤個人'}・時価 ${L.yen(p.timeValue)}</div></div></div>`).join('')
+    : '<div class="text-slate-500 text-xs col-span-2">所有物件なし</div>';
+  const st = state.stats || {};
+  const badgeIds = L.evaluateBadges(state);
+  const badges = badgeIds.length ? badgeIds.map(id => `<span class="inline-block border rounded px-1.5 py-0.5 mr-1 mb-1">${L.BADGES[id].icon}${L.BADGES[id].label}</span>`).join('') : 'なし';
+  const head = kind === 'clear'
+    ? `<div class="text-3xl font-black"><span style="background:linear-gradient(180deg,#f59e0b,#b45309);-webkit-background-clip:text;background-clip:text;color:transparent;">🏆 称号「${title}」</span></div>
+       <div class="text-sm text-slate-600">目標 ${goalText} を ${Math.floor(state.month / 12)}年${state.month % 12}ヶ月 で達成！</div>`
+    : `<div class="text-2xl font-black text-slate-700">${kind === 'bankrupt' ? '💥' : '⏰'} 称号「${title}」</div>
+       <div class="text-sm text-slate-600">${Math.floor(state.month / 12)}年${state.month % 12}ヶ月の挑戦でした（目標 ${goalText}）</div>`;
+  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-lg max-h-[90vh] overflow-y-auto space-y-3 text-center">
+    ${head}
+    <div class="text-left">
+      <div class="font-bold text-sm mb-1">📒 最終バランスシート</div>
+      <table class="w-full text-sm">
+        <tr><td>手元現金</td><td class="text-right font-bold">${L.yen(state.cash)}</td></tr>
+        <tr class="border-t"><td>総資産（現金＋物件時価）</td><td class="text-right">${L.yen(ta)}</td></tr>
+        <tr><td>総負債（残債）</td><td class="text-right text-red-600">-${L.yen(td)}</td></tr>
+        <tr class="border-t font-bold"><td>純資産</td><td class="text-right text-emerald-700">${L.yen(nw)}</td></tr>
+        <tr class="border-t"><td>月間キャッシュフロー</td><td class="text-right">${L.yen(L.monthlyCF(state))}</td></tr>
+      </table>
+    </div>
+    <div class="text-left">
+      <div class="font-bold text-sm mb-1">🏙️ ポートフォリオ（👤${persProps.length}件 ${L.yen(sumTv(persProps))} ・ 🏢${corpProps.length}件 ${L.yen(sumTv(corpProps))}）</div>
+      <div class="grid grid-cols-2 gap-1">${propRows}</div>
+    </div>
+    <div class="text-left text-xs">
+      <div class="font-bold text-sm mb-1">📜 生涯実績</div>
+      <div>購入 ${st.buys || 0}件 ／ 売却 ${st.sales || 0}件（うち利益売却 ${st.profitSales || 0}件）／ 訳あり再生 ${st.junkRepairs || 0}件・転売 ${st.junkFlips || 0}件 ／ 最大月CF ${L.yen(st.maxMonthlyCF ?? 0)}</div>
+      <div class="mt-1 leading-relaxed">${badges}</div>
+    </div>
+    <div class="flex gap-2 pt-2 border-t">
+      <button id="rs-retry" class="flex-1 bg-navy text-white rounded-lg py-2.5 text-sm font-bold">🔁 新しい人生でもう一度</button>
+      ${kind === 'clear' ? '<button id="rs-continue" class="flex-1 bg-amber-500 hover:bg-amber-600 text-white rounded-lg py-2.5 text-sm font-bold">🏙️ このまま経営を続ける</button>' : ''}
+    </div></div>`);
+  m.appendChild(box);
+  box.querySelector('#rs-retry').addEventListener('click', () => {
+    if (confirm('この人生を終えて、新しい人生をはじめますか？')) { localStorage.removeItem(SAVE_KEY); location.reload(); }
+  });
+  box.querySelector('#rs-continue')?.addEventListener('click', () => {
+    state.freePlay = true; save();
+    m.classList.add('hidden'); m.innerHTML = '';
+    render();
+  });
 }
 
 function checkEnd() {
-  if (L.isClearedV2(state)) return endScreen('🎉 ゲームクリア！', `目標（${state.goal.type === 'networth' ? '純資産' : '月CF'} ${L.yen(state.goal.amount)}）を達成した。メガ大家への道、達成！`, 'text-emerald');
-  if (L.isBankrupt(state)) return endScreen('💥 自己破産', '手元現金がマイナスに。ゲームオーバー。', 'text-red-600');
-  if (L.isTimeUpV2(state)) return endScreen('⏰ タイムアップ', '期限までに目標未達。', 'text-red-600');
+  if (!state || state.freePlay) return;   // クリア後フリープレイ中は再判定しない
+  if (L.isClearedV2(state)) {
+    if (!endFxShown) { endFxShown = true; playClearFinale(() => openResultScreen('clear')); }
+    return;
+  }
+  if (L.isBankrupt(state)) {
+    if (!endFxShown) { endFxShown = true; playDefeatFx('bankrupt', () => openResultScreen('bankrupt')); }
+    return;
+  }
+  if (L.isTimeUpV2(state)) {
+    if (!endFxShown) { endFxShown = true; playDefeatFx('timeup', () => openResultScreen('timeup')); }
+  }
 }
 
 wireGlobalAudioHooks();
@@ -2748,9 +3833,9 @@ initCity(document.getElementById('city-canvas'), {
   onTapLock: () => openLockTeaser(),                                      // 🔒未開拓エリアをクリック→ティーザー
 });
 
-// 起動
-if (load()) { document.getElementById('setup-modal').classList.add('hidden'); render(); }
-else showSetup();
+// 起動（v3.7: まずタイトル画面。セーブがあれば「続きから」）
+showTitle(load());
+document.getElementById('btn-result')?.addEventListener('click', () => openResultScreen('clear'));
 
 document.getElementById('btn-reset').addEventListener('click', () => {
   if (confirm('データをリセットしますか？')) { localStorage.removeItem(SAVE_KEY); location.reload(); }
