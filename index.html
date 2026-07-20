@@ -31,8 +31,13 @@
   <main class="relative flex-1 min-h-0">
     <canvas id="city-canvas" class="absolute inset-0 w-full h-full touch-none select-none" style="cursor:grab;"></canvas>
 
-    <div id="panel-left" class="absolute left-1 top-1 bottom-1 w-32 sm:w-44 md:w-52 flex flex-col gap-1.5 pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
-    <div id="panel-right" class="absolute right-1 top-1 bottom-1 w-32 sm:w-44 md:w-52 flex flex-col gap-1.5 items-stretch pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
+    <!-- PC/タブレット用の左右パネル（スマホでは非表示） -->
+    <div id="panel-left" class="hidden sm:flex absolute left-1 top-1 bottom-1 w-44 md:w-52 flex-col gap-1.5 pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
+    <div id="panel-right" class="hidden sm:flex absolute right-1 top-1 bottom-1 w-44 md:w-52 flex-col gap-1.5 items-stretch pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
+
+    <!-- v3.9: スマホ用UI（sm未満のみ表示）。上部に主要3情報、下部に主要3アクション＋メニュー -->
+    <div id="mobile-status" class="sm:hidden absolute top-1 left-1 right-1 z-10 grid grid-cols-3 gap-1"></div>
+    <div id="mobile-actions" class="sm:hidden absolute left-2 right-2 z-20 flex gap-2" style="bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);"></div>
   </main>
 
   <!-- 選択肢イベント／各種モーダル -->
@@ -48,6 +53,7 @@
   <div id="kpi-modal" class="fixed inset-0 bg-black/40 z-40 hidden items-center justify-center p-4"></div>
   <div id="bgm-modal" class="fixed inset-0 bg-black/40 z-40 hidden items-center justify-center p-4"></div>
   <div id="diy-modal" class="fixed inset-0 bg-black/40 z-40 hidden items-center justify-center p-4"></div>
+  <div id="mobile-drawer" class="fixed inset-0 z-40 hidden"></div>
   <script type="module">
   // ==== inlined from src/logic.mjs（このビルドは scripts/build-inline.mjs が自動生成）====
 export const CONFIG = {
@@ -212,6 +218,40 @@ export function propertyName(genreKey, builtAge, seed) {
   return pool[Math.floor(rnd() * pool.length)];
 }
 
+// v3.10: 間取りごとの専有面積帯（㎡）。家賃はこの面積から算出する。
+export const LAYOUT_SIZES = {
+  '1R':   [16, 25], '1K':  [20, 30], '1DK': [25, 35], '1LDK': [30, 45],
+  '2LDK': [45, 65], '3LDK': [60, 85], '4LDK': [80, 110],
+};
+// 各構造でどの間取りもあり得る（可能性は排除しない）。よくある間取りを重み付けで多めにしただけの重み配列。
+const GENRE_LAYOUTS = {
+  // 戸建てはファミリー向けが基本（単身1R/1Kは現実的に稀なので出さない・極小の1DKだけ稀に）
+  kodate:   ['2LDK', '3LDK', '3LDK', '3LDK', '4LDK', '4LDK', '4LDK', '1DK'],
+  // アパートは単身〜小家族向け中心（3LDK以上のアパートは稀なので出さない）
+  apart:    ['1R', '1R', '1K', '1K', '1K', '1DK', '1DK', '1LDK', '2LDK'],
+  // 鉄骨マンションは単身〜ファミリーまで（4LDKは稀なので出さない）
+  tekkotsu: ['1K', '1K', '1DK', '1LDK', '1LDK', '2LDK', '2LDK', '3LDK'],
+  // 区分は単身〜ファミリー
+  kubun:    ['1R', '1K', '1K', '1DK', '1LDK', '1LDK', '2LDK', '3LDK'],
+  // RCマンションは単身〜ファミリー
+  rc:       ['1K', '1K', '1DK', '1LDK', '1LDK', '2LDK', '2LDK', '3LDK'],
+};
+// エリア別の㎡あたり月額家賃相場（円）。都心は高く地方は安い。
+const RENT_PER_SQM = { urban: [2400, 3400], local: [1200, 1800] };
+
+// 面積・エリア・築年・タイプから現実的な月額家賃を算出（家賃先行モデル）。
+export function estimateRent(sizeSqm, areaKey, builtAge, genreKey, rng = Math.random) {
+  const [lo, hi] = RENT_PER_SQM[areaKey] || RENT_PER_SQM.local;
+  const perSqm = lo + (hi - lo) * rng();
+  const ageFactor = Math.max(0.55, Math.min(1, 1 - Math.max(0, builtAge - 5) * 0.008));
+  const isKodate = genreKey === 'kodate' || genreKey === 'w_kodate';
+  const typeFactor = isKodate ? 0.65 : 1.0;   // 戸建ては㎡単価が割安
+  const junkFactor = genreKey.startsWith('w_') ? 0.85 : 1.0;   // 訳ありは状態相応に安い
+  const noise = 0.92 + rng() * 0.16;
+  const rent = sizeSqm * perSqm * ageFactor * typeFactor * junkFactor * noise;
+  return Math.max(15000, Math.round(rent / 1000) * 1000);
+}
+
 export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands = null) {
   const g = GENRE[genreKey], a = AREA_ADJ[areaKey];
   const lr = (lo, hi) => lo + (hi - lo) * rng();
@@ -221,20 +261,28 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
     if (ok.length) { const [lo, hi] = ok[Math.floor(rng() * ok.length)]; ageMin = Math.max(lo, g.ageMin); ageMax = Math.min(hi, g.ageMax); }
   }
   const builtAge = Math.round(lr(ageMin, ageMax));
-  const price = Math.max(10000, Math.round(lr(g.priceMin, g.priceMax) * a.priceF / 10000) * 10000);
-  const grossYield = lr(g.yieldMin, g.yieldMax) + a.yieldAdd;
   const unitCount = Math.round(lr(g.unitsMin, g.unitsMax));
-  const rentTotalM = price * grossYield / 12;
+  // v3.10: 家賃先行。建物ごとに1つの間取りを選び（同じ建物は概ね同じ間取り）、各室に面積のばらつきを付ける。
+  const normalKey = genreKey.startsWith('w_') ? genreKey.slice(2) : genreKey;
+  const layoutPool = GENRE_LAYOUTS[normalKey] || GENRE_LAYOUTS.kubun;
+  const layout = layoutPool[Math.floor(rng() * layoutPool.length)];
+  const [szLo, szHi] = LAYOUT_SIZES[layout];
   const units = Array.from({ length: unitCount }, () => {
-    const rent = Math.max(5000, Math.round(rentTotalM / unitCount * lr(0.9, 1.1) / 1000) * 1000);
+    const sizeSqm = Math.round(lr(szLo, szHi));
+    const rent = estimateRent(sizeSqm, areaKey, builtAge, genreKey, rng);
     const occupied = g.wake ? rng() < 0.4 : rng() > Math.max(0.03, 0.10 + a.vacancyAdd);
-    return { rent, occupied, vacantMonths: occupied ? 0 : Math.round(lr(1, 6)) };
+    return { rent, occupied, vacantMonths: occupied ? 0 : Math.round(lr(1, 6)), layout, sizeSqm };
   });
+  // v3.10: 価格は家賃から導く（年間家賃 ÷ 想定利回り帯）。訳ありは高利回り帯＝安い掘り出し物のまま。
+  const gpiM = units.reduce((s, u) => s + u.rent, 0);
+  const grossYield = Math.max(0.03, lr(g.yieldMin, g.yieldMax) + a.yieldAdd);
+  const price = Math.max(10000, Math.round(gpiM * 12 / grossYield / 10000) * 10000);
+  const rentTotalM = gpiM;
   const isKubun = genreKey === 'kubun' || genreKey === 'w_kubun';
   const id = __pid();
   const p = {
     id, genreKey, areaKey, name: propertyName(genreKey, builtAge, id), label: `${g.label}（${a.label}）`,
-    builtAge, structure: g.structure, units,
+    builtAge, structure: g.structure, units, layout,
     price, askingPrice: price, origPrice: price, timeValue: Math.round(price * lr(0.95, 1.15)),
     grossYield,
     mgmtFeeM: isKubun ? Math.round(lr(10000, 20000)) : Math.round(rentTotalM * 0.03),
@@ -699,7 +747,8 @@ export function doWork(state, rng = Math.random) {
   if (state.actionPower < 1) return { state, earned: 0 };
   const s = structuredClone(state);
   s.actionPower -= 1;
-  const earned = (10 + Math.floor(rng() * 91)) * 100;
+  // v3.9: 金額幅(1,000〜10,000円)は維持しつつ低額を引きやすく偏らせ、平均を約2,000円（旧5,500円の約37%）に。
+  const earned = (10 + Math.floor(Math.pow(rng(), 6) * 91)) * 100;
   s.cash += earned;
   return { state: s, earned };
 }
@@ -1067,10 +1116,37 @@ export function reviewAllBanks(property, price, downRatio, state) {
 
 // === v2: 売却フロー（査定・掲載・値下げ・取下げ） ===
 
+// v3.9: 市場利回り。物件の「通常版ジャンル」の標準利回りを基準に、築年・エリア・訳ありで調整。
+// 高利回り=市場が高い利回りを要求＝安く評価。低利回り=人気で高く評価。
+export function marketYield(property) {
+  const normalKey = property.genreKey.startsWith('w_') ? property.genreKey.slice(2) : property.genreKey;
+  const g = GENRE[normalKey] || GENRE.kodate;
+  const a = AREA_ADJ[property.areaKey] || AREA_ADJ.local;
+  let y = (g.yieldMin + g.yieldMax) / 2;         // その物件タイプの標準的な市場利回り
+  y += Math.max(0, property.builtAge - 15) * 0.0015;   // 築15年超は古いほど高利回り（安評価）
+  y += a.yieldAdd;                                // 都心は低利回り(高評価)・地方は高利回り(安評価)
+  if (property.junkFlags?.length) y += 0.06 + property.junkFlags.length * 0.02;   // 訳あり未解消は高利回り(安評価)
+  return Math.max(0.04, Math.min(0.5, y));
+}
+
+// v3.9: 収益還元法による適正価格。満室想定家賃を市場利回りで割り戻し、入居状況・修繕度で補正する。
+// これにより「安く買って直して満室にした物件」も家賃相応の現実的な価格で評価される。
+export function fairValue(property) {
+  if (!property.units?.length) return property.timeValue ?? 0;   // 家賃データがなければ従来の時価にフォールバック
+  const gpi = gpiAnnual(property);
+  if (gpi <= 0) return property.timeValue ?? 0;
+  const occ = property.units?.length ? property.units.filter(u => u.occupied).length / property.units.length : 1;
+  const incomeFactor = 0.6 + 0.4 * occ;       // 満室=満額・空室が多いほど収入評価を下げる
+  const repairFactor = 0.85 + 0.15 * (property.repairState ?? 100) / 100;   // ボロいほど最大15%減
+  return Math.round(gpi / marketYield(property) * incomeFactor * repairFactor);
+}
+
 export function appraise(property, appraisalLv, rng = Math.random) {
+  // v3.9: 査定は収益還元の適正価格ベース。査定なので気持ち安め(×0.92)＋目利きで誤差幅が縮む。
+  const base = Math.round(fairValue(property) * 0.92);
   const spread = Math.max(0.02, 0.10 - (appraisalLv - 1) * 0.01);
   const f = (1 - spread) + rng() * spread * 2;
-  return Math.round(property.timeValue * f / 10000) * 10000;
+  return Math.max(10000, Math.round(base * f / 10000) * 10000);
 }
 
 export function requestAppraisal(state, propertyId, rng = Math.random) {
@@ -1166,8 +1242,9 @@ export function searchHitChance(nGenres, nAreas, nAges, appraisalLv) {
 
 // === v3: 営業は1押下=行動力1消費。累計が隠し閾値(6〜40)に達すると物件情報を入手 ===
 export const SEARCH_PRESS_COST = 1;
-export const SEARCH_MIN = 6;
-export const SEARCH_MAX = 40;
+// v3.9: 出物に出会う確率を旧設定の約30〜50%に（＝必要な調査回数を約2.5倍に引き上げ）
+export const SEARCH_MIN = 15;
+export const SEARCH_MAX = 100;
 
 // 閾値抽選: threshold = 6 + 34×u^f。fは従来の発見率(0.30〜1.0)を流用し、
 // 条件が広く目利きLvが高いほど f が大きい＝低い閾値（早い発見）が出やすい。
@@ -1205,7 +1282,7 @@ export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) 
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, REPAIR_TIERS, repairTier, repairTierInfo, doDIY, totalDebt, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, doSalesPress };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, REPAIR_TIERS, repairTier, repairTierInfo, doDIY, totalDebt, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, doSalesPress };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -1399,15 +1476,16 @@ function drawLandmasses() {
   ctx.globalAlpha = 1;
 }
 
-// グレー雰囲気建物: 絵文字スプライトをグレースケール化して描画（呼び出し元でfilterを一括設定）
+// v3.9: 雰囲気建物。ctx.filterは使わず低alphaで奥に霞ませる（iOS Safariでもカラー絵文字を表示）。
 function drawGrayBuilding(lat, lon, stories, emoji) {
   const p = project(lat, lon);
   if (p.z < 0.05) return;
   const scale = 0.65 + p.z * 0.85;   // v3.5: ズームでもアイコンサイズは固定（間隔だけ変わる）
   const size = (12 + stories * 2.1) * scale;
-  ctx.globalAlpha = 0.55 + p.z * 0.35;
+  ctx.globalAlpha = 0.32 + p.z * 0.22;   // 実物件より薄く「奥に控える」表現
   ctx.font = `${Math.round(size)}px "Segoe UI Emoji", sans-serif`;
   ctx.fillText(emoji, p.x, p.y);
+  ctx.globalAlpha = 1;
 }
 
 // カラー建物（所有・売り出し中）: ジャンル別の絵文字＋状態バッジ。市場物件は常時グレー表示。
@@ -1431,11 +1509,12 @@ function drawColorBuilding(p, lat, lon, kind) {
     ctx.fillStyle = '#a7f3d0';
     ctx.beginPath(); ctx.arc(pr.x, pr.y - size * 0.35, size * 0.62, 0, TAU); ctx.fill();
   }
-  if (kind === 'market') ctx.filter = 'grayscale(1) brightness(0.75)';
-  ctx.globalAlpha = Math.min(1, 0.6 + pr.z * 0.55);
+  // v3.9: iOS Safariはcanvasのctx.filter＋絵文字描画が不安定でシルエット化するため使用しない。
+  // 市場（未所有）物件は半透明で「奥に控える」表現にし、全デバイスでカラー絵文字を表示する。
+  ctx.globalAlpha = kind === 'market' ? Math.min(0.55, 0.3 + pr.z * 0.3) : Math.min(1, 0.6 + pr.z * 0.55);
   ctx.font = `${Math.round(size)}px "Segoe UI Emoji", sans-serif`;
   ctx.fillText(emoji, pr.x, pr.y);
-  ctx.filter = 'none';
+  ctx.globalAlpha = 1;
 
   if (kind === 'owned') {
     const occ = p.units && p.units.length ? p.units.filter(u => u.occupied).length / p.units.length : 1;
@@ -1452,7 +1531,7 @@ function drawColorBuilding(p, lat, lon, kind) {
     }
   } else if (kind === 'market' && (st.favorites || []).some(f => f.propertyId === p.id)) {
     // お気に入り登録した市場物件だけ⭐を付けタップ可能にする（未登録の市場物件は雰囲気建物と同じ扱い）
-    ctx.filter = 'none';
+    ctx.globalAlpha = 1;
     ctx.font = `${Math.round(13 * scale)}px sans-serif`;
     ctx.fillText('⭐', pr.x, pr.y - size * 1.05);
   }
@@ -1507,9 +1586,8 @@ function draw(ts) {
   drawGlobeBase();
   drawLandmasses();
 
-  // グレー雰囲気建物（filterを一括設定してからまとめて描く＝呼び出しごとのsave/restoreを避け軽量化）
+  // v3.9: 雰囲気建物。ctx.filter（iOS Safariで不安定）は使わず、drawGrayBuilding側の低alphaで「奥に霞む」表現にする。
   ctx.save();
-  ctx.filter = 'grayscale(1) brightness(0.72)';
   ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
   for (const s of GRAY_SLOTS) drawGrayBuilding(s.lat, s.lon, s.stories, s.emoji);
   ctx.restore();
@@ -2048,50 +2126,69 @@ function showSetup() {
       m.querySelector('#wz-next')?.addEventListener('click', () => { step = 1; draw(); });
       return;
     } else if (step === 1) {
-      inner = `<input id="wz-age" type="number" min="18" max="79" value="${data.age}" class="w-full border rounded p-2 text-lg font-bold text-center">
+      inner = `<div class="text-center text-3xl font-black mb-1"><span id="wz-age-v">${data.age}</span><span class="text-lg">歳</span></div>
+        <input id="wz-age" type="range" min="18" max="79" value="${data.age}" class="w-full">
         <div class="text-xs text-slate-500 mt-1">融資は80歳までに完済できる期間しか組めない。若さも、また資本。</div>`;
-      collect = () => { data.age = Math.max(18, Math.min(79, Number(m.querySelector('#wz-age').value) || 30)); return true; };
       m.appendChild(el(frame('いくつになった？', '', inner)));
+      const ai = m.querySelector('#wz-age');
+      ai.addEventListener('input', () => { m.querySelector('#wz-age-v').textContent = ai.value; });
+      collect = () => { data.age = Math.max(18, Math.min(79, Number(ai.value) || 30)); return true; };
     } else if (step === 2) {
-      inner = `<input id="wz-seed" type="text" inputmode="numeric" class="w-full border rounded p-2 text-lg font-bold text-right">
+      // 0〜5,000万を50万円刻みのスライダーで（プリセットボタンも併設）
+      inner = `<div class="text-center text-2xl font-black mb-1"><span id="wz-seed-v">${L.yen(data.seed)}</span></div>
+        <input id="wz-seed" type="range" min="0" max="${L.CONFIG.seedMax}" step="500000" value="${data.seed}" class="w-full">
         <div class="flex gap-1 text-xs mt-1">${[[1_000_000, '100万'], [10_000_000, '1,000万'], [30_000_000, '3,000万']].map(([v, l]) => `<button class="wz-seedp flex-1 border rounded py-1" data-v="${v}">${l}</button>`).join('')}</div>
         <div class="text-xs text-slate-500 mt-1">これまで貯めた元手（0〜5,000万円）。足りない分は💼働いて稼げばいい。</div>`;
       m.appendChild(el(frame('種銭は、いくらある？', '最初の一歩は種銭づくりから。', inner)));
       const si = m.querySelector('#wz-seed');
-      wireCommaInput(si, { min: L.CONFIG.seedMin, max: L.CONFIG.seedMax });
-      setCommaValue(si, data.seed);
-      m.querySelectorAll('.wz-seedp').forEach(b => b.addEventListener('click', () => setCommaValue(si, Number(b.dataset.v))));
-      collect = () => { data.seed = parseCommaNumber(si.value); return true; };
+      const upd = () => { data.seed = Number(si.value); m.querySelector('#wz-seed-v').textContent = L.yen(data.seed); };
+      si.addEventListener('input', upd);
+      m.querySelectorAll('.wz-seedp').forEach(b => b.addEventListener('click', () => { si.value = b.dataset.v; upd(); }));
+      collect = () => { data.seed = Number(si.value); return true; };
     } else if (step === 3) {
       inner = `<div class="flex gap-2">
           <label class="flex-1 border-2 rounded-xl p-2 text-sm text-center ${data.goalType === 'networth' ? 'border-navy bg-slate-50 font-bold' : ''}"><input type="radio" name="wz-goaltype" value="networth" ${data.goalType === 'networth' ? 'checked' : ''} class="mr-1">純資産</label>
           <label class="flex-1 border-2 rounded-xl p-2 text-sm text-center ${data.goalType === 'cashflow' ? 'border-navy bg-slate-50 font-bold' : ''}"><input type="radio" name="wz-goaltype" value="cashflow" ${data.goalType === 'cashflow' ? 'checked' : ''} class="mr-1">月間CF</label></div>
-        <div id="wz-goalp" class="flex gap-1 text-xs mt-2"></div>
-        <input id="wz-goal" type="text" inputmode="numeric" class="w-full border rounded p-2 mt-1 text-lg font-bold text-right">
+        <div class="text-center text-2xl font-black mt-2"><span id="wz-goal-v">${L.yen(data.goalAmount)}</span></div>
+        <input id="wz-goal" type="range" class="w-full">
+        <div id="wz-goalp" class="flex gap-1 text-xs mt-1"></div>
         <div class="text-xs text-slate-500 mt-1">純資産＝資産から負債を引いた本当の財産。月間CF＝毎月の不労所得。</div>`;
       m.appendChild(el(frame('目指す頂は？', '目標なき航海に、追い風は吹かない。', inner)));
       const gi = m.querySelector('#wz-goal');
-      wireCommaInput(gi, { min: 0, max: Infinity });
+      // 目標タイプごとにスライダーの範囲・刻みを切り替え
+      const RANGES = { networth: [10_000_000, 1_000_000_000, 10_000_000], cashflow: [100_000, 10_000_000, 100_000] };
+      const setupSlider = () => {
+        const [mn, mx, st2] = RANGES[data.goalType];
+        gi.min = mn; gi.max = mx; gi.step = st2;
+        gi.value = Math.max(mn, Math.min(mx, data.goalAmount));
+        data.goalAmount = Number(gi.value);
+        m.querySelector('#wz-goal-v').textContent = L.yen(data.goalAmount);
+      };
+      const upd = () => { data.goalAmount = Number(gi.value); m.querySelector('#wz-goal-v').textContent = L.yen(data.goalAmount); };
+      gi.addEventListener('input', upd);
       const renderP = () => {
         const box = m.querySelector('#wz-goalp'); box.innerHTML = '';
         PRESETS[data.goalType].forEach(([v, l]) => {
           const b = el(`<button class="flex-1 border rounded py-1">${l}</button>`);
-          b.addEventListener('click', () => setCommaValue(gi, v));
+          b.addEventListener('click', () => { gi.value = v; upd(); });
           box.appendChild(b);
         });
       };
       m.querySelectorAll('input[name="wz-goaltype"]').forEach(r => r.addEventListener('change', e => {
-        data.goalType = e.target.value; data.goalAmount = PRESETS[data.goalType][1][0]; setCommaValue(gi, data.goalAmount); renderP();
+        data.goalType = e.target.value; data.goalAmount = PRESETS[data.goalType][1][0]; setupSlider(); renderP();
       }));
-      renderP(); setCommaValue(gi, data.goalAmount);
-      collect = () => { data.goalAmount = Math.max(1, parseCommaNumber(gi.value)); return true; };
+      setupSlider(); renderP();
+      collect = () => { data.goalAmount = Math.max(1, Number(gi.value)); return true; };
     } else if (step === 4) {
       const maxYears = L.maxYearsForAge(data.age);
       if (data.years > maxYears) data.years = maxYears;
-      inner = `<input id="wz-years" type="number" min="1" max="${maxYears}" value="${data.years}" class="w-full border rounded p-2 text-lg font-bold text-center">
+      inner = `<div class="text-center text-3xl font-black mb-1"><span id="wz-years-v">${data.years}</span><span class="text-lg">年</span></div>
+        <input id="wz-years" type="range" min="1" max="${maxYears}" value="${data.years}" class="w-full">
         <div class="text-xs text-slate-500 mt-1">${data.age}歳なら80歳までの上限 ${maxYears}年。期限が迫るほど、融資の扉は狭くなる。</div>`;
       m.appendChild(el(frame('期限は、何年？', '', inner)));
-      collect = () => { data.years = Math.max(1, Math.min(maxYears, Number(m.querySelector('#wz-years').value) || 1)); return true; };
+      const yi = m.querySelector('#wz-years');
+      yi.addEventListener('input', () => { m.querySelector('#wz-years-v').textContent = yi.value; });
+      collect = () => { data.years = Math.max(1, Math.min(maxYears, Number(yi.value) || 1)); return true; };
     } else {
       const attrLabel = data.attr === 'employee' ? '💼サラリーマン' : '🛠️自営業';
       inner = `<div class="bg-slate-50 rounded-xl p-4 text-sm leading-relaxed">
@@ -2137,9 +2234,83 @@ function load(){
 // v3.5: ゲーム操作（購入・修繕・翌月など）のたびに地図のズーム・視点を初期状態へ戻す。
 // 地図側の操作（ドラッグ・ズーム・タップ）や「地図で場所を見る」はrender()を通らないため維持される。
 function render(){
-  setCityState(state); resetMapView(); renderPanelLeft(); renderPanelRight(); checkEnd(); checkNewBadges(); save(); showExpFloats();
+  setCityState(state); resetMapView(); renderPanelLeft(); renderPanelRight(); renderMobileBars(); checkEnd(); checkNewBadges(); save(); showExpFloats();
   document.getElementById('btn-result')?.classList.toggle('hidden', !state?.freePlay);   // v3.7: クリア後はいつでもリザルトへ
   if (tutIdx >= 0) renderTutStep();   // v3.7: チュートリアル中は吹き出しを追従させる
+}
+
+// v3.9: スマホ用の簡素UI。常時は主要3情報＋主要3アクションのみ。残りは≡メニュー（ドロワー）へ。
+function renderMobileBars() {
+  const statusEl = document.getElementById('mobile-status');
+  const actEl = document.getElementById('mobile-actions');
+  if (!statusEl || !actEl || !state) return;
+  const mcf = L.monthlyCF(state);
+  statusEl.innerHTML = `
+    <button class="ms-kpi bg-white/95 shadow rounded-lg px-1 py-1 text-center" data-kpi="cash">
+      <div class="text-[9px] font-bold text-slate-500">💰現金</div><div class="text-[11px] font-bold truncate">${L.yen(state.cash)}</div></button>
+    <button class="ms-kpi bg-white/95 shadow rounded-lg px-1 py-1 text-center" data-kpi="cf">
+      <div class="text-[9px] font-bold text-slate-500">📈月CF</div><div class="text-[11px] font-bold truncate ${mcf >= 0 ? 'text-emerald-600' : 'text-red-600'}">${L.yen(mcf)}</div></button>
+    <div class="bg-white/95 shadow rounded-lg px-1 py-1 text-center">
+      <div class="text-[9px] font-bold text-slate-500">⚡行動力</div><div class="text-[11px] font-bold" id="hud-ap-m">${state.actionPower}/${state.baseActionPower}</div></div>`;
+  statusEl.querySelectorAll('.ms-kpi').forEach(b => b.addEventListener('click', () => openKpiModal(b.dataset.kpi)));
+
+  const unread = (state.notifications || []).filter(n => !n.read).length;
+  actEl.innerHTML = `
+    <button id="m-search" class="flex-1 bg-navy text-white rounded-xl py-3 text-xs font-bold shadow-lg">🏘️探す</button>
+    <button id="m-work" class="flex-1 bg-amber-500 text-white rounded-xl py-3 text-xs font-bold shadow-lg select-none touch-none">💼働く</button>
+    <button id="m-next" class="flex-1 bg-amber-600 text-white rounded-xl py-3 text-xs font-bold shadow-lg">📅翌月</button>
+    <button id="m-menu" class="w-12 bg-white text-navy rounded-xl py-3 text-lg font-bold shadow-lg relative">≡${unread ? `<span class="absolute -top-1 -right-1 bg-red-500 text-white text-[9px] rounded-full px-1">${unread}</span>` : ''}</button>`;
+  actEl.querySelector('#m-search').addEventListener('click', openSearchModal);
+  wireWorkButton(actEl.querySelector('#m-work'));
+  actEl.querySelector('#m-next').addEventListener('click', onNextMonth);
+  actEl.querySelector('#m-menu').addEventListener('click', openMobileDrawer);
+}
+
+// v3.9: スマホの≡メニュー。普段隠している機能（一覧・通知・ログ・資産詳細・スキル・音・リセット）をまとめる。
+function openMobileDrawer() {
+  const m = document.getElementById('mobile-drawer');
+  m.classList.remove('hidden');
+  const close = () => { m.classList.add('hidden'); m.innerHTML = ''; };
+  const g = state.goal;
+  const pct = Math.max(0, Math.min(100, Math.round((g.type === 'networth' ? L.netWorth(state) : L.monthlyCF(state)) / g.amount * 100)));
+  const unread = (state.notifications || []).filter(n => !n.read).length;
+  const item = (id, label) => `<button id="${id}" class="w-full text-left bg-slate-50 hover:bg-slate-100 rounded-lg px-3 py-3 text-sm font-bold flex justify-between items-center">${label}</button>`;
+  const box = el(`<div class="absolute inset-0"><div class="absolute inset-0 bg-black/40" id="dr-backdrop"></div>
+    <div class="absolute top-0 right-0 bottom-0 w-72 max-w-[85%] bg-white shadow-2xl p-3 space-y-2 overflow-y-auto">
+      <div class="flex justify-between items-center"><h2 class="font-bold">≡ メニュー</h2><button id="dr-close" class="text-slate-400 text-2xl leading-none">✕</button></div>
+      <div class="bg-slate-50 rounded-lg p-2 text-xs">
+        <div class="flex justify-between font-bold text-slate-700"><span>🎯 目標達成度</span><span>${pct}%</span></div>
+        <div class="w-full bg-slate-200 rounded-full h-2 mt-1 overflow-hidden"><div class="bg-emerald-500 h-2" style="width:${pct}%"></div></div>
+      </div>
+      ${item('dr-listings', `🗂️ 物件市場（${state.market.length}件）`)}
+      ${item('dr-notifs', `🔔 通知${unread ? `（未読${unread}）` : ''}`)}
+      ${item('dr-props', `🏠 所有物件・売却センター（${state.properties.length}件）`)}
+      ${item('dr-assets', '💰 資産・バランスシート')}
+      ${item('dr-credit', '📊 信用度・銀行取引')}
+      ${item('dr-log', '📜 ログ履歴')}
+      <div class="bg-slate-50 rounded-lg p-2 text-xs space-y-1">
+        <div class="font-bold text-slate-700 mb-1">🎓 スキル状況</div>
+        ${skillRow('目利き力', 'appraisal')}${skillRow('交渉力', 'negotiation')}${skillRow('自主管理', 'selfmgmt')}
+      </div>
+      <div class="flex gap-2 pt-1 border-t">
+        <button id="dr-bgm" class="flex-1 border rounded-lg py-2 text-sm">🎵 BGM</button>
+        <button id="dr-mute" class="flex-1 border rounded-lg py-2 text-sm">${muted ? '🔇 消音中' : '🔊 音あり'}</button>
+        <button id="dr-reset" class="flex-1 border rounded-lg py-2 text-sm text-red-600">リセット</button>
+      </div>
+    </div></div>`);
+  m.innerHTML = ''; m.appendChild(box);
+  const go = (fn) => { close(); fn(); };
+  m.querySelector('#dr-backdrop').addEventListener('click', close);
+  m.querySelector('#dr-close').addEventListener('click', close);
+  m.querySelector('#dr-listings').addEventListener('click', () => go(openListingsModal));
+  m.querySelector('#dr-notifs').addEventListener('click', () => go(openNotificationsModal));
+  m.querySelector('#dr-props').addEventListener('click', () => go(() => openKpiModal('props')));
+  m.querySelector('#dr-assets').addEventListener('click', () => go(() => openKpiModal('cash')));
+  m.querySelector('#dr-credit').addEventListener('click', () => go(() => openKpiModal('credit')));
+  m.querySelector('#dr-log').addEventListener('click', () => go(openLogModal));
+  m.querySelector('#dr-bgm').addEventListener('click', () => go(openBgmModal));
+  m.querySelector('#dr-mute').addEventListener('click', () => { setMuted(!muted); updateMuteButton(); close(); });
+  m.querySelector('#dr-reset').addEventListener('click', () => { if (confirm('データをリセットしますか？')) { localStorage.removeItem(SAVE_KEY); location.reload(); } });
 }
 
 function pushLog(msg){ state.log = state.log || []; state.log.unshift(msg); if(state.log.length>50) state.log.pop(); }
@@ -2433,6 +2604,7 @@ function overviewTab(p, from) {
       </div>
       <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">🔧 修繕度 ${repairGauge(p.repairState)}${p.repairJob ? `<span class="text-amber-600 font-bold ml-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : ''}</div>
       <div class="text-xs text-slate-600">${p.structure}造・築${p.builtAge}年・${p.units.length}戸／残存償却 ${p.deprRemaining}ヶ月</div>
+      ${buildingComposition(p) ? `<div class="text-xs text-slate-600">🏠 ${buildingComposition(p)}</div>` : ''}
       ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
       <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>名義</span><b>${p.owner === 'corp' ? '🏢 法人' : '👤 個人'}</b></div>
       ${p.lastAppraisal ? `<div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>査定額（参考）</span><b>${L.yen(p.lastAppraisal.amount)} <span class="text-slate-500 font-normal">（${state.month - p.lastAppraisal.month === 0 ? '今月' : `${state.month - p.lastAppraisal.month}ヶ月前`}）</span></b></div>` : ''}
@@ -2444,7 +2616,7 @@ function overviewTab(p, from) {
   return `<div class="flex flex-col items-center">${svg}</div>
     <div class="space-y-2 text-sm">
     <div class="font-bold text-center">売出価格: ${cut ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> ` : ''}<span class="text-emerald-700 text-lg">${L.yen(p.price)}</span></div>
-    <div class="text-center text-xs text-slate-500">${p.structure}造・築${p.builtAge}年・${p.units.length}戸</div>
+    <div class="text-center text-xs text-slate-500">${p.structure}造・築${p.builtAge}年・${p.units.length}戸${buildingComposition(p) ? `／${buildingComposition(p)}` : ''}</div>
     <div class="flex items-center justify-center text-xs p-2 bg-slate-50 rounded-lg">🔧 修繕度 ${repairGauge(p.repairState)}</div>
     ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold text-center">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
     ${p.sellerUrgency ? `<div class="text-xs text-rose-600 font-bold text-center">🏃 売り急ぎ: ${p.sellerUrgency.reason}そうだ</div>` : ''}
@@ -2454,12 +2626,22 @@ function overviewTab(p, from) {
 
 function rentRollTab(p, from) {
   return `<table class="w-full text-xs">
-    <tr class="text-slate-500"><th class="text-left">部屋</th><th>家賃</th><th>状況</th><th></th></tr>
-    ${p.units.map((u, i) => `<tr class="border-t"><td>${i + 1}号室</td><td class="text-center">${L.yen(u.rent)}</td>
+    <tr class="text-slate-500"><th class="text-left">部屋</th><th>間取り</th><th>家賃</th><th>状況</th><th></th></tr>
+    ${p.units.map((u, i) => `<tr class="border-t"><td>${i + 1}号室</td>
+      <td class="text-center">${u.layout ? `${u.layout}・${u.sizeSqm}㎡` : '—'}</td>
+      <td class="text-center">${L.yen(u.rent)}</td>
       <td class="text-center">${u.occupied ? '<span class="text-emerald">入居中</span>' : `<span class="text-red-600">空室${u.vacantMonths}ヶ月</span>`}</td>
       <td class="text-right">${!u.occupied && from === 'owned' ? `<button class="fill-ad text-xs border rounded px-1" data-i="${i}">広告料(家賃1ヶ月)</button>
         <button class="fill-self text-xs border rounded px-1" data-i="${i}">自主客付け(-30)</button>` : ''}</td></tr>`).join('')}
   </table>`;
+}
+
+// v3.10: 建物構成サマリ（例: 1K×6戸・平均22㎡）
+function buildingComposition(p) {
+  if (!p.units?.length || !p.units[0].layout) return '';
+  const layout = p.units[0].layout;
+  const avg = Math.round(p.units.reduce((s, u) => s + (u.sizeSqm || 0), 0) / p.units.length);
+  return `${layout}×${p.units.length}戸・平均${avg}㎡`;
 }
 
 function plTab(p) {
@@ -2836,8 +3018,8 @@ function drawPricing(m, p, appraisal, close, back) {
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3">
     <div class="flex justify-between items-center gap-2">${back ? '<button id="sl-back" class="text-xs text-navy shrink-0">← 戻る</button>' : ''}<h2 class="font-bold flex-1">売出価格を決める</h2><button id="sl-x2" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
     <div class="text-sm">不動産会社の査定額（参考）: <b>${L.yen(appraisal)}</b>（利回り${yieldOf(appraisal)}%）</div>
-    <div class="text-sm font-bold">売出価格（自由に設定できます）</div>
-    <input id="sl-price-input" type="text" inputmode="numeric" class="w-full border-2 border-navy rounded p-2 text-lg font-bold text-right">
+    <div class="text-center text-2xl font-black text-navy"><span id="sl-price-v">${L.yen(appraisal)}</span></div>
+    <input id="sl-price-range" type="range" min="${Math.max(10000, Math.round(appraisal * 0.5))}" max="${Math.round(appraisal * 2)}" step="10000" value="${appraisal}" class="w-full">
     <div class="flex gap-1 text-xs">
       ${[0.9, 1.0, 1.1, 1.2].map(f => `<button class="sl-preset flex-1 border rounded py-1" data-f="${f}">査定×${Math.round(f * 100)}%</button>`).join('')}
     </div>
@@ -2847,17 +3029,15 @@ function drawPricing(m, p, appraisal, close, back) {
     <button id="sl-list" class="w-full bg-emerald text-white rounded py-2">この価格で売りに出す</button>
     <button id="sl-cancel2" class="w-full text-slate-500 text-sm">やめる</button></div>`);
   m.appendChild(box);
-  const input = box.querySelector('#sl-price-input');
-  wireCommaInput(input, { min: 10000, max: 10_000_000_000 });
-  setCommaValue(input, appraisal);
+  const range = box.querySelector('#sl-price-range');
   const updatePrice = () => {
-    price = Math.max(10000, parseCommaNumber(input.value) || appraisal);
+    price = Math.max(10000, Number(range.value));
+    box.querySelector('#sl-price-v').textContent = L.yen(price);
     box.querySelector('#sl-yield').textContent = yieldOf(price);
   };
-  input.addEventListener('input', updatePrice);
-  input.addEventListener('blur', updatePrice);
+  range.addEventListener('input', updatePrice);
   box.querySelectorAll('.sl-preset').forEach(b => b.addEventListener('click', () => {
-    setCommaValue(input, Math.round(appraisal * Number(b.dataset.f) / 10000) * 10000);
+    range.value = Math.round(appraisal * Number(b.dataset.f) / 10000) * 10000;
     updatePrice();
   }));
   box.querySelector('#sl-list').addEventListener('click', () => {
@@ -3275,16 +3455,25 @@ function showRepairEffect(propId, text) {
   setTimeout(() => f.remove(), 2600);
 }
 
+// v3.9: 長押し中のライブ表示更新（PCパネルとスマホ情報バーの両方を更新）
+function updateHudLive() {
+  const cashEl = document.getElementById('hud-cash');
+  if (cashEl) cashEl.textContent = L.yen(state.cash);
+  const apEl = document.getElementById('hud-ap');
+  if (apEl) apEl.textContent = `⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}`;
+  const apM = document.getElementById('hud-ap-m');
+  if (apM) apM.textContent = `${state.actionPower}/${state.baseActionPower}`;
+  const cashM = document.querySelector('#mobile-status .ms-kpi[data-kpi="cash"] div:last-child');
+  if (cashM) cashM.textContent = L.yen(state.cash);
+}
+
 function wireWorkButton(btn) {
   let timer = null, sessionEarned = 0, sessionCount = 0;
   const workOnce = () => {
     const r = L.doWork(state, Math.random);
     if (!r.earned) { stopWork(); return; }
     state = r.state; sessionEarned += r.earned; sessionCount += 1;
-    const cashEl = document.getElementById('hud-cash');
-    if (cashEl) cashEl.textContent = L.yen(state.cash);
-    const apEl = document.getElementById('hud-ap');
-    if (apEl) apEl.textContent = `⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}`;
+    updateHudLive();
     sfxCoin();
     floatEarn(btn, r.earned);
   };
@@ -3561,8 +3750,7 @@ function onSearchPress(box, closeModal) {
   const feed = box.querySelector('#sr-feed');
   feed.querySelector('.sr-empty')?.remove();
   const act = SEARCH_ACTIONS[Math.floor(Math.random() * SEARCH_ACTIONS.length)];
-  const apEl = document.getElementById('hud-ap');
-  if (apEl) apEl.textContent = `⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}`;
+  updateHudLive();
   if (r.found) {
     // v3.5: 自動で一覧へ飛ばず、発見ログをタップで詳細へ（ログは消えず残る）
     const line = el(`<div class="sr-found font-bold text-emerald-700 underline cursor-pointer">${act}…おっ！ ${r.found.name || r.found.label} の情報を掴んだ（タップで詳細）</div>`);
