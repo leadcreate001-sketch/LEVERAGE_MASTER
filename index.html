@@ -252,7 +252,7 @@ export function estimateRent(sizeSqm, areaKey, builtAge, genreKey, rng = Math.ra
   return Math.max(15000, Math.round(rent / 1000) * 1000);
 }
 
-export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands = null) {
+export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands = null, opts = {}) {
   const g = GENRE[genreKey], a = AREA_ADJ[areaKey];
   const lr = (lo, hi) => lo + (hi - lo) * rng();
   let ageMin = g.ageMin, ageMax = g.ageMax;
@@ -274,8 +274,11 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
     return { rent, occupied, vacantMonths: occupied ? 0 : Math.round(lr(1, 6)), layout, sizeSqm };
   });
   // v3.10: 価格は家賃から導く（年間家賃 ÷ 想定利回り帯）。訳ありは高利回り帯＝安い掘り出し物のまま。
+  // v3.11: opts.lowYield=true は利回り帯の下限寄り（家賃に対して割高＝買う魅力の薄い「平凡物件」）を生成。
   const gpiM = units.reduce((s, u) => s + u.rent, 0);
-  const grossYield = Math.max(0.03, lr(g.yieldMin, g.yieldMax) + a.yieldAdd);
+  const yr = g.yieldMax - g.yieldMin;
+  const yieldPick = opts.lowYield ? (g.yieldMin + lr(0, 0.30) * yr) : lr(g.yieldMin, g.yieldMax);
+  const grossYield = Math.max(0.03, yieldPick + a.yieldAdd);
   const price = Math.max(10000, Math.round(gpiM * 12 / grossYield / 10000) * 10000);
   const rentTotalM = gpiM;
   const isKubun = genreKey === 'kubun' || genreKey === 'w_kubun';
@@ -644,6 +647,38 @@ export function startProfessionalRepair(state, propertyId, financed = false) {
   p.repairJob = { monthsTotal, monthsLeft: monthsTotal, startState: p.repairState };
   return { state: s, started: true, cost, loanAmount, financed: canFinance, monthsTotal };
 }
+
+// === v3.11: バリューアップ投資（設備更新・リノベで家賃自体を上げる）===
+export const VALUE_UP_PLANS = {
+  light:    { label: '設備更新（エアコン・建具・照明）',   rentMult: 1.06, months: 1, costRate: 0.6 },
+  standard: { label: '水回り刷新・内装フルチェンジ',       rentMult: 1.12, months: 2, costRate: 1.2 },
+  full:     { label: 'フルリノベーション・間取り改善',     rentMult: 1.20, months: 3, costRate: 2.0 },
+};
+export const VALUE_UP_MAX_LEVEL = 2;   // 1物件につき2回まで
+
+// バリューアップ費用は年間家賃 × プラン係数（最低30万円）
+export function valueUpCost(property, planKey) {
+  const plan = VALUE_UP_PLANS[planKey];
+  if (!plan) return 0;
+  return Math.max(300000, Math.round(gpiAnnual(property) * plan.costRate / 10000) * 10000);
+}
+
+// バリューアップを発注。工期を経て家賃・時価が上がる（修繕とは別枠のjob）。
+export function startValueUp(state, propertyId, planKey) {
+  const p0 = state.properties.find(x => x.id === propertyId);
+  const plan = VALUE_UP_PLANS[planKey];
+  if (!p0 || !plan || p0.repairJob || p0.valueUpJob) return { state, started: false, reason: 'busy' };
+  if ((p0.valueUpLevel || 0) >= VALUE_UP_MAX_LEVEL) return { state, started: false, reason: 'maxed' };
+  const cost = valueUpCost(p0, planKey);
+  if (state.cash < cost) return { state, started: false, reason: 'cash' };
+  const s = structuredClone(state);
+  const p = s.properties.find(x => x.id === propertyId);
+  s.actionPower -= 5;
+  s.cash -= cost;
+  p.valueUpJob = { monthsTotal: plan.months, monthsLeft: plan.months, rentMult: plan.rentMult, label: plan.label };
+  return { state: s, started: true, cost, months: plan.months };
+}
+
 export function totalAssetsV2(state) { return state.cash + state.properties.reduce((t, p) => t + p.timeValue, 0); }
 export function netWorth(state) { return Math.round(totalAssetsV2(state) - totalDebt(state)); }
 export function monthlyCF(state) { return state.properties.reduce((t, p) => t + (p.history.at(-1)?.cf ?? 0), 0); }
@@ -953,6 +988,20 @@ export function advanceMonth(state, rng = Math.random) {
         p.repairState = Math.min(99, Math.round(j.startState + (100 - j.startState) * k / j.monthsTotal));
       }
     }
+    // v3.11: バリューアップ工事の進行。完了月に各室の家賃と時価が上がる。
+    if (p.valueUpJob) {
+      p.valueUpJob.monthsLeft -= 1;
+      if (p.valueUpJob.monthsLeft <= 0) {
+        const mult = p.valueUpJob.rentMult;
+        p.units.forEach(u => { u.rent = Math.max(1000, Math.round(u.rent * mult / 1000) * 1000); });
+        p.valueUpLevel = (p.valueUpLevel || 0) + 1;
+        p.timeValue = Math.round(p.timeValue * mult);
+        p.valueUpJob = null;
+        const nm = p.name || p.label;
+        pushNotification(s, 'valueup_done', p.id, nm, `${nm} のバリューアップが完了！家賃がアップしました`);
+        logs.push(`${nm} のバリューアップ完了（家賃UP・資産価値上昇）`);
+      }
+    }
     // 修繕度が20%を割ったら管理会社から修繕依頼（通知は劣化中に一度だけ・回復で再アーム。修繕中は出さない）
     if (p.repairState < 20 && !p.repairAlerted && !p.repairJob) {
       const nm = p.name || p.label;
@@ -1253,36 +1302,63 @@ export function drawSearchThreshold({ genres, areas, ages }, appraisalLv, rng = 
   return SEARCH_MIN + Math.round((SEARCH_MAX - SEARCH_MIN) * Math.pow(rng(), f));
 }
 
-export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) {
-  if (state.actionPower < SEARCH_PRESS_COST) return { state, found: null, pressed: false };
-  const s = structuredClone(state);
-  s.actionPower -= SEARCH_PRESS_COST;
-  s.salesSearch = s.salesSearch || { spent: 0, threshold: null };
-  if (s.salesSearch.threshold == null) {
-    const lv = skillLevel(s.skills.appraisal.exp);
-    s.salesSearch.threshold = drawSearchThreshold({ genres, areas, ages }, lv, rng);
-  }
-  s.salesSearch.spent += SEARCH_PRESS_COST;
-  s.skills.appraisal.exp += 1;
-  if (s.salesSearch.spent < s.salesSearch.threshold) {
-    return { state: s, found: null, pressed: true };
-  }
-  const gk = genres[Math.floor(rng() * genres.length)];
-  const ak = areas[Math.floor(rng() * areas.length)];
-  const p = generateProperty(gk, ak, rng, ages);
-  // v3.5: IDはセーブデータ内で採番する（モジュール変数はリロードで0に戻り、復元後に既存物件と衝突するため）
+// v3.11: 平凡物件は買い候補の約2倍の頻度で出す（＝閾値が約半分）
+export const MUNDANE_SEARCH_DIVISOR = 2;
+
+// 市場に1件追加してID採番・名前付けする内部ヘルパー
+function pushToMarket(s, p) {
   s.nextPropertyId = s.nextPropertyId || 1;
   p.id = 'p' + s.nextPropertyId++;
   p.name = propertyName(p.genreKey, p.builtAge, p.id);
   s.market.unshift(p);
-  s.skills.appraisal.exp += 10;
-  s.salesSearch = { spent: 0, threshold: null };
-  return { state: s, found: p, pressed: true,
-    log: `${p.name || p.label}（${p.label}）を発見（表面${(p.grossYield * 100).toFixed(1)}%・${yen(p.price)}）` };
+  return p;
+}
+
+export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) {
+  if (state.actionPower < SEARCH_PRESS_COST) return { state, found: null, mundane: [], pressed: false };
+  const s = structuredClone(state);
+  s.actionPower -= SEARCH_PRESS_COST;
+  const ss = s.salesSearch = s.salesSearch || { spent: 0, threshold: null };
+  const lv = skillLevel(s.skills.appraisal.exp);
+  if (ss.threshold == null) ss.threshold = drawSearchThreshold({ genres, areas, ages }, lv, rng);
+  // v3.11: 平凡ルートの閾値（買い候補の約半分＝2倍の頻度）
+  if (ss.mundaneThreshold == null) ss.mundaneThreshold = Math.max(4, Math.round(drawSearchThreshold({ genres, areas, ages }, lv, rng) / MUNDANE_SEARCH_DIVISOR));
+  ss.spent += SEARCH_PRESS_COST;
+  ss.mundaneSpent = (ss.mundaneSpent || 0) + SEARCH_PRESS_COST;
+  s.skills.appraisal.exp += 1;
+
+  // v3.11: 平凡ルート（低利回り・1〜2件・売れ残り演出）。買い候補とは独立に発火する。
+  const mundane = [];
+  if (ss.mundaneSpent >= ss.mundaneThreshold) {
+    const n = rng() < 0.35 ? 2 : 1;
+    for (let i = 0; i < n; i++) {
+      const gk = genres[Math.floor(rng() * genres.length)];
+      const ak = areas[Math.floor(rng() * areas.length)];
+      const mp = generateProperty(gk, ak, rng, ages, { lowYield: true });
+      mp.staleFlag = true;                              // 長く売りに出ている
+      mp.listedMonths = 6 + Math.floor(rng() * 8);
+      mundane.push(pushToMarket(s, mp));
+    }
+    ss.mundaneSpent = 0; ss.mundaneThreshold = null;
+    s.skills.appraisal.exp += 2;
+  }
+
+  // 買い候補ルート（現状維持）
+  let found = null, log = null;
+  if (ss.spent >= ss.threshold) {
+    const gk = genres[Math.floor(rng() * genres.length)];
+    const ak = areas[Math.floor(rng() * areas.length)];
+    const p = generateProperty(gk, ak, rng, ages);
+    found = pushToMarket(s, p);
+    s.skills.appraisal.exp += 10;
+    ss.spent = 0; ss.threshold = null;
+    log = `${p.name || p.label}（${p.label}）を発見（表面${(p.grossYield * 100).toFixed(1)}%・${yen(p.price)}）`;
+  }
+  return { state: s, found, mundane, pressed: true, log };
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, REPAIR_TIERS, repairTier, repairTierInfo, doDIY, totalDebt, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, doSalesPress };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, REPAIR_TIERS, repairTier, repairTierInfo, doDIY, totalDebt, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -1524,10 +1600,10 @@ function drawColorBuilding(p, lat, lon, kind) {
       ctx.fillStyle = '#facc15';
       ctx.beginPath(); ctx.arc(pr.x - size * 0.30, pr.y - size * 0.95, 2.6 * scale, 0, TAU); ctx.fill();
     }
-    // v3: 業者修繕中の物件は🔨マークで一目で分かるように
-    if (p.repairJob) {
+    // v3: 業者修繕中の物件は🔨マーク、v3.11: バリューアップ工事中は✨マークで一目で分かるように
+    if (p.repairJob || p.valueUpJob) {
       ctx.font = `${Math.round(12 * scale)}px sans-serif`;
-      ctx.fillText('🔨', pr.x, pr.y - size * 1.10);
+      ctx.fillText(p.repairJob ? '🔨' : '✨', pr.x, pr.y - size * 1.10);
     }
   } else if (kind === 'market' && (st.favorites || []).some(f => f.propertyId === p.id)) {
     // お気に入り登録した市場物件だけ⭐を付けタップ可能にする（未登録の市場物件は雰囲気建物と同じ扱い）
@@ -2511,12 +2587,19 @@ function openDetail(propId, from, back) {
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   const draw = () => {
     m.innerHTML = '';
-    const repairing = from === 'owned' && p.repairJob;
-    const footer = from === 'owned' ? `<div class="p-2 border-t flex gap-2">
-        ${repairing ? `<div class="flex-[2] text-center text-xs text-amber-600 font-bold py-1.5">🔨 修繕中（残り${p.repairJob.monthsLeft}ヶ月）</div>` : `
-        <button class="dt-diy flex-1 border rounded py-1.5 text-sm" ${p.repairState >= 100 ? 'disabled' : ''}>🖌️ DIY(-${L.repairTierInfo(p).diyCost})</button>
-        <button class="dt-repair flex-1 border rounded py-1.5 text-sm" ${p.repairState >= 100 ? 'disabled' : ''}>業者修繕</button>`}
-        <button class="dt-sell flex-1 border rounded py-1.5 text-sm">売却</button></div>` : '';
+    // v3.11: フッターに✨バリューアップを追加。工事中（修繕/価値UP）はその表示を出し操作ボタンは隠す。
+    const busy = from === 'owned' && (p.repairJob || p.valueUpJob);
+    const vuMaxed = (p.valueUpLevel || 0) >= L.VALUE_UP_MAX_LEVEL;
+    const footer = from === 'owned' ? `<div class="p-2 border-t space-y-1">
+        ${p.repairJob ? `<div class="text-center text-xs text-amber-600 font-bold py-1">🔨 修繕中（残り${p.repairJob.monthsLeft}ヶ月）</div>` : ''}
+        ${p.valueUpJob ? `<div class="text-center text-xs text-indigo-600 font-bold py-1">✨ バリューアップ工事中（残り${p.valueUpJob.monthsLeft}ヶ月）</div>` : ''}
+        <div class="flex gap-1.5">
+          ${busy ? '' : `
+          <button class="dt-diy flex-1 border rounded py-1.5 text-xs" ${p.repairState >= 100 ? 'disabled' : ''}>🖌️DIY(-${L.repairTierInfo(p).diyCost})</button>
+          <button class="dt-repair flex-1 border rounded py-1.5 text-xs" ${p.repairState >= 100 ? 'disabled' : ''}>業者修繕</button>
+          <button class="dt-valueup flex-1 border rounded py-1.5 text-xs ${vuMaxed ? 'opacity-40' : ''}" ${vuMaxed ? 'disabled' : ''}>✨価値UP</button>`}
+          <button class="dt-sell flex-1 border rounded py-1.5 text-xs">売却</button>
+        </div></div>` : '';
     const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
       <div class="p-3 border-b shrink-0">
         <div class="flex justify-between items-center mb-1">
@@ -2548,6 +2631,7 @@ function openDetail(propId, from, back) {
     if (from === 'owned') {
       box.querySelector('.dt-diy')?.addEventListener('click', () => { close(); openDiyGame(p.id); });
       box.querySelector('.dt-repair')?.addEventListener('click', () => { close(); openRepairService(p.id); });
+      box.querySelector('.dt-valueup')?.addEventListener('click', () => { close(); openValueUp(p.id); });
       box.querySelector('.dt-sell').addEventListener('click', () => { close(); openSell(p.id); });
     }
     // v3.1: 市場物件はタブの上の固定「買付」ボタンからいつでも買付へ（買付画面から「戻る」でここへ戻れる）
@@ -2603,6 +2687,7 @@ function overviewTab(p, from) {
         <div class="bg-slate-50 rounded-lg p-2">購入差額<div class="font-bold ${gain >= 0 ? 'text-emerald-600' : 'text-red-600'}">${gain >= 0 ? '+' : ''}${L.yen(gain)}</div></div>
       </div>
       <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">🔧 修繕度 ${repairGauge(p.repairState)}${p.repairJob ? `<span class="text-amber-600 font-bold ml-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : ''}</div>
+      ${(p.valueUpLevel || p.valueUpJob) ? `<div class="flex items-center justify-between text-xs p-2 bg-indigo-50 rounded-lg"><span>✨ バリューアップ ${p.valueUpLevel ? `Lv${p.valueUpLevel}` : ''}</span>${p.valueUpJob ? `<span class="text-indigo-600 font-bold">工事中 残り${p.valueUpJob.monthsLeft}ヶ月</span>` : '<span class="text-slate-500">家賃UP済み</span>'}</div>` : ''}
       <div class="text-xs text-slate-600">${p.structure}造・築${p.builtAge}年・${p.units.length}戸／残存償却 ${p.deprRemaining}ヶ月</div>
       ${buildingComposition(p) ? `<div class="text-xs text-slate-600">🏠 ${buildingComposition(p)}</div>` : ''}
       ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
@@ -3260,6 +3345,43 @@ function openRepairService(propId) {
   box.querySelector('#rp-loan').addEventListener('click', () => order(true));
 }
 
+// v3.11: バリューアップ（設備更新・リノベで家賃を上げる投資）のプラン選択。工期を経て家賃・時価UP。
+function openValueUp(propId) {
+  const p = state.properties.find(x => x.id === propId);
+  if (!p) return;
+  if (p.repairJob || p.valueUpJob) { alert('別の工事が進行中です。完了までお待ちください。'); return; }
+  const lv = p.valueUpLevel || 0;
+  if (lv >= L.VALUE_UP_MAX_LEVEL) { alert(`この物件はバリューアップ上限（${L.VALUE_UP_MAX_LEVEL}回）に達しています。`); return; }
+  const m = document.getElementById('repair-modal');
+  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
+  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const plans = Object.entries(L.VALUE_UP_PLANS).map(([key, pl]) => {
+    const cost = L.valueUpCost(p, key);
+    const disabled = state.cash < cost;
+    return `<button class="vu-plan w-full border rounded-lg p-2 text-left ${disabled ? 'opacity-40' : 'hover:bg-slate-50'}" data-key="${key}" ${disabled ? 'disabled' : ''}>
+      <div class="font-bold text-sm">${pl.label}</div>
+      <div class="text-xs text-slate-600">家賃 +${Math.round((pl.rentMult - 1) * 100)}%・工期${pl.months}ヶ月・費用 <b>${L.yen(cost)}</b></div></button>`;
+  }).join('');
+  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
+    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">✨ ${p.name || p.label} をバリューアップ（行動力-5）</h2><button id="vu-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+    <div class="text-xs text-slate-500">設備更新やリノベで家賃そのものを上げる投資です（残り${L.VALUE_UP_MAX_LEVEL - lv}回可能）。工事中は他の工事・DIYはできません。</div>
+    ${plans}
+    <button id="vu-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
+  m.appendChild(box);
+  box.querySelector('#vu-x').addEventListener('click', close);
+  box.querySelector('#vu-cancel').addEventListener('click', close);
+  box.querySelectorAll('.vu-plan').forEach(b => b.addEventListener('click', () => {
+    if (state.actionPower < 5) { alert('行動力が足りません'); return; }
+    const r = L.startValueUp(state, propId, b.dataset.key);
+    if (!r.started) { alert(r.reason === 'cash' ? '現金が足りません' : '発注できませんでした'); return; }
+    state = r.state;
+    const pl = L.VALUE_UP_PLANS[b.dataset.key];
+    pushLog(`${p.name || p.label} のバリューアップを発注（${pl.label}・費用${L.yen(r.cost)}・工期${r.months}ヶ月）`);
+    save(); render(); close();
+    showRepairEffect(propId, `✨ バリューアップ開始（家賃+${Math.round((pl.rentMult - 1) * 100)}%・工期${r.months}ヶ月）`);
+  }));
+}
+
 function skillRow(name, key){
   const exp = state.skills[key].exp, lv = L.skillLevel(exp), next = L.expToNext(exp);
   return `<div class="flex justify-between text-sm relative" data-skill="${key}"><span class="font-bold text-slate-800">${name} Lv${lv}</span><span class="font-bold text-slate-600">${next===null?'MAX':'次まで'+next}</span></div>`;
@@ -3614,7 +3736,7 @@ function openNotificationsModal() {
         <div class="text-slate-500 text-[11px]">${Math.floor(n.month / 12)}年${n.month % 12}ヶ月</div>
         ${n.read ? '' : '<span class="text-[9px] bg-amber-500 text-white rounded px-1">未読</span>'}
       </div>
-      <div>${n.kind === 'sold_out' ? '🚫' : n.kind === 'repair_needed' ? '🔧' : n.kind === 'repair_done' ? '✅' : '💸'} ${n.message}</div>
+      <div>${n.kind === 'sold_out' ? '🚫' : n.kind === 'repair_needed' ? '🔧' : n.kind === 'repair_done' ? '✅' : n.kind === 'valueup_done' ? '✨' : '💸'} ${n.message}</div>
       <div class="flex gap-1 justify-end">
         ${n.kind === 'sold_out' && !n.snapshot ? '' : `<button class="notif-check border rounded px-2 py-0.5" data-id="${n.id}">${n.kind === 'sold_out' ? '✓ 確認（物件を見る）' : '✓ 物件詳細へ'}</button>`}
         <button class="notif-dismiss border rounded px-2 py-0.5" data-id="${n.id}">✕ 閉じる</button>
@@ -3736,6 +3858,14 @@ const SEARCH_MISS = [
   '…惜しい物件は既に他で決まっていた',
   '…掘り出し物はまだ見つからない',
 ];
+// v3.11: 平凡（低利回り）物件の淡々とした紹介フレーバー（良い情報ではなく日常の一コマ）
+const MUNDANE_LINES = [
+  '🖥️ ポータルサイトに普通に載っていた物件を眺めた',
+  '📋 長く売りに出ている物件を紹介された',
+  '🏢 不動産屋に「一応こんなのも」と勧められた',
+  '📰 折込チラシに載っていた売れ残りをチェックした',
+  '🤝 業者から「利回りは高くないですが」と案内された',
+];
 
 function onSearchPress(box, closeModal) {
   const sel = readSearchSelection();
@@ -3751,6 +3881,17 @@ function onSearchPress(box, closeModal) {
   feed.querySelector('.sr-empty')?.remove();
   const act = SEARCH_ACTIONS[Math.floor(Math.random() * SEARCH_ACTIONS.length)];
   updateHudLive();
+  // v3.11: 平凡（低利回り）物件は淡々と一覧に流す（利回り数字で自分で判断する目利きの場）。長押しは止めない。
+  if (r.mundane && r.mundane.length) {
+    for (const mp of r.mundane) {
+      const ml = MUNDANE_LINES[Math.floor(Math.random() * MUNDANE_LINES.length)];
+      const line = el(`<div class="sr-mundane text-slate-500 underline cursor-pointer">${ml}：${mp.name || mp.label}（表面${(mp.grossYield * 100).toFixed(1)}%）</div>`);
+      line.addEventListener('click', () => { closeModal(); openDetail(mp.id, 'market', openSearchModal); });
+      feed.insertBefore(line, feed.firstChild);
+    }
+    pushLog(`平凡な出物を${r.mundane.length}件見た（低利回り・売れ残り）`);
+    renderPanelRight();
+  }
   if (r.found) {
     // v3.5: 自動で一覧へ飛ばず、発見ログをタップで詳細へ（ログは消えず残る）
     const line = el(`<div class="sr-found font-bold text-emerald-700 underline cursor-pointer">${act}…おっ！ ${r.found.name || r.found.label} の情報を掴んだ（タップで詳細）</div>`);
