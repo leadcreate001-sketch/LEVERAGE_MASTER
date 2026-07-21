@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>レバレッジ・マスター 〜メガ大家への道〜</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
@@ -12,9 +12,37 @@
 <style>
   html, body { font-family: system-ui, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; height: 100%; overscroll-behavior: none; }
   .hud-panel { background: rgba(255,255,255,0.92); backdrop-filter: blur(4px); }
+
+  /* v3.12: iOSでは 100vh が「ブラウザのバーを隠した高さ」を指すため、h-screen だと画面下端が
+     アドレスバーの裏に潜り込み、下部のボタン（翌月へ進む等）に一切触れなくなっていた。
+     実際に見えている高さを指す 100dvh を使う（非対応ブラウザは 100vh にフォールバック）。 */
+  body { height: 100vh; height: 100dvh; }
+
+  /* v3.12: スマホUIとPCパネルの出し分けを「幅」だけでなく「高さ」でも判定する。
+     従来は幅640px以上でPCパネルに切り替わっていたため、横向きのiPhone（幅812px・高さ375px）で
+     縦に並ぶPCパネルが画面からはみ出し、翌月へ進むボタンが画面外に出ていた。 */
+  #panel-left, #panel-right, #mobile-status, #mobile-actions { display: none; }
+  @media (min-width: 640px) and (min-height: 520px) {
+    #panel-left, #panel-right { display: flex; }
+  }
+  @media (max-width: 639.98px), (max-height: 519.98px) {
+    #mobile-status  { display: grid; }
+    #mobile-actions { display: flex; }
+  }
+  /* ノッチ／ホームインジケータを避ける（viewport-fit=cover と対で機能する） */
+  #mobile-actions {
+    left:   calc(env(safe-area-inset-left,  0px) + 8px);
+    right:  calc(env(safe-area-inset-right, 0px) + 8px);
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+  }
+  #mobile-status {
+    top:   calc(env(safe-area-inset-top,   0px) + 4px);
+    left:  calc(env(safe-area-inset-left,  0px) + 4px);
+    right: calc(env(safe-area-inset-right, 0px) + 4px);
+  }
 </style>
 </head>
-<body class="bg-canvas text-ink h-screen overflow-hidden flex flex-col">
+<body class="bg-canvas text-ink overflow-hidden flex flex-col">
   <header class="bg-navy text-white px-3 py-2 flex items-center justify-between shrink-0 z-10">
     <h1 class="font-bold text-sm md:text-base">レバレッジ・マスター</h1>
     <div class="flex items-center gap-3">
@@ -31,13 +59,14 @@
   <main class="relative flex-1 min-h-0">
     <canvas id="city-canvas" class="absolute inset-0 w-full h-full touch-none select-none" style="cursor:grab;"></canvas>
 
-    <!-- PC/タブレット用の左右パネル（スマホでは非表示） -->
-    <div id="panel-left" class="hidden sm:flex absolute left-1 top-1 bottom-1 w-44 md:w-52 flex-col gap-1.5 pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
-    <div id="panel-right" class="hidden sm:flex absolute right-1 top-1 bottom-1 w-44 md:w-52 flex-col gap-1.5 items-stretch pointer-events-none z-10 max-h-[85vh] overflow-y-auto"></div>
+    <!-- PC/タブレット用の左右パネル（表示条件は<style>のメディアクエリ側で判定） -->
+    <div id="panel-left" class="absolute left-1 top-1 bottom-1 w-44 md:w-52 flex-col gap-1.5 pointer-events-none z-10 overflow-y-auto"></div>
+    <div id="panel-right" class="absolute right-1 top-1 bottom-1 w-44 md:w-52 flex-col gap-1.5 items-stretch pointer-events-none z-10 overflow-y-auto"></div>
 
-    <!-- v3.9: スマホ用UI（sm未満のみ表示）。上部に主要3情報、下部に主要3アクション＋メニュー -->
-    <div id="mobile-status" class="sm:hidden absolute top-1 left-1 right-1 z-10 grid grid-cols-3 gap-1"></div>
-    <div id="mobile-actions" class="sm:hidden absolute left-2 right-2 z-20 flex gap-2" style="bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);"></div>
+    <!-- v3.9: スマホ用UI。上部に主要3情報、下部に主要3アクション＋メニュー -->
+    <!-- v3.12: 表示条件（幅が狭い or 高さが低い）と位置（セーフエリア）は<style>側で指定する -->
+    <div id="mobile-status" class="absolute z-10 grid-cols-3 gap-1"></div>
+    <div id="mobile-actions" class="absolute z-20 gap-2"></div>
   </main>
 
   <!-- 選択肢イベント／各種モーダル -->
@@ -1399,6 +1428,80 @@ const GENRE_EMOJI = { kodate: '🏠', apart: '🏘️', tekkotsu: '🏢', kubun:
 const FILLER_TALL = ['🏢', '🏙️', '🏬', '🗼'];
 const FILLER_MID = ['🏬', '🏫', '🏭'];
 const FILLER_LOW = ['🏠', '🏡', '🏘️'];
+// 雰囲気建物の絵文字 → 図形フォールバック時の建物形状
+const EMOJI_SHAPE = { '🏠': 'kodate', '🏡': 'kodate', '🏘️': 'apart', '🏢': 'tekkotsu',
+  '🏬': 'kubun', '🏫': 'kubun', '🏭': 'tekkotsu', '🏙️': 'rc', '🗼': 'rc' };
+
+// v3.12: 絵文字フォントの指定。従来は Windows 専用の "Segoe UI Emoji" しか挙げていなかったため、
+// iOS では canvas の絵文字がカラー字形に解決されずモノクロ＝シルエットで描かれる端末があった。
+// 各OSのカラー絵文字フォントを明示的に先頭から並べる。
+const EMOJI_FONT = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
+
+// v3.12: カラー絵文字が「実際に描けたか」をピクセルで実測する。描けない端末では建物を絵文字ではなく
+// 図形で描くフォールバックへ自動的に切り替え、原因が何であれ必ず色付きの建物が見えるようにする。
+// 手元で再現できない端末の切り分け用。URLに ?vector=1 を付けると強制的に図形描画、
+// ?vector=0 なら強制的に絵文字描画になる（実機で症状を確認してもらうため）。
+const forcedVector = /[?&]vector=([01])/.exec(location.search);
+let colorEmojiOK = forcedVector ? forcedVector[1] === '0' : true;  // 実測が済むまでは絵文字で描く
+function detectColorEmoji() {
+  if (forcedVector) return forcedVector[1] === '0';
+  try {
+    const c = document.createElement('canvas');
+    c.width = 24; c.height = 24;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.font = `18px ${EMOJI_FONT}`;
+    g.fillStyle = '#000';
+    g.fillText('🏠', 12, 12);
+    const d = g.getImageData(0, 0, 24, 24).data;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 40) continue;                    // 透明部分は無視
+      const r = d[i], gg = d[i + 1], b = d[i + 2];
+      if (Math.max(r, gg, b) - Math.min(r, gg, b) > 28) return true;   // 彩度あり＝カラー字形で描けている
+    }
+    return false;                                     // 真っ黒＝モノクロ字形しか出せていない
+  } catch { return true; }                            // 判定不能な環境では従来どおり絵文字
+}
+
+// 絵文字が使えない端末向けの建物描画。ジャンルごとに「壁＋屋根＋窓」を図形で描くため端末差が出ない。
+// x,y は絵文字と同じ基準（textAlign=center / textBaseline=bottom 相当の足元中央）。
+const VECTOR_STYLE = {
+  kodate:   { wall: '#fde68a', roof: '#b45309', floors: 1, wide: 0.86 },
+  apart:    { wall: '#fed7aa', roof: '#c2410c', floors: 2, wide: 0.98 },
+  tekkotsu: { wall: '#bfdbfe', roof: '#1d4ed8', floors: 4, wide: 0.80 },
+  kubun:    { wall: '#ddd6fe', roof: '#6d28d9', floors: 5, wide: 0.74 },
+  rc:       { wall: '#c7d2fe', roof: '#3730a3', floors: 6, wide: 0.70 },
+};
+function drawVectorBuilding(x, y, size, shape, alpha, gray) {
+  const s = VECTOR_STYLE[shape] || VECTOR_STYLE.kodate;
+  const w = size * s.wide, h = size * 0.92;
+  const left = x - w / 2, top = y - h;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = gray ? '#94a3b8' : s.wall;
+  ctx.fillRect(left, top, w, h);
+  ctx.fillStyle = gray ? '#64748b' : s.roof;
+  if (shape === 'kodate' || shape === 'apart') {      // 低層は三角屋根、中高層は陸屋根で見分ける
+    ctx.beginPath();
+    ctx.moveTo(left - w * 0.09, top);
+    ctx.lineTo(x, top - h * 0.34);
+    ctx.lineTo(left + w + w * 0.09, top);
+    ctx.closePath(); ctx.fill();
+  } else {
+    ctx.fillRect(left - w * 0.05, top - h * 0.07, w * 1.1, h * 0.07);
+  }
+  const cols = Math.max(2, Math.round(w / (size * 0.26)));
+  const gapX = w / (cols + 1), gapY = h / (s.floors + 1);
+  const ww = Math.max(1.1, gapX * 0.52), wh = Math.max(1.1, gapY * 0.5);
+  ctx.fillStyle = gray ? '#cbd5e1' : '#1e3a5f';
+  for (let r = 1; r <= s.floors; r++) {
+    for (let c = 1; c <= cols; c++) ctx.fillRect(left + gapX * c - ww / 2, top + gapY * r - wh / 2, ww, wh);
+  }
+  ctx.strokeStyle = gray ? 'rgba(51,65,85,0.55)' : 'rgba(30,41,59,0.65)';
+  ctx.lineWidth = Math.max(0.6, size * 0.035);
+  ctx.strokeRect(left, top, w, h);
+  ctx.restore();
+}
 
 // 大陸の陸地パッチ（雰囲気のみ）: 中心に厚く・外周にいくほど薄く広がる分布
 const CONTINENT_BLOBS = (() => {
@@ -1546,7 +1649,8 @@ function drawLandmasses() {
     const p = project(area.center.lat, area.center.lon);
     if (p.z < 0.05) continue;
     ctx.globalAlpha = Math.min(1, p.z * 2);
-    ctx.font = `${Math.round(18 * (0.6 + p.z * 0.6))}px sans-serif`;
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = `${Math.round(18 * (0.6 + p.z * 0.6))}px ${EMOJI_FONT}`;
     ctx.fillText('🔒', p.x, p.y);
   }
   ctx.globalAlpha = 1;
@@ -1558,8 +1662,11 @@ function drawGrayBuilding(lat, lon, stories, emoji) {
   if (p.z < 0.05) return;
   const scale = 0.65 + p.z * 0.85;   // v3.5: ズームでもアイコンサイズは固定（間隔だけ変わる）
   const size = (12 + stories * 2.1) * scale;
-  ctx.globalAlpha = 0.32 + p.z * 0.22;   // 実物件より薄く「奥に控える」表現
-  ctx.font = `${Math.round(size)}px "Segoe UI Emoji", sans-serif`;
+  const alpha = 0.32 + p.z * 0.22;   // 実物件より薄く「奥に控える」表現
+  if (!colorEmojiOK) { drawVectorBuilding(p.x, p.y, size, EMOJI_SHAPE[emoji] || 'kodate', alpha, true); return; }
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = '#334155';         // 万一モノクロ字形になっても地面の緑を引き継がないよう明示する
+  ctx.font = `${Math.round(size)}px ${EMOJI_FONT}`;
   ctx.fillText(emoji, p.x, p.y);
   ctx.globalAlpha = 1;
 }
@@ -1587,10 +1694,17 @@ function drawColorBuilding(p, lat, lon, kind) {
   }
   // v3.9: iOS Safariはcanvasのctx.filter＋絵文字描画が不安定でシルエット化するため使用しない。
   // 市場（未所有）物件は半透明で「奥に控える」表現にし、全デバイスでカラー絵文字を表示する。
-  ctx.globalAlpha = kind === 'market' ? Math.min(0.55, 0.3 + pr.z * 0.3) : Math.min(1, 0.6 + pr.z * 0.55);
-  ctx.font = `${Math.round(size)}px "Segoe UI Emoji", sans-serif`;
-  ctx.fillText(emoji, pr.x, pr.y);
-  ctx.globalAlpha = 1;
+  // v3.12: カラー絵文字を描けない端末では図形の建物にフォールバックする。
+  const alpha = kind === 'market' ? Math.min(0.55, 0.3 + pr.z * 0.3) : Math.min(1, 0.6 + pr.z * 0.55);
+  if (!colorEmojiOK) {
+    drawVectorBuilding(pr.x, pr.y, size, parts.shape, alpha, kind === 'market');
+  } else {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#334155';       // モノクロ字形になってもハローの緑を引き継がないよう明示する
+    ctx.font = `${Math.round(size)}px ${EMOJI_FONT}`;
+    ctx.fillText(emoji, pr.x, pr.y);
+    ctx.globalAlpha = 1;
+  }
 
   if (kind === 'owned') {
     const occ = p.units && p.units.length ? p.units.filter(u => u.occupied).length / p.units.length : 1;
@@ -1602,13 +1716,16 @@ function drawColorBuilding(p, lat, lon, kind) {
     }
     // v3: 業者修繕中の物件は🔨マーク、v3.11: バリューアップ工事中は✨マークで一目で分かるように
     if (p.repairJob || p.valueUpJob) {
-      ctx.font = `${Math.round(12 * scale)}px sans-serif`;
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = `${Math.round(12 * scale)}px ${EMOJI_FONT}`;
       ctx.fillText(p.repairJob ? '🔨' : '✨', pr.x, pr.y - size * 1.10);
     }
   } else if (kind === 'market' && (st.favorites || []).some(f => f.propertyId === p.id)) {
     // お気に入り登録した市場物件だけ⭐を付けタップ可能にする（未登録の市場物件は雰囲気建物と同じ扱い）
     ctx.globalAlpha = 1;
-    ctx.font = `${Math.round(13 * scale)}px sans-serif`;
+    ctx.fillStyle = '#facc15';
+    ctx.font = `${Math.round(13 * scale)}px ${EMOJI_FONT}`;
     ctx.fillText('⭐', pr.x, pr.y - size * 1.05);
   }
   ctx.restore();
@@ -1689,7 +1806,8 @@ function draw(ts) {
       ctx.beginPath(); ctx.arc(pr.x, pr.y - 8, 14 + ((t + 0.5) % 1) * 34, 0, TAU); ctx.stroke();
       // 跳ねる📍ピン
       const bounce = Math.abs(Math.sin(now / 220)) * 9;
-      ctx.font = '28px "Segoe UI Emoji", sans-serif';
+      ctx.fillStyle = '#ef4444';
+      ctx.font = `28px ${EMOJI_FONT}`;
       ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
       ctx.fillText('📍', pr.x, pr.y - 26 - bounce);
       ctx.restore();
@@ -1772,6 +1890,12 @@ function initCity(cv, callbacks) {
   canvas = cv; cbs = callbacks || {};
   ctx = canvas.getContext('2d');
   resize();
+  // v3.12: カラー絵文字が描けるかを実測。フォント確定前だと誤判定するため fonts.ready 後に実行し、
+  // 「描けない」と出た場合だけ念のため後追いでもう一度だけ確かめる（遅れて使えるようになる端末対策）。
+  const runDetect = () => { colorEmojiOK = detectColorEmoji(); };
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(runDetect, runDetect);
+  else setTimeout(runDetect, 300);
+  setTimeout(() => { if (!colorEmojiOK) colorEmojiOK = detectColorEmoji(); }, 2500);
   // Tailwind CDNのスタイル適用が非同期のため、initCity実行時点ではcanvasのレイアウトサイズが
   // まだ確定していないことがある（clientWidth=0）。ResizeObserverで実際のサイズ確定を捉える。
   if (typeof ResizeObserver !== 'undefined') {
@@ -2126,13 +2250,26 @@ function showTitle(hasSave) {
 }
 
 // v3.7: 初回チュートリアル。先輩大家🧑‍🏫の吹き出しが基本動作を順番に案内（スキップ可・完了は端末に記録）。
+// v3.12: 対象ボタンはPC用パネル（btn-*）とスマホ用バー（m-*）で別物なので、候補を並べて
+// 「実際に画面に出ている方」を選ぶ。従来はPC用のidだけを見ており、スマホではすべての対象が
+// 非表示（実サイズ0）だったため、吹き出しが毎回画面左上に固定され上部の情報バーに被っていた。
 const TUTORIAL_STEPS = [
-  { target: 'btn-work', text: 'まずは💼「働く」で種銭を作ろう。長押しで連続で稼げるぞ。' },
-  { target: 'btn-open-search', text: '次は🏘️「物件を探す」。1回ごとに行動力1。何度も足を運ぶほど出物に近づく。' },
-  { target: 'btn-open-listings', text: '見つけた物件は🗂️市場一覧に並ぶ。「買付を検討」から満額か指値で申し込もう。指値は断られることもある。' },
-  { target: 'btn-open-listings', text: '支払いは現金一括か融資。融資なら頭金をスライダーで自由に決めて、4つの銀行の審査結果を見比べよう。' },
-  { target: 'btn-next-month-desk', text: '📅「翌月へ進む」と家賃が入り、行動力が全回復する。ここからは君の腕次第だ！' },
+  { targets: ['m-work', 'btn-work'], text: 'まずは💼「働く」で種銭を作ろう。長押しで連続で稼げるぞ。' },
+  { targets: ['m-search', 'btn-open-search'], text: '次は🏘️「物件を探す」。1回ごとに行動力1。何度も足を運ぶほど出物に近づく。' },
+  { targets: ['btn-open-listings', 'm-menu'], text: '見つけた物件は🗂️市場一覧に並ぶ（スマホは≡メニューの中）。「買付を検討」から満額か指値で申し込もう。指値は断られることもある。' },
+  { targets: ['btn-open-listings', 'm-menu'], text: '支払いは現金一括か融資。融資なら頭金をスライダーで自由に決めて、4つの銀行の審査結果を見比べよう。' },
+  { targets: ['m-next', 'btn-next-month-desk'], text: '📅「翌月へ進む」と家賃が入り、行動力が全回復する。ここからは君の腕次第だ！' },
 ];
+// 候補のうち実際に表示されている（実サイズを持つ）ものを返す
+function visibleTutTarget(ids) {
+  for (const id of ids) {
+    const e = document.getElementById(id);
+    if (!e) continue;
+    const r = e.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) return e;
+  }
+  return null;
+}
 let tutIdx = -1, tutBubble = null;
 function startTutorial() { tutIdx = 0; renderTutStep(); }
 function endTutorial() {
@@ -2147,22 +2284,62 @@ function renderTutStep() {
   document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl', 'ring-4', 'ring-amber-400'));
   if (tutIdx >= TUTORIAL_STEPS.length) { endTutorial(); return; }
   const stp = TUTORIAL_STEPS[tutIdx];
-  const target = document.getElementById(stp.target);
+  const target = visibleTutTarget(stp.targets);
   if (!target) { tutIdx += 1; renderTutStep(); return; }
   target.classList.add('tut-hl', 'ring-4', 'ring-amber-400');
-  const r = target.getBoundingClientRect();
-  tutBubble = el(`<div class="fixed z-[65]" style="left:${Math.max(8, Math.round(r.left - 258))}px; top:${Math.max(8, Math.round(r.top - 10))}px; width:248px;">
-    <div class="bg-white rounded-xl shadow-2xl p-3 text-xs space-y-2 border-2 border-amber-400">
+  tutBubble = el(`<div class="fixed z-[65]" style="visibility:hidden; left:0; top:0;">
+    <div class="relative bg-white rounded-xl shadow-2xl p-3 text-xs space-y-2 border-2 border-amber-400">
       <div class="font-bold text-slate-800">🧑‍🏫 先輩大家（${tutIdx + 1}/${TUTORIAL_STEPS.length}）</div>
       <div class="text-slate-700 leading-relaxed">${stp.text}</div>
       <div class="flex gap-2">
         <button class="tut-next flex-1 bg-amber-500 hover:bg-amber-600 text-white rounded py-1.5 font-bold">${tutIdx === TUTORIAL_STEPS.length - 1 ? 'はじめる！' : '次へ ▶'}</button>
         <button class="tut-skip text-slate-500 px-2">スキップ</button>
-      </div></div></div>`);
+      </div>
+      <div class="tut-arrow absolute"></div>
+    </div></div>`);
   document.body.appendChild(tutBubble);
+  placeTutBubble(tutBubble, target.getBoundingClientRect());
   tutBubble.querySelector('.tut-next').addEventListener('click', () => { tutIdx += 1; renderTutStep(); });
   tutBubble.querySelector('.tut-skip').addEventListener('click', endTutorial);
 }
+
+// v3.12: 吹き出しを「対象ボタンに重ならない空いている側」へ置き、対象を指す三角を出す。
+// 従来は対象の258px左に固定していたため、幅の狭いスマホでは必ず左端(8,8)へ丸められ、
+// 上部の情報バーに文字が被ったうえ何を指しているのか分からなくなっていた。
+function placeTutBubble(bubble, r) {
+  const vw = window.innerWidth, vh = window.innerHeight, M = 8, GAP = 12, A = 8;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const w = Math.min(260, vw - M * 2);
+  bubble.style.width = w + 'px';
+  const h = bubble.offsetHeight;                       // 幅確定後に実測する
+  let left, top, dir;
+  if (r.left - w - GAP >= M) {                         // 対象の左に置く（PCの右パネル）
+    dir = 'right'; left = r.left - w - GAP; top = clamp(r.top - 10, M, vh - h - M);
+  } else if (r.right + w + GAP <= vw - M) {            // 対象の右に置く（PCの左パネル）
+    dir = 'left'; left = r.right + GAP; top = clamp(r.top - 10, M, vh - h - M);
+  } else if (r.top - h - GAP >= M) {                   // 対象の上に置く（スマホ下部バー）
+    dir = 'down'; left = clamp(r.left + r.width / 2 - w / 2, M, vw - w - M); top = r.top - h - GAP;
+  } else {                                             // 対象の下に置く（スマホ上部バー）
+    dir = 'up'; left = clamp(r.left + r.width / 2 - w / 2, M, vw - w - M); top = clamp(r.bottom + GAP, M, vh - h - M);
+  }
+  bubble.style.left = Math.round(left) + 'px';
+  // 対象の上に置く場合は下端を基準にする。文字が後から折り返して高さが伸びても、
+  // 吹き出しは上へ伸びるだけで対象ボタンに被らない（高さの実測値に依存しない）。
+  if (dir === 'down') { bubble.style.top = 'auto'; bubble.style.bottom = Math.round(vh - r.top + GAP) + 'px'; }
+  else { bubble.style.bottom = 'auto'; bubble.style.top = Math.round(top) + 'px'; }
+  const ax = clamp(r.left + r.width / 2 - left, 16, w - 16);
+  const ay = clamp(r.top + r.height / 2 - top, 16, h - 16);
+  const arrow = bubble.querySelector('.tut-arrow');
+  const base = 'position:absolute;width:0;height:0;';
+  if (dir === 'down')       arrow.style.cssText = `${base}left:${ax - A}px;bottom:${-A * 2}px;border-left:${A}px solid transparent;border-right:${A}px solid transparent;border-top:${A * 2}px solid #fbbf24;`;
+  else if (dir === 'up')    arrow.style.cssText = `${base}left:${ax - A}px;top:${-A * 2}px;border-left:${A}px solid transparent;border-right:${A}px solid transparent;border-bottom:${A * 2}px solid #fbbf24;`;
+  else if (dir === 'right') arrow.style.cssText = `${base}top:${ay - A}px;right:${-A * 2}px;border-top:${A}px solid transparent;border-bottom:${A}px solid transparent;border-left:${A * 2}px solid #fbbf24;`;
+  else                      arrow.style.cssText = `${base}top:${ay - A}px;left:${-A * 2}px;border-top:${A}px solid transparent;border-bottom:${A}px solid transparent;border-right:${A * 2}px solid #fbbf24;`;
+  bubble.style.visibility = 'visible';
+}
+
+// 画面回転・リサイズで対象の位置が変わるため、表示中のステップを置き直す
+window.addEventListener('resize', () => { if (tutIdx >= 0) renderTutStep(); });
 
 // v3.7: 初期設定をウィザード形式（1問ずつ・フレーバー付き）に。最後に「あなたの物語」で確認してから開始。
 function showSetup() {
