@@ -300,7 +300,10 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
     const sizeSqm = Math.round(lr(szLo, szHi));
     const rent = estimateRent(sizeSqm, areaKey, builtAge, genreKey, rng);
     const occupied = g.wake ? rng() < 0.4 : rng() > Math.max(0.03, 0.10 + a.vacancyAdd);
-    return { rent, occupied, vacantMonths: occupied ? 0 : Math.round(lr(1, 6)), layout, sizeSqm };
+    // v4: 原状回復は部屋ごと。tenantMonths（在室月数）は退去時の原状回復費に効く。
+    return { rent, occupied, vacantMonths: occupied ? 0 : Math.round(lr(1, 6)), layout, sizeSqm,
+      needsRestore: false, tenantMonths: occupied ? Math.round(lr(1, 60)) : 0,
+      restoreJob: null, restoreProgress: 0 };
   });
   // v3.10: 価格は家賃から導く（年間家賃 ÷ 想定利回り帯）。訳ありは高利回り帯＝安い掘り出し物のまま。
   // v3.11: opts.lowYield=true は利回り帯の下限寄り（家賃に対して割高＝買う魅力の薄い「平凡物件」）を生成。
@@ -326,7 +329,7 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
     bldgRatio: g.structure === '木造' ? 0.5 : 0.45,
     deprRemaining: deprMonthsFor(g.structure, builtAge),
     listedMonths: 0, staleFlag: false, refusedOffer: false,
-    loan: null, boughtPrice: null, boughtMonth: null, selfManaged: false,
+    loan: null, reformLoans: [], boughtPrice: null, boughtMonth: null, selfManaged: false,
     history: [], cum: { cf: 0, months: 0 },
   };
   // v3.8: 売主事情。売り急ぎ（相続・資金繰り等）の売主は深い指値にも応じやすい（レアな掘り出し物・訳ありはやや高め）
@@ -488,7 +491,10 @@ export function propertyMonthlyPL(p) {
   const pm = p.selfManaged ? 0 : Math.round(rentIn * p.pmFeeRate);
   const opex = p.mgmtFeeM + p.repairReserveM + pm + Math.round(p.propTaxA / 12);
   const loanBd = loanMonthlyBreakdown(p.loan);
-  const reformBd = loanMonthlyBreakdown(p.reformLoan);
+  // v4: リフォームローンは複数本を同時に抱えられる（工事ごとに借りられるため）
+  const reformBd = (p.reformLoans || []).map(loanMonthlyBreakdown)
+    .reduce((t, b) => ({ interest: t.interest + b.interest, principal: t.principal + b.principal }),
+      { interest: 0, principal: 0 });
   const interest = loanBd.interest + reformBd.interest;
   const principalPay = loanBd.principal + reformBd.principal;
   const noiM = rentIn - opex;
@@ -552,7 +558,7 @@ export function settleSale(state, sale) {
   const capTax = Math.round(gain * taxRate);
   let payoff = 0;
   if (p.loan) payoff += Math.round(remainingPrincipal(p.loan.principal, p.loan.rate, p.loan.years, p.loan.monthsPaid));
-  if (p.reformLoan) payoff += Math.round(remainingPrincipal(p.reformLoan.principal, p.reformLoan.rate, p.reformLoan.years, p.reformLoan.monthsPaid));
+  payoff += reformLoansRemaining(p);
   s.cash += sale.price - capTax - payoff;
   if (p.loan) { const rel = s.bankRelations?.[p.loan.bankKey]; if (rel) rel.paidOff += 1; }
   logs.push(`${p.label} を ${yen(sale.price)} で売却（譲渡税 ${yen(capTax)}・残債精算 ${yen(payoff)}）`);
@@ -571,7 +577,14 @@ export function monthlyVacancyRoll(property, rng = Math.random) {
   let vacated = 0;
   const rate = 0.01 + (property.builtAge >= 26 ? 0.005 : 0) + (property.junkFlags.includes('管理崩壊') ? 0.01 : 0);
   property.units.forEach(u => {
-    if (u.occupied && rng() < rate) { u.occupied = false; u.vacantMonths = 0; vacated += 1; }
+    if (u.occupied && rng() < rate) {
+      // v4: 退去した部屋は「要原状回復」。回復するまで客付けできない。
+      // tenantMonths は原状回復費の算定に使うため、ここでは0に戻さない（入居時にリセットする）。
+      u.occupied = false; u.vacantMonths = 0; vacated += 1;
+      u.needsRestore = true; u.restoreProgress = 0;
+    } else if (u.occupied) {
+      u.tenantMonths = (u.tenantMonths || 0) + 1;
+    }
   });
   return { property, vacated };
 }
@@ -580,7 +593,8 @@ export function naturalFillRoll(property, rng = Math.random) {
   let filled = 0;
   property.units.forEach(u => {
     if (!u.occupied) {
-      if (rng() < 0.20) { u.occupied = true; u.vacantMonths = 0; filled += 1; }
+      if (u.needsRestore) { u.vacantMonths += 1; return; }   // v4: 原状回復前は埋まらない
+      if (rng() < 0.20) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; filled += 1; }
       else u.vacantMonths += 1;
     }
   });
@@ -592,51 +606,156 @@ export function fillVacancy(state, propertyId, unitIndex, method, rng = Math.ran
   const p = s.properties.find(x => x.id === propertyId);
   const u = p.units[unitIndex];
   if (!u || u.occupied) return { state: s, success: false };
+  // v4: 原状回復が済むまでは募集できない。費用・行動力を消費する前に弾く。
+  if (u.needsRestore) return { state: s, success: false, reason: 'needsRestore' };
   let chance;
   if (method === 'ad') { s.cash -= u.rent; chance = 0.70; }
   else { s.actionPower -= 30; const lv = skillLevel(s.skills.selfmgmt.exp); chance = 0.40 + (lv - 1) * 0.10; s.skills.selfmgmt.exp += 10; }
   const success = rng() < chance;
-  if (success) { u.occupied = true; u.vacantMonths = 0; }
+  if (success) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; }
   return { state: s, success };
 }
 
-// === v3: 修繕は「工事内容」ベース。ギャップ(100-修繕度)で規模・DIYコスト・業者工期が決まる ===
-export const REPAIR_TIERS = {
-  small: { label: '清掃・草刈り・クロス補修', diyCost: 10 },
-  mid:   { label: '水回り・内装・防水工事',   diyCost: 20 },
-  large: { label: '外壁・屋根・躯体工事',     diyCost: 30 },
-};
+// === v4: 現状回復（部屋ごと・退去起点）===
+export const DIY_WORK_TOTAL = 100;       // DIY完了に必要な作業量（修繕・原状回復・価値UP共通）
+export const RESTORE_DIY_AP = 10;        // DIY1回の行動力
+export const RESTORE_DIY_STEP = 25;      // DIY1回の基準作業量（スキルで増える）
+export const DIY_MATERIAL_RATE = 0.30;   // DIYの材料費 ＝ 業者見積の30%
 
-export function repairTier(gap) {
-  return gap <= 30 ? 'small' : gap <= 60 ? 'mid' : 'large';
+// 自主管理スキルが高いほどDIY1回で進む量が増える
+export function diyWorkStep(base, state) {
+  return base * (1 + skillLevel(state.skills.selfmgmt.exp) * 0.12);
 }
 
-export function repairTierInfo(property) {
+// 原状回復費: 家賃ベース。修繕度が低いほど高く、長期入居ほど高い（10年で約2倍）。
+export function restoreCost(property, unit) {
   const gap = Math.max(0, 100 - property.repairState);
-  const tier = repairTier(gap);
-  return { tier, gap, ...REPAIR_TIERS[tier] };
+  const wear = 2 + gap / 50;
+  const tenure = 1 + (unit.tenantMonths || 0) / 120;
+  return Math.max(50_000, Math.round(unit.rent * wear * tenure / 1000) * 1000);
 }
 
-export function doDIY(state, propertyId) {
+// 原状回復に着手する。diy=true は材料費のみで作業量を貯める方式、false は業者へ発注（借入可）。
+export function startRestore(state, propertyId, unitIndex, opts = {}) {
   const p0 = state.properties.find(x => x.id === propertyId);
-  if (!p0 || p0.repairJob) return { state };   // 業者修繕中はDIY不可
+  const u0 = p0 && p0.units[unitIndex];
+  if (!p0 || !u0 || !u0.needsRestore || u0.restoreJob) return { state, started: false };
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
-  s.actionPower -= repairTierInfo(p).diyCost;
-  const before = p.repairState;
-  p.repairState = Math.min(100, p.repairState + 15);
-  s.skills.selfmgmt.exp += 10;
-  if (before < 100 && p.repairState === 100) {
-    p.timeValue = Math.round(p.timeValue * 1.05);
-    recordJunkRepair(s, p);
+  const u = p.units[unitIndex];
+  const cost = restoreCost(p, u);
+
+  if (opts.diy) {
+    const material = Math.round(cost * DIY_MATERIAL_RATE);
+    // 材料費は着手時（作業量0）の1回だけ。以降のタップは行動力のみ。
+    if ((u.restoreProgress || 0) <= 0) s.cash -= material;
+    s.actionPower -= RESTORE_DIY_AP;
+    u.restoreProgress = (u.restoreProgress || 0) + diyWorkStep(RESTORE_DIY_STEP, s);
+    s.skills.selfmgmt.exp += 10;
+    const done = u.restoreProgress >= DIY_WORK_TOTAL;
+    if (done) { u.needsRestore = false; u.restoreProgress = 0; }
+    return { state: s, started: true, diy: true, cost: material, done };
   }
-  return { state: s };
+
+  s.actionPower -= 5;
+  let loanAmount = 0;
+  if (opts.financed) {
+    loanAmount = reformLoanAmount(cost, s.creditScore);
+    s.cash -= (cost - loanAmount);
+    p.reformLoans = p.reformLoans || [];
+    p.reformLoans.push({ principal: loanAmount, rate: CONFIG.reformLoanRate, years: CONFIG.reformLoanYears, monthsPaid: 0 });
+  } else {
+    s.cash -= cost;
+  }
+  u.restoreJob = { monthsTotal: 1, monthsLeft: 1 };
+  return { state: s, started: true, diy: false, cost, loanAmount, financed: !!opts.financed, months: 1 };
 }
+
+// === v4: 修繕は「日常メンテ・小規模補修」と「大規模修繕」の2種類 ===
+// 日常メンテはDIYできるが修繕度70%が上限（清掃・草刈り・部分補修で躯体の劣化は直らない）。
+// 100%まで戻すには足場を組む大規模修繕が必要で、こちらは業者のみ。
+export const REPAIR_KINDS = {
+  maint: { label: '日常メンテ・小規模補修', detail: '清掃・草刈り・部分クロス張替',
+    diyable: true,  costRate: 0.02, minCost: 30_000, gain: 15, cap: 70, diyAp: 10, diyStep: 25 },
+  large: { label: '大規模修繕', detail: '外壁・屋根・防水',
+    diyable: false, costRate: 0.10, minCost: 50_000, gain: null, cap: 100, diyAp: 0, diyStep: 0,
+    blockedReason: '足場の設置と高所・構造の作業が必要なため、業者にしか頼めません' },
+};
+
+// 工事種別ごとの業者見積もり
+export function repairCost(property, kind) {
+  const k = REPAIR_KINDS[kind];
+  if (!k) return 0;
+  const gap = Math.max(0, 100 - property.repairState);
+  return Math.max(k.minCost, Math.round(property.price * k.costRate * gap / 100 / 10000) * 10000);
+}
+
+// 工事後に到達する修繕度（日常メンテは+15かつ70上限、大規模修繕は100）
+export function repairResultState(property, kind) {
+  const k = REPAIR_KINDS[kind];
+  if (!k) return property.repairState;
+  return k.gain == null ? k.cap : Math.min(k.cap, property.repairState + k.gain);
+}
+
+// 修繕に着手する。diy=true は材料費のみで作業量を貯める方式、false は業者へ発注（借入可）。
+export function startRepair(state, propertyId, kind, opts = {}) {
+  const p0 = state.properties.find(x => x.id === propertyId);
+  const k = REPAIR_KINDS[kind];
+  if (!p0 || !k || p0.repairJob) return { state, started: false, reason: 'busy' };
+  if (opts.diy && !k.diyable) return { state, started: false, reason: 'diyNotAllowed' };
+  if (repairResultState(p0, kind) <= p0.repairState) return { state, started: false, reason: 'noGain' };
+
+  const s = structuredClone(state);
+  const p = s.properties.find(x => x.id === propertyId);
+  const cost = repairCost(p, kind);
+
+  if (opts.diy) {
+    const material = Math.round(cost * DIY_MATERIAL_RATE);
+    const prog = (p.diyProgress && p.diyProgress.kind === kind) ? p.diyProgress : null;
+    if (!prog) s.cash -= material;                       // 材料費は着手時の1回だけ
+    s.actionPower -= k.diyAp;
+    const done = (prog ? prog.done : 0) + diyWorkStep(k.diyStep, s);
+    s.skills.selfmgmt.exp += 10;
+    if (done >= DIY_WORK_TOTAL) {
+      // DIYできるのは日常メンテ（70%上限）だけなので、ここで100%に到達することはない。
+      // 訳あり物件の修繕実績は大規模修繕（業者）の完了時に記録される。
+      p.repairState = repairResultState(p, kind);
+      p.diyProgress = null;
+      return { state: s, started: true, diy: true, cost: material, done: true };
+    }
+    p.diyProgress = { kind, planKey: null, done };
+    return { state: s, started: true, diy: true, cost: prog ? 0 : material, done: false };
+  }
+
+  s.actionPower -= 5;
+  let loanAmount = 0;
+  if (opts.financed) {
+    loanAmount = reformLoanAmount(cost, s.creditScore);
+    s.cash -= (cost - loanAmount);
+    p.reformLoans = p.reformLoans || [];
+    p.reformLoans.push({ principal: loanAmount, rate: CONFIG.reformLoanRate, years: CONFIG.reformLoanYears, monthsPaid: 0 });
+  } else {
+    s.cash -= cost;
+  }
+  const monthsTotal = repairMonthsForCost(cost);
+  p.repairJob = { kind, monthsTotal, monthsLeft: monthsTotal, startState: p.repairState };
+  return { state: s, started: true, diy: false, cost, loanAmount, financed: !!opts.financed, monthsTotal };
+}
+
+// v4: 旧 repairTier / repairTierInfo / doDIY は廃止。
+// ギャップで小/中/大を自動判定する方式をやめ、プレイヤーが工事内容（maint / large）を選び、
+// 実施方法（DIY / 業者）も選ぶ REPAIR_KINDS + startRepair に置き換えた。
 
 export function totalDebt(state) {
   return Math.round(state.properties.reduce((t, p) => t
     + (p.loan ? remainingPrincipal(p.loan.principal, p.loan.rate, p.loan.years, p.loan.monthsPaid) : 0)
-    + (p.reformLoan ? remainingPrincipal(p.reformLoan.principal, p.reformLoan.rate, p.reformLoan.years, p.reformLoan.monthsPaid) : 0), 0));
+    + reformLoansRemaining(p), 0));
+}
+
+// v4: リフォームローンは1物件に複数本。残債の合計を返す。
+export function reformLoansRemaining(p) {
+  return Math.round((p.reformLoans || []).reduce((t, l) =>
+    t + remainingPrincipal(l.principal, l.rate, l.years, l.monthsPaid), 0));
 }
 
 // === 業者への修繕依頼（DIYより高コストだが一括で修繕度100・リフォームローン利用可）===
@@ -663,12 +782,14 @@ export function startProfessionalRepair(state, propertyId, financed = false) {
   const p = s.properties.find(x => x.id === propertyId);
   const cost = professionalRepairCost(p);
   s.actionPower -= 5;
-  const canFinance = financed && !p.reformLoan;   // 既存のリフォームローン完済前は再借入不可（多重借入で残債が消える事故を防ぐ）
+  // v4: 工事ごとに借りられるよう複数本を許可（配列化で残債・返済を本数ぶん正しく処理する）
+  const canFinance = !!financed;
   let loanAmount = 0;
   if (canFinance) {
     loanAmount = reformLoanAmount(cost, s.creditScore);
     s.cash -= (cost - loanAmount);
-    p.reformLoan = { principal: loanAmount, rate: CONFIG.reformLoanRate, years: CONFIG.reformLoanYears, monthsPaid: 0 };
+    p.reformLoans = p.reformLoans || [];
+    p.reformLoans.push({ principal: loanAmount, rate: CONFIG.reformLoanRate, years: CONFIG.reformLoanYears, monthsPaid: 0 });
   } else {
     s.cash -= cost;
   }
@@ -678,10 +799,16 @@ export function startProfessionalRepair(state, propertyId, financed = false) {
 }
 
 // === v3.11: バリューアップ投資（設備更新・リノベで家賃自体を上げる）===
+// v4: 各プランに diyable / diyAp / diyStep を持たせ、修繕と同じ「DIY か 業者か」を選べるようにした。
+// フルリノベは間取り変更に確認申請が要るため業者のみ。
 export const VALUE_UP_PLANS = {
-  light:    { label: '設備更新（エアコン・建具・照明）',   rentMult: 1.06, months: 1, costRate: 0.6 },
-  standard: { label: '水回り刷新・内装フルチェンジ',       rentMult: 1.12, months: 2, costRate: 1.2 },
-  full:     { label: 'フルリノベーション・間取り改善',     rentMult: 1.20, months: 3, costRate: 2.0 },
+  light:    { label: '設備更新（エアコン・建具・照明）',   rentMult: 1.06, months: 1, costRate: 0.6,
+    diyable: true,  diyAp: 15, diyStep: 20 },
+  standard: { label: '水回り刷新・内装フルチェンジ',       rentMult: 1.12, months: 2, costRate: 1.2,
+    diyable: true,  diyAp: 15, diyStep: 12.5 },
+  full:     { label: 'フルリノベーション・間取り改善',     rentMult: 1.20, months: 3, costRate: 2.0,
+    diyable: false, diyAp: 0,  diyStep: 0,
+    blockedReason: '間取り変更には確認申請が必要なため、業者にしか頼めません' },
 };
 export const VALUE_UP_MAX_LEVEL = 2;   // 1物件につき2回まで
 
@@ -693,19 +820,56 @@ export function valueUpCost(property, planKey) {
 }
 
 // バリューアップを発注。工期を経て家賃・時価が上がる（修繕とは別枠のjob）。
-export function startValueUp(state, propertyId, planKey) {
+export function startValueUp(state, propertyId, planKey, opts = {}) {
   const p0 = state.properties.find(x => x.id === propertyId);
   const plan = VALUE_UP_PLANS[planKey];
   if (!p0 || !plan || p0.repairJob || p0.valueUpJob) return { state, started: false, reason: 'busy' };
   if ((p0.valueUpLevel || 0) >= VALUE_UP_MAX_LEVEL) return { state, started: false, reason: 'maxed' };
+  if (opts.diy && !plan.diyable) return { state, started: false, reason: 'diyNotAllowed' };
   const cost = valueUpCost(p0, planKey);
-  if (state.cash < cost) return { state, started: false, reason: 'cash' };
+
+  if (opts.diy) {
+    const material = Math.round(cost * DIY_MATERIAL_RATE);
+    const prog = (p0.diyProgress && p0.diyProgress.kind === 'valueup' && p0.diyProgress.planKey === planKey)
+      ? p0.diyProgress : null;
+    if (!prog && state.cash < material) return { state, started: false, reason: 'cash' };
+    const s = structuredClone(state);
+    const p = s.properties.find(x => x.id === propertyId);
+    if (!prog) s.cash -= material;                       // 材料費は着手時の1回だけ
+    s.actionPower -= plan.diyAp;
+    const done = (prog ? prog.done : 0) + diyWorkStep(plan.diyStep, s);
+    s.skills.selfmgmt.exp += 10;
+    if (done >= DIY_WORK_TOTAL) {
+      applyValueUp(p, plan.rentMult);
+      p.diyProgress = null;
+      return { state: s, started: true, diy: true, cost: prog ? 0 : material, done: true };
+    }
+    p.diyProgress = { kind: 'valueup', planKey, done };
+    return { state: s, started: true, diy: true, cost: prog ? 0 : material, done: false };
+  }
+
+  if (!opts.financed && state.cash < cost) return { state, started: false, reason: 'cash' };
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
   s.actionPower -= 5;
-  s.cash -= cost;
+  let loanAmount = 0;
+  if (opts.financed) {
+    loanAmount = reformLoanAmount(cost, s.creditScore);
+    s.cash -= (cost - loanAmount);
+    p.reformLoans = p.reformLoans || [];
+    p.reformLoans.push({ principal: loanAmount, rate: CONFIG.reformLoanRate, years: CONFIG.reformLoanYears, monthsPaid: 0 });
+  } else {
+    s.cash -= cost;
+  }
   p.valueUpJob = { monthsTotal: plan.months, monthsLeft: plan.months, rentMult: plan.rentMult, label: plan.label };
-  return { state: s, started: true, cost, months: plan.months };
+  return { state: s, started: true, diy: false, cost, loanAmount, financed: !!opts.financed, months: plan.months };
+}
+
+// 価値UPの効果（各室家賃・時価・レベル）を物件に適用する。DIY完了時と業者工期完了時の共通処理。
+export function applyValueUp(p, rentMult) {
+  p.units.forEach(u => { u.rent = Math.max(1000, Math.round(u.rent * rentMult / 1000) * 1000); });
+  p.timeValue = Math.round(p.timeValue * rentMult);
+  p.valueUpLevel = (p.valueUpLevel || 0) + 1;
 }
 
 export function totalAssetsV2(state) { return state.cash + state.properties.reduce((t, p) => t + p.timeValue, 0); }
@@ -867,7 +1031,7 @@ export function dedupePropertyIds(state) {
 export function transferToCorp(state, propertyId) {
   const p0 = state.properties.find(x => x.id === propertyId);
   if (!state.isIncorporated || !p0 || p0.owner === 'corp') return { state, done: false, reason: 'invalid' };
-  if (p0.loan || p0.reformLoan) return { state, done: false, reason: 'loan' };
+  if (p0.loan || (p0.reformLoans || []).length > 0) return { state, done: false, reason: 'loan' };
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
   const price = p.timeValue;
@@ -974,6 +1138,16 @@ export function advanceMonth(state, rng = Math.random) {
     const r = settleSale(s, sale); s = r.state; logs.push(...r.logs);
   }
   for (const p of s.properties) {
+    // v4: 業者に出した原状回復は工期を経て完了する。先に完了させてから客付け判定に進む。
+    for (const u of p.units) {
+      if (u.restoreJob) {
+        u.restoreJob.monthsLeft -= 1;
+        if (u.restoreJob.monthsLeft <= 0) {
+          u.restoreJob = null; u.needsRestore = false; u.restoreProgress = 0;
+          logs.push(`${p.name || p.label} の原状回復が完了。募集を再開できる`);
+        }
+      }
+    }
     monthlyVacancyRoll(p, rng);
     naturalFillRoll(p, rng);
     const pl = propertyMonthlyPL(p);
@@ -982,9 +1156,10 @@ export function advanceMonth(state, rng = Math.random) {
       p.loan.monthsPaid += 1;
       if (p.loan.monthsPaid >= p.loan.years * 12) p.loan = null;   // 完済したら返済を止める
     }
-    if (p.reformLoan) {
-      p.reformLoan.monthsPaid += 1;
-      if (p.reformLoan.monthsPaid >= p.reformLoan.years * 12) p.reformLoan = null;
+    // v4: リフォームローンは複数本。各本を1ヶ月進め、完済した本だけを配列から外す。
+    if (p.reformLoans && p.reformLoans.length) {
+      p.reformLoans.forEach(l => { l.monthsPaid += 1; });
+      p.reformLoans = p.reformLoans.filter(l => l.monthsPaid < l.years * 12);
     }
     if (p.deprRemaining > 0) p.deprRemaining -= 1;
     const drift = p.structure === '木造' ? -0.0015 : p.structure === 'S' ? -0.001 : -0.0005;
@@ -1002,29 +1177,34 @@ export function advanceMonth(state, rng = Math.random) {
     if (p.repairJob) {
       p.repairJob.monthsLeft -= 1;
       const j = p.repairJob;
+      // v4: 工事種別で到達点が変わる（日常メンテは+15で70上限、大規模修繕は100・時価+8%）
+      const goal = repairResultState({ repairState: j.startState }, j.kind || 'large');
       if (j.monthsLeft <= 0) {
         const before = p.repairState;
-        p.repairState = 100;
+        p.repairState = goal;
         p.repairJob = null;
-        p.timeValue = Math.round(p.timeValue * 1.08);
-        s.skills.selfmgmt.exp += 15;
-        if (before < 100) recordJunkRepair(s, p);
         const nm = p.name || p.label;
-        pushNotification(s, 'repair_done', p.id, nm, `${nm} の修繕が完了しました（修繕度100%・資産価値上昇）`);
-        logs.push(`${nm} の修繕が完了した（修繕度100%）`);
+        if ((j.kind || 'large') === 'large') {
+          p.timeValue = Math.round(p.timeValue * 1.08);
+          s.skills.selfmgmt.exp += 15;
+          if (before < 100) recordJunkRepair(s, p);
+          pushNotification(s, 'repair_done', p.id, nm, `${nm} の大規模修繕が完了しました（修繕度100%・資産価値上昇）`);
+          logs.push(`${nm} の大規模修繕が完了した（修繕度100%）`);
+        } else {
+          s.skills.selfmgmt.exp += 8;
+          pushNotification(s, 'repair_done', p.id, nm, `${nm} の日常メンテが完了しました（修繕度${goal}%）`);
+          logs.push(`${nm} の日常メンテが完了した（修繕度${goal}%）`);
+        }
       } else {
         const k = j.monthsTotal - j.monthsLeft;
-        p.repairState = Math.min(99, Math.round(j.startState + (100 - j.startState) * k / j.monthsTotal));
+        p.repairState = Math.min(goal - 1, Math.round(j.startState + (goal - j.startState) * k / j.monthsTotal));
       }
     }
     // v3.11: バリューアップ工事の進行。完了月に各室の家賃と時価が上がる。
     if (p.valueUpJob) {
       p.valueUpJob.monthsLeft -= 1;
       if (p.valueUpJob.monthsLeft <= 0) {
-        const mult = p.valueUpJob.rentMult;
-        p.units.forEach(u => { u.rent = Math.max(1000, Math.round(u.rent * mult / 1000) * 1000); });
-        p.valueUpLevel = (p.valueUpLevel || 0) + 1;
-        p.timeValue = Math.round(p.timeValue * mult);
+        applyValueUp(p, p.valueUpJob.rentMult);   // DIY完了時と同じ処理を使う
         p.valueUpJob = null;
         const nm = p.name || p.label;
         pushNotification(s, 'valueup_done', p.id, nm, `${nm} のバリューアップが完了！家賃がアップしました`);
@@ -1074,6 +1254,24 @@ export function advanceMonth(state, rng = Math.random) {
 
 export function serialize(state) { return JSON.stringify(state); }
 export function deserialize(str) { return JSON.parse(str); }
+
+// v4: 旧セーブを新フィールドへ移行する。ui側のload()から呼ぶ（純関数なのでテストできる）。
+export function migrateSave(state) {
+  const s = structuredClone(state);
+  (s.properties || []).forEach(p => {
+    // リフォームローンの単数→配列
+    if (!Array.isArray(p.reformLoans)) p.reformLoans = p.reformLoan ? [p.reformLoan] : [];
+    delete p.reformLoan;
+    // 原状回復（部屋ごと）。既存の空室は「原状回復済み」扱いにし、いきなり客付け不可にしない。
+    (p.units || []).forEach(u => {
+      if (u.needsRestore === undefined) u.needsRestore = false;
+      if (u.tenantMonths === undefined) u.tenantMonths = u.occupied ? 12 : 0;
+      if (u.restoreJob === undefined) u.restoreJob = null;
+      if (u.restoreProgress === undefined) u.restoreProgress = 0;
+    });
+  });
+  return s;
+}
 
 // ===== v2: ジャンル・エリア補正・銀行・耐用年数 =====
 export const GENRE = {
@@ -1387,7 +1585,7 @@ export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) 
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, REPAIR_TIERS, repairTier, repairTierInfo, doDIY, totalDebt, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, restoreCost, startRestore, REPAIR_KINDS, repairCost, repairResultState, startRepair, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -2478,6 +2676,7 @@ function load(){
   state.nextNotifId = state.nextNotifId || 1;
   state.salesSearch = state.salesSearch || { spent: 0, threshold: null };   // v3: 営業進捗
   state.nextPropertyId = state.nextPropertyId || 1;
+  state = L.migrateSave(state);   // v4: リフォームローンの配列化など新フィールドへの移行
   // v3.5: 旧採番バグで衝突したIDを修復（一覧と詳細が別物件を指す不具合の根治）
   const dd = L.dedupePropertyIds(state);
   if (dd.fixed) { state = dd.state; console.info(`物件IDの重複を${dd.fixed}件修復しました`); }
@@ -2660,8 +2859,12 @@ function openKpiModal(which, keepBulk = false) {
       const badges = [
         p.owner === 'corp' ? '<span class="bg-navy text-white rounded px-1">🏢法人</span>' : '<span class="bg-slate-200 text-slate-700 rounded px-1">👤個人</span>',
         listing ? `<span class="bg-amber-500 text-white rounded px-1">📢売出中${listing.listedMonths + 1}ヶ月目</span>` : '',
-        p.repairJob ? `<span class="bg-amber-100 text-amber-700 rounded px-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : '',
+        p.repairJob ? `<span class="bg-amber-100 text-amber-700 rounded px-1">🔨${L.REPAIR_KINDS[p.repairJob.kind || 'large'].label}中 残り${p.repairJob.monthsLeft}ヶ月</span>` : '',
         (!p.repairJob && p.repairState < 20) ? '<span class="bg-red-100 text-red-700 rounded px-1">⚠️要修繕</span>' : '',
+        // v4: 原状回復が済んでいない部屋は募集できない＝空室損が続くので一覧で目立たせる
+        p.units.filter(u => u.needsRestore).length
+          ? `<span class="bg-red-500 text-white rounded px-1">要原状回復${p.units.filter(u => u.needsRestore).length}室</span>` : '',
+        p.diyProgress ? `<span class="bg-emerald-100 text-emerald-700 rounded px-1">🔨DIY中${Math.min(100, Math.round(p.diyProgress.done))}%</span>` : '',
         occ >= 100 ? '<span class="bg-emerald-100 text-emerald-700 rounded px-1">満室</span>' : `<span class="bg-slate-100 text-slate-600 rounded px-1">入居${occ}%</span>`,
       ].filter(Boolean).join(' ');
       const la = p.lastAppraisal;   // v3.6: 査定結果は物件に保存され、一覧に残り続ける
@@ -2764,18 +2967,19 @@ function openDetail(propId, from, back) {
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   const draw = () => {
     m.innerHTML = '';
-    // v3.11: フッターに✨バリューアップを追加。工事中（修繕/価値UP）はその表示を出し操作ボタンは隠す。
+    // v4: 大分類は「修繕」と「価値UP」の2つ。実施方法（DIY/業者→借入）は各画面で選ぶ。
     const busy = from === 'owned' && (p.repairJob || p.valueUpJob);
     const vuMaxed = (p.valueUpLevel || 0) >= L.VALUE_UP_MAX_LEVEL;
+    const restoreCount = from === 'owned' ? p.units.filter(u => u.needsRestore).length : 0;
     const footer = from === 'owned' ? `<div class="p-2 border-t space-y-1">
-        ${p.repairJob ? `<div class="text-center text-xs text-amber-600 font-bold py-1">🔨 修繕中（残り${p.repairJob.monthsLeft}ヶ月）</div>` : ''}
-        ${p.valueUpJob ? `<div class="text-center text-xs text-indigo-600 font-bold py-1">✨ バリューアップ工事中（残り${p.valueUpJob.monthsLeft}ヶ月）</div>` : ''}
+        ${p.repairJob ? `<div class="text-center text-xs text-amber-600 font-bold py-1">🔨 ${L.REPAIR_KINDS[p.repairJob.kind || 'large'].label}を工事中（残り${p.repairJob.monthsLeft}ヶ月）</div>` : ''}
+        ${p.valueUpJob ? `<div class="text-center text-xs text-indigo-600 font-bold py-1">✨ 価値UP工事中（残り${p.valueUpJob.monthsLeft}ヶ月）</div>` : ''}
+        ${p.diyProgress ? `<div class="text-center text-xs text-emerald-700 font-bold py-1">🔨 DIY作業中（${Math.min(100, Math.round(p.diyProgress.done))}%）</div>` : ''}
         <div class="flex gap-1.5">
           ${busy ? '' : `
-          <button class="dt-diy flex-1 border rounded py-1.5 text-xs" ${p.repairState >= 100 ? 'disabled' : ''}>🖌️DIY(-${L.repairTierInfo(p).diyCost})</button>
-          <button class="dt-repair flex-1 border rounded py-1.5 text-xs" ${p.repairState >= 100 ? 'disabled' : ''}>業者修繕</button>
-          <button class="dt-valueup flex-1 border rounded py-1.5 text-xs ${vuMaxed ? 'opacity-40' : ''}" ${vuMaxed ? 'disabled' : ''}>✨価値UP</button>`}
-          <button class="dt-sell flex-1 border rounded py-1.5 text-xs">売却</button>
+          <button class="dt-repair flex-1 border rounded py-1.5 text-xs font-bold">🔨修繕${restoreCount ? `<span class="ml-1 bg-red-500 text-white rounded px-1">要${restoreCount}</span>` : ''}</button>
+          <button class="dt-valueup flex-1 border rounded py-1.5 text-xs font-bold ${vuMaxed ? 'opacity-40' : ''}" ${vuMaxed ? 'disabled' : ''}>✨価値UP</button>`}
+          <button class="dt-sell flex-1 border rounded py-1.5 text-xs font-bold">💰売却</button>
         </div></div>` : '';
     const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
       <div class="p-3 border-b shrink-0">
@@ -2806,9 +3010,9 @@ function openDetail(propId, from, back) {
     if (active === 2) body.innerHTML = plTab(p);
     if (active === 3) body.innerHTML = financeTab(p);
     if (from === 'owned') {
-      box.querySelector('.dt-diy')?.addEventListener('click', () => { close(); openDiyGame(p.id); });
-      box.querySelector('.dt-repair')?.addEventListener('click', () => { close(); openRepairService(p.id); });
-      box.querySelector('.dt-valueup')?.addEventListener('click', () => { close(); openValueUp(p.id); });
+      const backHere = () => openDetail(propId, from, back);
+      box.querySelector('.dt-repair')?.addEventListener('click', () => { close(); openWorkMenu(p.id, 'repair', backHere); });
+      box.querySelector('.dt-valueup')?.addEventListener('click', () => { close(); openWorkMenu(p.id, 'valueup', backHere); });
       box.querySelector('.dt-sell').addEventListener('click', () => { close(); openSell(p.id); });
     }
     // v3.1: 市場物件はタブの上の固定「買付」ボタンからいつでも買付へ（買付画面から「戻る」でここへ戻れる）
@@ -2870,7 +3074,7 @@ function overviewTab(p, from) {
       ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
       <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>名義</span><b>${p.owner === 'corp' ? '🏢 法人' : '👤 個人'}</b></div>
       ${p.lastAppraisal ? `<div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>査定額（参考）</span><b>${L.yen(p.lastAppraisal.amount)} <span class="text-slate-500 font-normal">（${state.month - p.lastAppraisal.month === 0 ? '今月' : `${state.month - p.lastAppraisal.month}ヶ月前`}）</span></b></div>` : ''}
-      ${(state.isIncorporated && p.owner !== 'corp') ? `<button class="dt-to-corp w-full border border-navy text-navy rounded-lg py-2 text-xs font-bold hover:bg-slate-50 ${(p.loan || p.reformLoan) ? 'opacity-40' : ''}" ${(p.loan || p.reformLoan) ? 'disabled' : ''}>🏢 法人へ売却（移転）${(p.loan || p.reformLoan) ? '｜ローン完済後に可能' : ''}</button>` : ''}
+      ${(state.isIncorporated && p.owner !== 'corp') ? `<button class="dt-to-corp w-full border border-navy text-navy rounded-lg py-2 text-xs font-bold hover:bg-slate-50 ${(p.loan || (p.reformLoans || []).length) ? 'opacity-40' : ''}" ${(p.loan || (p.reformLoans || []).length) ? 'disabled' : ''}>🏢 法人へ売却（移転）${(p.loan || (p.reformLoans || []).length) ? '｜ローン完済後に可能' : ''}</button>` : ''}
       <button class="dt-map-jump w-full border rounded-lg py-2 text-xs text-navy font-bold hover:bg-slate-50">📍 地図で場所を見る</button>
       ${noiTable(p)}</div>`;
   }
@@ -2892,10 +3096,15 @@ function rentRollTab(p, from) {
     ${p.units.map((u, i) => `<tr class="border-t"><td>${i + 1}号室</td>
       <td class="text-center">${u.layout ? `${u.layout}・${u.sizeSqm}㎡` : '—'}</td>
       <td class="text-center">${L.yen(u.rent)}</td>
-      <td class="text-center">${u.occupied ? '<span class="text-emerald">入居中</span>' : `<span class="text-red-600">空室${u.vacantMonths}ヶ月</span>`}</td>
-      <td class="text-right">${!u.occupied && from === 'owned' ? `<button class="fill-ad text-xs border rounded px-1" data-i="${i}">広告料(家賃1ヶ月)</button>
-        <button class="fill-self text-xs border rounded px-1" data-i="${i}">自主客付け(-30)</button>` : ''}</td></tr>`).join('')}
-  </table>`;
+      <td class="text-center">${u.occupied ? '<span class="text-emerald">入居中</span>'
+        : u.needsRestore ? `<span class="text-amber-600 font-bold">${u.restoreJob ? `🔨原状回復中(残${u.restoreJob.monthsLeft}ヶ月)` : '要原状回復'}</span>`
+        : `<span class="text-red-600">空室${u.vacantMonths}ヶ月</span>`}</td>
+      <td class="text-right">${!u.occupied && from === 'owned' ? (u.needsRestore
+        ? '<span class="text-[11px] text-slate-500">原状回復するまで募集できません</span>'
+        : `<button class="fill-ad text-xs border rounded px-1" data-i="${i}">広告料(家賃1ヶ月)</button>
+        <button class="fill-self text-xs border rounded px-1" data-i="${i}">自主客付け(-30)</button>`) : ''}</td></tr>`).join('')}
+  </table>
+  ${from === 'owned' && p.units.some(u => u.needsRestore) ? '<div class="mt-2 text-xs text-amber-700 bg-amber-50 rounded p-2">退去した部屋は原状回復するまで募集できません。フッターの「🔨修繕」から着手できます。</div>' : ''}`;
 }
 
 // v3.10: 建物構成サマリ（例: 1K×6戸・平均22㎡）
@@ -3421,45 +3630,181 @@ function jumpToMapWithBubble(p, from) {
   setTimeout(() => bubble.remove(), 4400);
 }
 
-function doDIYClick(propId) {
-  const p0 = state.properties.find(x => x.id === propId);
-  if (!p0 || p0.repairJob) return;
-  const info = L.repairTierInfo(p0);
-  if (state.actionPower < info.diyCost) { alert('行動力が足りません'); return; }
-  const before = p0.repairState;
-  const r = L.doDIY(state, propId);   // 訳あり修繕実績の記録もロジック側で行われる
-  state = r.state;
-  const p = state.properties.find(x => x.id === propId);
-  pushLog(`DIYで修繕した（${info.label}・修繕度+15%・自主管理+10 EXP）`); save(); render();
-  showRepairEffect(propId, `🔨 修繕度 ${before}% → ${p.repairState}%${p.repairState === 100 ? '・資産価値UP！' : ''}`);
+// === v4: 工事は「大分類（修繕/価値UP）→ 工事内容 → 実施方法（DIY/業者→借入）」の3階層 ===
+
+// 物件の現況から選べる工事内容を組み立てる。cost はいずれも業者見積（DIYはこの30%が材料費）。
+function workOptions(p, category) {
+  if (category === 'valueup') {
+    return Object.entries(L.VALUE_UP_PLANS).map(([key, pl]) => ({
+      type: 'valueup', planKey: key, label: pl.label,
+      detail: `業者なら工期${pl.months}ヶ月`,
+      effect: `家賃 +${Math.round((pl.rentMult - 1) * 100)}%・資産価値UP`,
+      cost: L.valueUpCost(p, key), diyable: pl.diyable, diyAp: pl.diyAp, blockedReason: pl.blockedReason,
+    }));
+  }
+  const out = [];
+  // 現状回復は退去した部屋ごと。回復するまでその部屋は募集できない。
+  p.units.forEach((u, i) => {
+    if (!u.needsRestore) return;
+    out.push({
+      type: 'restore', unitIndex: i, label: `現状回復（${i + 1}号室 ${u.layout || ''}）`,
+      detail: u.restoreJob ? `業者が施工中（残り${u.restoreJob.monthsLeft}ヶ月）` : '退去後の原状回復。業者なら工期1ヶ月',
+      effect: 'この部屋の募集を再開できる',
+      cost: L.restoreCost(p, u), diyable: true, diyAp: L.RESTORE_DIY_AP,
+      disabled: !!u.restoreJob, disabledReason: '施工中です',
+      progress: u.restoreProgress || 0,
+    });
+  });
+  const mk = L.REPAIR_KINDS.maint, lg = L.REPAIR_KINDS.large;
+  const maintGoal = L.repairResultState(p, 'maint');
+  out.push({
+    type: 'maint', label: mk.label, detail: mk.detail,
+    effect: `修繕度 ${p.repairState}% → ${maintGoal}%`,
+    cost: L.repairCost(p, 'maint'), diyable: true, diyAp: mk.diyAp,
+    disabled: maintGoal <= p.repairState,
+    disabledReason: `修繕度${mk.cap}%が上限です。これ以上戻すには大規模修繕が必要`,
+    progress: (p.diyProgress && p.diyProgress.kind === 'maint') ? p.diyProgress.done : 0,
+  });
+  out.push({
+    type: 'large', label: lg.label, detail: lg.detail,
+    effect: `修繕度 ${p.repairState}% → 100%・資産価値+8%`,
+    cost: L.repairCost(p, 'large'), diyable: false, blockedReason: lg.blockedReason,
+    disabled: p.repairState >= 100, disabledReason: '修繕度は既に100%です',
+  });
+  return out;
 }
 
-// DIYは専用画面を開き、建物の壊れた箇所（🕸️ひび・💧雨漏り・🌿雑草）をタップで直していくミニゲームに。
-// 全箇所を直すと本来の doDIYClick を1回だけ実行する（コスト-15・効果+20%はロジックのまま変更しない）。
+function runWork(propId, sel, diy, financed) {
+  if (sel.type === 'restore') return L.startRestore(state, propId, sel.unitIndex, { diy, financed });
+  if (sel.type === 'valueup') return L.startValueUp(state, propId, sel.planKey, { diy, financed });
+  return L.startRepair(state, propId, sel.type, { diy, financed });
+}
+
+function openWorkMenu(propId, category, back) {
+  const m = document.getElementById('repair-modal');
+  m.classList.remove('hidden'); m.classList.add('flex');
+  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const title = category === 'repair' ? '🔨 修繕' : '✨ 価値UP';
+  const lead = category === 'repair'
+    ? '傷んだところを元に戻す工事です。'
+    : '設備更新やリノベで家賃そのものを上げる投資です。';
+  let step = 1, sel = null;
+
+  const draw = () => {
+    const p = state.properties.find(x => x.id === propId);
+    if (!p) { close(); return; }
+    m.innerHTML = '';
+    const head = (backFn) => `<div class="flex justify-between items-center gap-2">
+      ${backFn ? '<button id="wk-back" class="text-xs text-navy font-bold">← 戻る</button>' : '<span></span>'}
+      <button id="wk-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>`;
+
+    let body;
+    if (step === 1) {
+      const opts = workOptions(p, category);
+      const rows = opts.map((o, i) => {
+        const off = o.disabled;
+        return `<button class="wk-opt w-full border rounded-lg p-2.5 text-left ${off ? 'opacity-40' : 'hover:bg-slate-50'}" data-i="${i}" ${off ? 'disabled' : ''}>
+          <div class="font-bold text-sm">${o.label}</div>
+          <div class="text-xs text-slate-600">${o.detail}</div>
+          <div class="text-xs text-slate-700 mt-0.5">${o.effect}</div>
+          <div class="text-xs mt-0.5">業者見積 <b>${L.yen(o.cost)}</b>${o.diyable ? ` ／ DIY材料費 <b>${L.yen(Math.round(o.cost * L.DIY_MATERIAL_RATE))}</b>` : ' <span class="text-slate-500">（業者のみ）</span>'}</div>
+          ${o.progress > 0 ? `<div class="text-xs text-emerald-700 font-bold mt-0.5">DIY作業中 ${Math.min(100, Math.round(o.progress))}%</div>` : ''}
+          ${off ? `<div class="text-xs text-red-600 mt-0.5">${o.disabledReason}</div>` : ''}</button>`;
+      }).join('');
+      body = `${head(back)}<h2 class="font-bold">${title}｜${p.name || p.label}</h2>
+        <div class="text-xs text-slate-500">${lead}どの工事をするか選んでください。</div>
+        <div class="space-y-1.5">${rows || '<div class="text-sm text-slate-500 py-4 text-center">いま必要な工事はありません。</div>'}</div>`;
+    } else if (step === 2) {
+      const material = Math.round(sel.cost * L.DIY_MATERIAL_RATE);
+      const months = sel.type === 'restore' ? 1
+        : sel.type === 'valueup' ? L.VALUE_UP_PLANS[sel.planKey].months
+        : L.repairMonthsForCost(sel.cost);
+      body = `${head(true)}<h2 class="font-bold">${sel.label}</h2>
+        <div class="text-xs text-slate-500">${sel.effect}</div>
+        <button id="wk-diy" class="w-full border-2 rounded-lg p-3 text-left ${sel.diyable ? 'hover:bg-slate-50 border-emerald-500' : 'opacity-50'}" ${sel.diyable ? '' : 'disabled'}>
+          <div class="font-bold text-sm">🔨 自分でやる（DIY）${sel.diyable ? '' : '<span class="text-xs font-normal">｜この工事では選べません</span>'}</div>
+          ${sel.diyable ? `<div class="text-xs text-slate-600">材料費 <b>${L.yen(material)}</b>のみ・行動力${sel.diyAp}を何回か使って自分で仕上げる</div>
+          <div class="text-xs text-emerald-700">安く済むが、その月の行動力を使う</div>`
+            : `<div class="text-xs text-red-600">${sel.blockedReason || ''}</div>`}</button>
+        <button id="wk-pro" class="w-full border-2 border-navy rounded-lg p-3 text-left hover:bg-slate-50">
+          <div class="font-bold text-sm">🏢 業者に頼む</div>
+          <div class="text-xs text-slate-600">費用 <b>${L.yen(sel.cost)}</b>・行動力5だけ・工期${months}ヶ月</div>
+          <div class="text-xs text-navy">高いが手が空く。リフォームローンも使える</div></button>`;
+    } else {
+      const loanAmount = L.reformLoanAmount(sel.cost, state.creditScore);
+      const down = sel.cost - loanAmount;
+      const openLoans = (p.reformLoans || []).length;
+      body = `${head(true)}<h2 class="font-bold">${sel.label}｜支払い方法</h2>
+        <div class="text-sm">費用 <b>${L.yen(sel.cost)}</b>（現金 ${L.yen(state.cash)}）</div>
+        <button id="wk-cash" class="w-full border rounded-lg py-2.5 text-sm font-bold ${state.cash < sel.cost ? 'opacity-40' : 'hover:bg-slate-50'}" ${state.cash < sel.cost ? 'disabled' : ''}>現金で支払う（${L.yen(sel.cost)}）</button>
+        <button id="wk-loan" class="w-full bg-navy text-white rounded-lg py-2.5 text-sm font-bold ${state.cash < down ? 'opacity-40' : ''}" ${state.cash < down ? 'disabled' : ''}>
+          リフォームローンを使う（頭金${L.yen(down)}＋借入${L.yen(loanAmount)}）</button>
+        <div class="text-xs text-slate-500">金利${(L.CONFIG.reformLoanRate * 100).toFixed(1)}%・${L.CONFIG.reformLoanYears}年。借入可能額は信用度で変わります。
+          ${openLoans ? `この物件には返済中のローンが${openLoans}本ありますが、重ねて借りられます。` : ''}</div>`;
+    }
+
+    const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md space-y-2 max-h-[85vh] overflow-y-auto">${body}</div>`);
+    m.appendChild(box);
+    box.querySelector('#wk-x').addEventListener('click', close);
+    box.querySelector('#wk-back')?.addEventListener('click', () => {
+      if (step === 1) { close(); back && back(); } else { step -= 1; draw(); }
+    });
+    box.querySelectorAll('.wk-opt').forEach(b => b.addEventListener('click', () => {
+      sel = workOptions(p, category)[Number(b.dataset.i)];
+      step = 2; draw();
+    }));
+    box.querySelector('#wk-diy')?.addEventListener('click', () => {
+      if (state.actionPower < (sel.diyAp || 0)) { alert('行動力が足りません。翌月へ進むと回復します。'); return; }
+      const material = Math.round(sel.cost * L.DIY_MATERIAL_RATE);
+      if ((sel.progress || 0) <= 0 && state.cash < material) { alert(`材料費 ${L.yen(material)} が足りません。`); return; }
+      close();
+      openDiySession(propId, sel, category, back);
+    });
+    box.querySelector('#wk-pro')?.addEventListener('click', () => { step = 3; draw(); });
+    box.querySelector('#wk-cash')?.addEventListener('click', () => order(false));
+    box.querySelector('#wk-loan')?.addEventListener('click', () => order(true));
+  };
+
+  const order = (financed) => {
+    if (state.actionPower < 5) { alert('行動力が足りません'); return; }
+    const r = runWork(propId, sel, false, financed);
+    if (!r.started) { alert(r.reason === 'cash' ? '現金が足りません' : '発注できませんでした'); return; }
+    state = r.state;
+    const p = state.properties.find(x => x.id === propId);
+    pushLog(`${p.name || p.label} の${sel.label}を業者へ発注（${r.financed ? `リフォームローン${L.yen(r.loanAmount)}` : `現金${L.yen(r.cost)}`}）`);
+    save(); render(); close();
+    showRepairEffect(propId, `🔨 ${sel.label} を発注（工期${r.monthsTotal || r.months || 1}ヶ月）`);
+  };
+
+  draw();
+}
+
+// DIYは「壊れている箇所をタップして直す」1セッション＝ロジック1回ぶんの作業。
+// 作業量ゲージが貯まりきるまで何セッションか繰り返すことになる。
 const DIY_SPOT_POOL = [
   { l: 30, t: 40, e: '🕸️' }, { l: 66, t: 32, e: '🕳️' }, { l: 48, t: 58, e: '🩹' },
   { l: 22, t: 72, e: '🌿' }, { l: 76, t: 70, e: '🌿' }, { l: 54, t: 26, e: '💧' },
 ];
-function openDiyGame(propId) {
+function openDiySession(propId, sel, category, back) {
   const p = state.properties.find(x => x.id === propId);
   if (!p) return;
-  if (p.repairJob) { alert('業者修繕が進行中です。完了までお待ちください。'); return; }
-  const diyCost = L.repairTierInfo(p).diyCost;
-  if (state.actionPower < diyCost) { alert('行動力が足りません。翌月へ進むと回復します。'); return; }
   const m = document.getElementById('diy-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
-  const n = Math.min(DIY_SPOT_POOL.length, Math.max(3, Math.ceil((100 - p.repairState) / 18)));
+  const n = 4;
   const spots = DIY_SPOT_POOL.slice(0, n);
+  const before = Math.min(100, Math.round(sel.progress || 0));
   let fixed = 0;
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-2">
-    <div class="flex justify-between items-center"><h2 class="font-bold truncate">🖌️ ${p.name || p.label} をDIY修繕（-${diyCost}）</h2><button id="diy-close" class="text-slate-400 text-xl shrink-0">✕</button></div>
-    <div class="text-xs text-slate-500">工事内容: ${L.repairTierInfo(p).label}。壊れている箇所（${n}か所）をタップして直そう！</div>
+    <div class="flex justify-between items-center"><h2 class="font-bold truncate">🔨 ${sel.label}</h2><button id="diy-close" class="text-slate-400 text-xl shrink-0">✕</button></div>
+    <div class="text-xs text-slate-500">材料費 ${L.yen(Math.round(sel.cost * L.DIY_MATERIAL_RATE))}${before > 0 ? '（支払い済み）' : ''}・行動力-${sel.diyAp}。傷んだ箇所をタップして直そう！</div>
+    <div class="w-full bg-slate-200 rounded-full h-2 overflow-hidden"><div class="bg-emerald-500 h-2 transition-all" style="width:${before}%"></div></div>
+    <div class="text-xs text-slate-600 text-center">全体の進捗 ${before}%</div>
     <div id="diy-stage" class="relative mx-auto rounded-lg bg-sky-50" style="width:220px;height:176px;">
       <div class="absolute inset-0 flex items-center justify-center">${renderBuildingSVG(p, 'w-40 h-32')}</div>
     </div>
     <div class="text-center text-sm font-bold" id="diy-progress">0 / ${n} 直した</div>
-    <button id="diy-cancel" class="w-full text-slate-500 text-sm">やめる（進捗は破棄）</button></div>`);
+    <button id="diy-cancel" class="w-full text-slate-500 text-sm">やめる（この回の作業は行われません）</button></div>`);
   m.appendChild(box);
   const stage = box.querySelector('#diy-stage');
   spots.forEach(sp => {
@@ -3474,89 +3819,31 @@ function openDiyGame(propId) {
       sfxKnock();
       fixed++;
       box.querySelector('#diy-progress').textContent = `${fixed} / ${n} 直した`;
-      if (fixed >= n) setTimeout(() => { close(); doDIYClick(propId); }, 560);
+      if (fixed >= n) setTimeout(() => { close(); applyDiy(propId, sel, category, back); }, 560);
     });
   });
   box.querySelector('#diy-close').addEventListener('click', close);
   box.querySelector('#diy-cancel').addEventListener('click', close);
 }
 
-function openRepairService(propId) {
+function applyDiy(propId, sel, category, back) {
+  const r = runWork(propId, sel, true, false);
+  if (!r.started) { alert('作業できませんでした'); return; }
+  state = r.state;
   const p = state.properties.find(x => x.id === propId);
-  if (!p) return;
-  if (p.repairJob) { alert('既に業者修繕が進行中です'); return; }
-  const m = document.getElementById('repair-modal');
-  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
-  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
-  const info = L.repairTierInfo(p);
-  const cost = L.professionalRepairCost(p);
-  const months = L.repairMonthsForCost(cost);   // v3.1: 工期は見積金額で決まる
-  const hasReformLoan = !!p.reformLoan;
-  const loanAmount = L.reformLoanAmount(cost, state.creditScore);
-  const down = cost - loanAmount;
-  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
-    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">${p.name || p.label} を業者に依頼（行動力-5）</h2><button id="rp-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
-    <div class="text-sm">工事内容: <b>${info.label}</b></div>
-    <div class="text-sm">見積もり: <b>${L.yen(cost)}</b>・工期 <b>${months}ヶ月</b>（完了時に修繕度100%）</div>
-    <button id="rp-cash" class="w-full border rounded py-2 text-sm ${state.cash < cost ? 'opacity-40' : ''}" ${state.cash < cost ? 'disabled' : ''}>現金で支払う（${L.yen(cost)}）</button>
-    <button id="rp-loan" class="w-full bg-navy text-white rounded py-2 text-sm ${hasReformLoan ? 'opacity-40' : ''}" ${hasReformLoan ? 'disabled' : ''}>
-      リフォームローンを利用（頭金${L.yen(down)} + 借入${L.yen(loanAmount)}・金利${(L.CONFIG.reformLoanRate * 100).toFixed(1)}%・${L.CONFIG.reformLoanYears}年）</button>
-    ${hasReformLoan ? '<div class="text-xs text-red-600">既存のリフォームローンが残っているため、完済まで新たな借入はできません（現金払いは可）</div>' : '<div class="text-xs text-slate-500">借入可能額は信用度で変動します</div>'}
-    <div class="text-xs text-slate-500">工事中はDIY・追加発注はできません。完了は通知でお知らせします。</div>
-    <button id="rp-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
-  m.appendChild(box);
-  box.querySelector('#rp-cancel').addEventListener('click', close);
-  box.querySelector('#rp-x').addEventListener('click', close);
-  const order = (financed) => {
-    if (state.actionPower < 5) { alert('行動力が足りません'); return; }
-    if (financed && state.cash < down) { alert('頭金分の現金が足りません'); return; }
-    const r = L.startProfessionalRepair(state, propId, financed);
-    if (!r.started) { alert('発注できませんでした'); return; }
-    state = r.state;
-    const pp = state.properties.find(x => x.id === propId);
-    pushLog(`${pp.label} の修繕を発注（${financed && r.financed ? `リフォームローン${L.yen(r.loanAmount)}` : `現金${L.yen(r.cost)}`}・工期${r.monthsTotal}ヶ月）`);
-    save(); render(); close();
-    showRepairEffect(propId, `🔨 修繕開始（${info.label}・工期${r.monthsTotal}ヶ月）`);
-  };
-  box.querySelector('#rp-cash').addEventListener('click', () => order(false));
-  box.querySelector('#rp-loan').addEventListener('click', () => order(true));
-}
-
-// v3.11: バリューアップ（設備更新・リノベで家賃を上げる投資）のプラン選択。工期を経て家賃・時価UP。
-function openValueUp(propId) {
-  const p = state.properties.find(x => x.id === propId);
-  if (!p) return;
-  if (p.repairJob || p.valueUpJob) { alert('別の工事が進行中です。完了までお待ちください。'); return; }
-  const lv = p.valueUpLevel || 0;
-  if (lv >= L.VALUE_UP_MAX_LEVEL) { alert(`この物件はバリューアップ上限（${L.VALUE_UP_MAX_LEVEL}回）に達しています。`); return; }
-  const m = document.getElementById('repair-modal');
-  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
-  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
-  const plans = Object.entries(L.VALUE_UP_PLANS).map(([key, pl]) => {
-    const cost = L.valueUpCost(p, key);
-    const disabled = state.cash < cost;
-    return `<button class="vu-plan w-full border rounded-lg p-2 text-left ${disabled ? 'opacity-40' : 'hover:bg-slate-50'}" data-key="${key}" ${disabled ? 'disabled' : ''}>
-      <div class="font-bold text-sm">${pl.label}</div>
-      <div class="text-xs text-slate-600">家賃 +${Math.round((pl.rentMult - 1) * 100)}%・工期${pl.months}ヶ月・費用 <b>${L.yen(cost)}</b></div></button>`;
-  }).join('');
-  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
-    <div class="flex justify-between items-start gap-2"><h2 class="font-bold">✨ ${p.name || p.label} をバリューアップ（行動力-5）</h2><button id="vu-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
-    <div class="text-xs text-slate-500">設備更新やリノベで家賃そのものを上げる投資です（残り${L.VALUE_UP_MAX_LEVEL - lv}回可能）。工事中は他の工事・DIYはできません。</div>
-    ${plans}
-    <button id="vu-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
-  m.appendChild(box);
-  box.querySelector('#vu-x').addEventListener('click', close);
-  box.querySelector('#vu-cancel').addEventListener('click', close);
-  box.querySelectorAll('.vu-plan').forEach(b => b.addEventListener('click', () => {
-    if (state.actionPower < 5) { alert('行動力が足りません'); return; }
-    const r = L.startValueUp(state, propId, b.dataset.key);
-    if (!r.started) { alert(r.reason === 'cash' ? '現金が足りません' : '発注できませんでした'); return; }
-    state = r.state;
-    const pl = L.VALUE_UP_PLANS[b.dataset.key];
-    pushLog(`${p.name || p.label} のバリューアップを発注（${pl.label}・費用${L.yen(r.cost)}・工期${r.months}ヶ月）`);
-    save(); render(); close();
-    showRepairEffect(propId, `✨ バリューアップ開始（家賃+${Math.round((pl.rentMult - 1) * 100)}%・工期${r.months}ヶ月）`);
-  }));
+  if (r.done) {
+    pushLog(`${p.name || p.label} の${sel.label}をDIYで完了した`);
+    save(); render();
+    showRepairEffect(propId, `🔨 ${sel.label} 完了！`);
+  } else {
+    const now = sel.type === 'restore'
+      ? (p.units[sel.unitIndex].restoreProgress || 0)
+      : (p.diyProgress ? p.diyProgress.done : 0);
+    pushLog(`${p.name || p.label} の${sel.label}をDIY中（進捗${Math.min(100, Math.round(now))}%・行動力-${sel.diyAp}）`);
+    save(); render();
+    showRepairEffect(propId, `🔨 進捗 ${Math.min(100, Math.round(now))}%`);
+    openWorkMenu(propId, category, back);   // 続けて作業できるよう工事メニューへ戻る
+  }
 }
 
 function skillRow(name, key){
