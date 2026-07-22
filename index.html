@@ -11,7 +11,23 @@
 </script>
 <style>
   html, body { font-family: system-ui, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; height: 100%; overscroll-behavior: none; }
-  .hud-panel { background: rgba(255,255,255,0.92); backdrop-filter: blur(4px); }
+
+  /* v5: 地図の上に浮くパネル類をピンハネ帝国と同じ濃紺のガラス調に統一する。
+     従来は白カードで、夜の地図の上に置くと上物だけが浮いて見えていた。
+     モーダルの中身は情報量が多いため白のまま据え置き、対象は地図上のHUDだけ。 */
+  .hud-panel {
+    background: rgba(15,23,42,0.86);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    border: 1px solid #334155; color: #f1f5f9;
+  }
+  .hud-sub    { color: #94a3b8; }   /* サブラベル */
+  .hud-accent { color: #fbbf24; }   /* 見出し・注記 */
+  .hud-money  { color: #4ade80; }   /* 金額（プラス） */
+  .hud-bad    { color: #f87171; }   /* 金額（マイナス） */
+  .hud-tile   { background: rgba(51,65,85,0.55); border: 1px solid #475569; color: #f1f5f9; }
+  .hud-tile:hover { background: rgba(71,85,105,0.75); }
+  .hud-track  { background: rgba(2,6,23,0.75); border: 1px solid #334155; }
+  .hud-divide { border-top: 1px solid #334155; }
 
   /* v3.12: iOSでは 100vh が「ブラウザのバーを隠した高さ」を指すため、h-screen だと画面下端が
      アドレスバーの裏に潜り込み、下部のボタン（翌月へ進む等）に一切触れなくなっていた。
@@ -26,7 +42,8 @@
     #panel-left, #panel-right { display: flex; }
   }
   @media (max-width: 639.98px), (max-height: 519.98px) {
-    #mobile-status  { display: grid; }
+    /* v5: 上段=情報3つ／下段=市場・所有の2ボタン、の2行構成にするため flex 縦積みにする */
+    #mobile-status  { display: flex; flex-direction: column; }
     #mobile-actions { display: flex; }
   }
   /* ノッチ／ホームインジケータを避ける（viewport-fit=cover と対で機能する） */
@@ -65,7 +82,7 @@
 
     <!-- v3.9: スマホ用UI。上部に主要3情報、下部に主要3アクション＋メニュー -->
     <!-- v3.12: 表示条件（幅が狭い or 高さが低い）と位置（セーフエリア）は<style>側で指定する -->
-    <div id="mobile-status" class="absolute z-10 grid-cols-3 gap-1"></div>
+    <div id="mobile-status" class="absolute z-10 gap-1"></div>
     <div id="mobile-actions" class="absolute z-20 gap-2"></div>
   </main>
 
@@ -1590,6 +1607,13 @@ export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
 // 架空の単一大陸（中心=都心コア、外周に向かうほど地方）＋未開拓の黒い影の陸地（鍵マーク、将来アップデートの匂わせ）。
+//
+// v5: 建物の絵文字スプライトを全廃し、全デバイスで図形描画に統一した。理由は3つ。
+//   ①🏙️（複数ビル＋星空の絵）や🏘️（家3軒の絵）は1棟に見えず「建物の写真」に見えていた
+//   ②iOSでカラー絵文字に解決されずシルエット化する問題を、絵文字を使わないことで根治できる
+//   ③未購入物件のグレー化が端末差なく確実にできる（ctx.filter は iOS で不安定なため使えなかった）
+// これに伴い colorEmojiOK の実測ロジックと ?vector= パラメータは不要になったため削除した。
+// 絵文字は建物以外のマーカー（🔒📍⭐🔨✨）にのみ残している。
 
 const TAU = Math.PI * 2;
 const FPS = 30;   // 描画上限（発熱・電池対策）
@@ -1598,15 +1622,17 @@ let canvas = null, ctx = null, dpr = 1, cx = 0, cy = 0, R = 0;
 let cbs = {};
 let st = null;                       // 直近のゲームstate（参照のみ・書き換えない）
 // v3.8: 初期視点は都心コア（大陸中心）が画面中央に来る角度
-let yaw = 0, pitch = -0.03, yawV = 0;
+const HOME = { yaw: 0, pitch: -0.03, zoom: 1 };
+let yaw = HOME.yaw, pitch = HOME.pitch, yawV = 0;
 let dragging = false, lastX = 0, lastY = 0, moved = 0;
-// v3.4: ズーム（ホイール／2本指ピンチ）。0.7倍（引き）〜2.5倍（寄り）。建物サイズも連動する。
-let zoom = 1;
+// v3.4: ズーム（ホイール／2本指ピンチ）。0.7倍（引き）〜2.5倍（寄り）。
+let zoom = HOME.zoom;
 const ZOOM_MIN = 0.7, ZOOM_MAX = 2.5;
 const activePtrs = new Map();
 let pinchDist = 0, pinching = false;
 let rafId = 0, lastFrame = 0;
 let pingItem = null;  // 一覧「地図を見る」からのピン（クリックまで維持）
+let viewAnim = null;  // v5: 翌月ボタンでゆっくり初期位置へ戻す回転アニメ
 
 // 架空の単一大陸。中心=都心コア（高層密集）、外周=郊外・地方（低層・疎）。
 const CONTINENT = { lat: 0.05, lon: 0 };
@@ -1615,6 +1641,24 @@ const MID_R = 0.65;    // この半径内＝中間市街地
 const OUTER_R = 1.05;  // この半径まで陸地（超えると海）。既存ロジックのareaKey(urban/local)を
                         // 「都心コア寄り／郊外〜地方寄り」の半径帯に対応させる。
 
+// v5: 建物の大きさは「球の半径Rに対する比率」で決める。絶対pxで持つと画面サイズによって
+// 見え方（密集度）が変わってしまうため。ユーザーが実サンプルを動かして確定した値。
+const PROP_SIZE = 0.100;    // 実物件（所有・市場）
+const FILLER_SIZE = 0.0868; // 雰囲気建物。実物件よりわずかに小さく、背景に退く
+const FILLER_COUNT = 200;   // 生成する雰囲気建物の総数
+const MIN_SEP = 0.15;       // 実物件どうしの最小間隔（重なり回避の押し出しに使う）
+
+// v5: ズームと建物サイズの関係。Rはzoomに比例するので、建物をRに比例させるだけだと
+// 密集度がズームによらず一定になってしまう。そこで
+//   引くとき(zoom<1): さらに強く縮めて「引くほど小さく・空く」
+//   寄るとき(zoom>1): 伸びを抑えて「寄るほど互いに離れる」
+// という補正をかける。
+function zoomFactor() {
+  return zoom <= 1 ? Math.pow(zoom, 1.2) : Math.pow(zoom, -0.65);
+}
+function propUnit() { return R * PROP_SIZE * zoomFactor(); }
+function fillerUnit() { return R * FILLER_SIZE * zoomFactor(); }
+
 function srand(seed) { let s = seed >>> 0 || 1; return () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; }; }
 function hashSeed(str) {
   let h = 2166136261;
@@ -1622,83 +1666,245 @@ function hashSeed(str) {
   return srand(h);
 }
 
-const GENRE_EMOJI = { kodate: '🏠', apart: '🏘️', tekkotsu: '🏢', kubun: '🏬', rc: '🏙️' };
-const FILLER_TALL = ['🏢', '🏙️', '🏬', '🗼'];
-const FILLER_MID = ['🏬', '🏫', '🏭'];
-const FILLER_LOW = ['🏠', '🏡', '🏘️'];
-// 雰囲気建物の絵文字 → 図形フォールバック時の建物形状
-const EMOJI_SHAPE = { '🏠': 'kodate', '🏡': 'kodate', '🏘️': 'apart', '🏢': 'tekkotsu',
-  '🏬': 'kubun', '🏫': 'kubun', '🏭': 'tekkotsu', '🏙️': 'rc', '🗼': 'rc' };
-
-// v3.12: 絵文字フォントの指定。従来は Windows 専用の "Segoe UI Emoji" しか挙げていなかったため、
-// iOS では canvas の絵文字がカラー字形に解決されずモノクロ＝シルエットで描かれる端末があった。
-// 各OSのカラー絵文字フォントを明示的に先頭から並べる。
+// マーカー（建物以外）の絵文字フォント。各OSのカラー絵文字フォントを先頭から並べる。
 const EMOJI_FONT = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
 
-// v3.12: カラー絵文字が「実際に描けたか」をピクセルで実測する。描けない端末では建物を絵文字ではなく
-// 図形で描くフォールバックへ自動的に切り替え、原因が何であれ必ず色付きの建物が見えるようにする。
-// 手元で再現できない端末の切り分け用。URLに ?vector=1 を付けると強制的に図形描画、
-// ?vector=0 なら強制的に絵文字描画になる（実機で症状を確認してもらうため）。
-const forcedVector = /[?&]vector=([01])/.exec(location.search);
-let colorEmojiOK = forcedVector ? forcedVector[1] === '0' : true;  // 実測が済むまでは絵文字で描く
-function detectColorEmoji() {
-  if (forcedVector) return forcedVector[1] === '0';
-  try {
-    const c = document.createElement('canvas');
-    c.width = 24; c.height = 24;
-    const g = c.getContext('2d', { willReadFrequently: true });
-    g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.font = `18px ${EMOJI_FONT}`;
-    g.fillStyle = '#000';
-    g.fillText('🏠', 12, 12);
-    const d = g.getImageData(0, 0, 24, 24).data;
-    for (let i = 0; i < d.length; i += 4) {
-      if (d[i + 3] < 40) continue;                    // 透明部分は無視
-      const r = d[i], gg = d[i + 1], b = d[i + 2];
-      if (Math.max(r, gg, b) - Math.min(r, gg, b) > 28) return true;   // 彩度あり＝カラー字形で描けている
-    }
-    return false;                                     // 真っ黒＝モノクロ字形しか出せていない
-  } catch { return true; }                            // 判定不能な環境では従来どおり絵文字
+// ================================================================
+// 建物の図形描画
+// ================================================================
+// ジャンルごとに「シルエット（幅・高さ）」「色」「付属物」の3方向で差をつけ、
+// 色を無視して輪郭だけでも見分けられるようにしている。
+// 名前が GENRE ではなく BLD_STYLE なのは、logic.mjs にも GENRE があるため。
+// 開発中は別モジュールなので衝突しないが、build-inline.mjs は3ファイルを1つのスコープに
+// 連結するので同名だと「Identifier has already been declared」でゲーム全体が起動しなくなる。
+const BLD_STYLE = {
+  kodate:   { wall:'#f2e3c0', side:'#d8c69c', roof:'#b1541d', dark:'#26354a',
+              w:1.02, h:0.56, floors:1,  cols:3, roofType:'gable',   door:true, chimney:true },
+  apart:    { wall:'#e9d9bd', side:'#cdb996', roof:'#8a5a2b', dark:'#26354a',
+              w:1.08, h:0.86, floors:2,  cols:4, roofType:'shed',    corridor:true, stairBox:true },
+  tekkotsu: { wall:'#9db2c6', side:'#7c92a8', roof:'#3f5468', dark:'#1d2c3d',
+              w:0.86, h:1.08, floors:4,  cols:3, roofType:'flat',    tank:true, frame:true, stairZig:true, ribbon:true },
+  kubun:    { wall:'#f7f2e6', side:'#dcd5c3', roof:'#b2aa98', dark:'#2a3244',
+              w:1.14, h:1.32, floors:6,  cols:4, roofType:'parapet', balcony:true, unit:true },
+  rc:       { wall:'#b7bec9', side:'#8f97a4', roof:'#57606e', dark:'#212836',
+              w:0.62, h:1.74, floors:10, cols:3, roofType:'rooftop', core:true, beacon:true },
+};
+// 未購入（市場）物件は完全な無彩色。図形描画なので端末差なく確実にグレーになる。
+const GRAY = { wall:'#9aa4b2', side:'#7c8694', roof:'#5b6470', dark:'#414a58', acc:'#69737f' };
+const GOLD = '#fbbf24', GOLD_HI = '#fff7dc';
+
+// 窓の矩形一覧。ジャンルごとに窓の形が違うが、点灯はここで返した順（下の階から）に行う。
+function windowRects(g, left, top, w, h, innerW) {
+  const out = [];
+  const gapY = h / (g.floors + 1);
+  if (g.ribbon) {                                   // 鉄骨: 横長の連窓を3分割
+    const segs = 3, bw = innerW * 0.80, bh = Math.max(1.2, gapY * 0.34);
+    const sw = bw / segs, x0 = left + (innerW - bw) / 2;
+    for (let r = g.floors; r >= 1; r--)
+      for (let c = 0; c < segs; c++) out.push({ x: x0 + sw * c + 0.5, y: top + gapY * r - bh / 2, w: Math.max(0.8, sw - 1), h: bh });
+    return out;
+  }
+  const gapX = innerW / (g.cols + 1);
+  const ww = Math.max(1.1, gapX * 0.56), wh = Math.max(1.1, gapY * (g.balcony ? 0.34 : 0.46));
+  for (let r = g.floors; r >= 1; r--)
+    for (let c = 1; c <= g.cols; c++)
+      out.push({ x: left + gapX * c - ww / 2, y: top + gapY * r - wh / 2 - (g.balcony ? gapY * 0.10 : 0), w: ww, h: wh });
+  return out;
 }
 
-// 絵文字が使えない端末向けの建物描画。ジャンルごとに「壁＋屋根＋窓」を図形で描くため端末差が出ない。
-// x,y は絵文字と同じ基準（textAlign=center / textBaseline=bottom 相当の足元中央）。
-const VECTOR_STYLE = {
-  kodate:   { wall: '#fde68a', roof: '#b45309', floors: 1, wide: 0.86 },
-  apart:    { wall: '#fed7aa', roof: '#c2410c', floors: 2, wide: 0.98 },
-  tekkotsu: { wall: '#bfdbfe', roof: '#1d4ed8', floors: 4, wide: 0.80 },
-  kubun:    { wall: '#ddd6fe', roof: '#6d28d9', floors: 5, wide: 0.74 },
-  rc:       { wall: '#c7d2fe', roof: '#3730a3', floors: 6, wide: 0.70 },
-};
-function drawVectorBuilding(x, y, size, shape, alpha, gray) {
-  const s = VECTOR_STYLE[shape] || VECTOR_STYLE.kodate;
-  const w = size * s.wide, h = size * 0.92;
-  const left = x - w / 2, top = y - h;
+// 建物1棟。x,y は足元の中央、size は高さの基準値。
+// o = { shape, owned, occ, dirt, crack, weed, tilt, broken, boarded, scaffold, alpha }
+function drawBuilding(x, y, size, o) {
+  const g = BLD_STYLE[o.shape] || BLD_STYLE.kodate;
+  const owned = !!o.owned;
+  const wall = owned ? g.wall : GRAY.wall, side = owned ? g.side : GRAY.side;
+  const roof = owned ? g.roof : GRAY.roof, dark = owned ? g.dark : GRAY.dark;
+  const w = size * g.w, h = size * g.h;
+  const rnd = srand(o.seed || 7);
+  const detail = size > 13;                       // 小さく描くときは細部を省いて潰れを防ぐ
+
+  ctx.save();
+  ctx.globalAlpha = o.alpha == null ? 1 : o.alpha;
+  ctx.fillStyle = 'rgba(2,6,23,0.35)';            // 接地影
+  ctx.beginPath(); ctx.ellipse(x, y, w * 0.62, size * 0.085, 0, 0, TAU); ctx.fill();
+  ctx.translate(x, y);
+  if (o.tilt) ctx.rotate(o.tilt);
+
+  const left = -w / 2, sideW = w * 0.15, innerW = w - sideW, top = -h;
+  ctx.fillStyle = wall; ctx.fillRect(left, top, innerW, h);
+  ctx.fillStyle = side; ctx.fillRect(left + innerW, top, sideW, h);
+
+  if (o.dirt > 0) {                               // 壁のシミ（修繕度が低いほど濃く多い）
+    ctx.fillStyle = `rgba(58,48,32,${0.10 + o.dirt * 0.28})`;
+    for (let i = 0; i < Math.round(2 + o.dirt * 5); i++) {
+      ctx.beginPath();
+      ctx.ellipse(left + rnd() * w, top + rnd() * h, w * (0.08 + rnd() * 0.15), h * (0.04 + rnd() * 0.10), 0, 0, TAU);
+      ctx.fill();
+    }
+  }
+  if (g.frame && detail) {                        // 鉄骨: 縦の柱ライン
+    ctx.fillStyle = owned ? 'rgba(50,68,88,0.55)' : 'rgba(70,80,92,0.5)';
+    for (const f of [0.0, 0.5, 1.0]) ctx.fillRect(left + innerW * f - w * 0.022, top, Math.max(0.7, w * 0.044), h);
+  }
+  if (g.core) {                                   // RC: 縦のコア（階段室）
+    ctx.fillStyle = owned ? 'rgba(120,128,140,0.55)' : 'rgba(105,115,127,0.55)';
+    ctx.fillRect(left + innerW * 0.74, top, innerW * 0.26, h);
+  }
+
+  ctx.fillStyle = roof;
+  if (g.roofType === 'gable') {                   // 戸建て: 三角屋根
+    ctx.beginPath(); ctx.moveTo(left - w * 0.10, top);
+    if (o.broken) { ctx.lineTo(-w * 0.06, top - h * 0.36); ctx.lineTo(w * 0.05, top - h * 0.20); }
+    else ctx.lineTo(0, top - h * 0.36);
+    ctx.lineTo(left + w + w * 0.10, top); ctx.closePath(); ctx.fill();
+    if (g.chimney && detail) ctx.fillRect(left + w * 0.70, top - h * 0.30, w * 0.10, h * 0.24);
+  } else if (g.roofType === 'shed') {             // アパート: 片流れ屋根
+    ctx.beginPath(); ctx.moveTo(left - w * 0.09, top);
+    ctx.lineTo(left + w + w * 0.09, top - h * (o.broken ? 0.13 : 0.22));
+    ctx.lineTo(left + w + w * 0.09, top - h * (o.broken ? 0.03 : 0.10));
+    ctx.lineTo(left - w * 0.09, top + h * 0.045); ctx.closePath(); ctx.fill();
+  } else if (g.roofType === 'parapet') {          // 区分: 立ち上がりのある陸屋根
+    ctx.fillRect(left - w * 0.05, top - h * 0.045, w * 1.10, Math.max(1, h * 0.045));
+    ctx.fillStyle = owned ? '#cfc7b4' : GRAY.acc;
+    ctx.fillRect(left - w * 0.05, top - h * 0.075, w * 1.10, Math.max(0.8, h * 0.030));
+  } else {                                        // 鉄骨・RC: 陸屋根
+    ctx.fillRect(left - w * 0.05, top - h * 0.038, w * 1.10, Math.max(1, h * 0.038));
+  }
+  if (g.tank && detail) {                         // 鉄骨: 屋上の貯水タンク（脚付き）
+    ctx.fillStyle = owned ? '#5c7186' : GRAY.acc;
+    ctx.fillRect(left + innerW * 0.16, top - h * 0.145, innerW * 0.34, h * 0.075);
+    ctx.fillRect(left + innerW * 0.20, top - h * 0.075, w * 0.028, h * 0.040);
+    ctx.fillRect(left + innerW * 0.44, top - h * 0.075, w * 0.028, h * 0.040);
+  }
+  if (g.roofType === 'rooftop') {                 // RC: 屋上設備＋赤い航空障害灯
+    ctx.fillStyle = owned ? '#6b7481' : GRAY.acc;
+    ctx.fillRect(left + innerW * 0.10, top - h * 0.085, innerW * 0.34, Math.max(1, h * 0.048));
+    if (detail) ctx.fillRect(left + innerW * 0.56, top - h * 0.070, innerW * 0.20, h * 0.033);
+    if (g.beacon) {
+      ctx.fillStyle = owned ? '#f87171' : '#8b8f96';
+      ctx.beginPath(); ctx.arc(left + innerW * 0.27, top - h * 0.100, Math.max(0.9, size * 0.020), 0, TAU); ctx.fill();
+    }
+  }
+
+  // 窓。所有物件は入居率のぶんだけ下の階から金色に灯る（＝地図だけで稼働状況が分かる）。
+  const rects = windowRects(g, left, top, w, h, innerW);
+  const litN = owned ? Math.round(rects.length * (o.occ == null ? 1 : o.occ)) : 0;
+  rects.forEach((r, i) => {
+    if (i < litN) {
+      ctx.fillStyle = GOLD; ctx.fillRect(r.x, r.y, r.w, r.h);
+      if (detail) { ctx.fillStyle = GOLD_HI; ctx.fillRect(r.x + r.w * 0.18, r.y + r.h * 0.16, r.w * 0.36, r.h * 0.36); }
+    } else { ctx.fillStyle = dark; ctx.fillRect(r.x, r.y, r.w, r.h); }
+  });
+
+  if (g.balcony) {                                // 区分: 各階のバルコニー帯
+    const gapY = h / (g.floors + 1);
+    for (let r = 1; r <= g.floors; r++) {
+      ctx.fillStyle = owned ? 'rgba(196,188,170,0.95)' : 'rgba(120,130,142,0.9)';
+      ctx.fillRect(left - w * 0.025, top + gapY * r + gapY * 0.10, innerW + w * 0.025, Math.max(0.9, gapY * 0.20));
+    }
+  }
+  if (g.corridor) {                               // アパート: 外廊下
+    ctx.fillStyle = owned ? 'rgba(112,84,48,0.5)' : 'rgba(88,97,110,0.55)';
+    ctx.fillRect(left, top + h * 0.46, innerW, Math.max(1, h * 0.055));
+  }
+  if (g.stairBox) {                               // アパート: 箱型の外階段
+    ctx.fillStyle = owned ? '#a98551' : GRAY.acc;
+    ctx.fillRect(left - w * 0.15, top + h * 0.12, w * 0.15, h * 0.88);
+    if (detail) {
+      ctx.strokeStyle = owned ? 'rgba(60,42,20,0.5)' : 'rgba(50,58,70,0.5)';
+      ctx.lineWidth = Math.max(0.6, size * 0.018);
+      for (let i = 1; i < 4; i++) {
+        const yy = top + h * 0.12 + h * 0.88 * i / 4;
+        ctx.beginPath(); ctx.moveTo(left - w * 0.15, yy); ctx.lineTo(left, yy); ctx.stroke();
+      }
+    }
+  }
+  if (g.stairZig) {                               // 鉄骨: ジグザグの外階段
+    ctx.strokeStyle = owned ? '#7d93a8' : GRAY.acc;
+    ctx.lineWidth = Math.max(0.8, size * 0.028);
+    ctx.beginPath();
+    const sx = left + w + w * 0.02, gapY = h / (g.floors + 1);
+    ctx.moveTo(sx, top + h);
+    for (let r = g.floors; r >= 1; r--) { ctx.lineTo(sx + w * 0.12, top + gapY * r + gapY * 0.4); ctx.lineTo(sx, top + gapY * r); }
+    ctx.stroke();
+  }
+  if (g.door && detail) {                         // 戸建て: 玄関ドア
+    ctx.fillStyle = owned ? '#7c4a1e' : GRAY.acc;
+    ctx.fillRect(left + innerW * 0.44, -h * 0.34, innerW * 0.16, h * 0.34);
+  }
+  if (g.unit && owned) {                          // 区分: 所有している1住戸だけ強調
+    const gapY = h / (g.floors + 1), gapX = innerW / (g.cols + 1);
+    const ww = Math.max(1.1, gapX * 0.56), wh = Math.max(1.1, gapY * 0.34);
+    const wx = left + gapX * 3 - ww / 2, wy = top + gapY * 4 - wh / 2 - gapY * 0.10;
+    ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = Math.max(0.9, size * 0.026);
+    ctx.strokeRect(wx - 1.5, wy - 1.5, ww + 3, wh + 3);
+  }
+  if (o.boarded && rects.length) {                // ボロ: 板が打たれた窓
+    const r = rects[rects.length - 1];
+    ctx.strokeStyle = '#7c5a2e'; ctx.lineWidth = Math.max(0.8, size * 0.026);
+    ctx.beginPath(); ctx.moveTo(r.x, r.y); ctx.lineTo(r.x + r.w, r.y + r.h);
+    ctx.moveTo(r.x + r.w, r.y); ctx.lineTo(r.x, r.y + r.h); ctx.stroke();
+  }
+  if (o.crack > 0 && detail) {                    // ボロ: 壁のひび
+    ctx.strokeStyle = `rgba(38,28,18,${0.35 + o.crack * 0.4})`;
+    ctx.lineWidth = Math.max(0.7, size * 0.020);
+    ctx.beginPath();
+    let px = left + innerW * 0.26, py = top + h * 0.10; ctx.moveTo(px, py);
+    for (let i = 0; i < 5; i++) { px += (rnd() - 0.4) * w * 0.14; py += h * 0.17; ctx.lineTo(px, py); }
+    ctx.stroke();
+  }
+  ctx.strokeStyle = owned ? 'rgba(15,23,42,0.5)' : 'rgba(30,41,59,0.5)';
+  ctx.lineWidth = Math.max(0.6, size * 0.024);
+  ctx.strokeRect(left, top, w, h);
+  if (o.weed && detail) {                         // ボロ: 足元の雑草
+    ctx.strokeStyle = '#4d7c3a'; ctx.lineWidth = Math.max(0.8, size * 0.024);
+    for (let i = 0; i < 5; i++) {
+      const gx = left + w * (0.02 + rnd() * 1.0);
+      ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx + (rnd() - 0.5) * size * 0.08, -size * (0.05 + rnd() * 0.07)); ctx.stroke();
+    }
+  }
+  if (o.scaffold) {                               // v5: 業者修繕中は足場を掛けて一目で分かるように
+    ctx.strokeStyle = 'rgba(203,213,225,0.65)';
+    ctx.lineWidth = Math.max(0.6, size * 0.020);
+    const bx = left - w * 0.08, bw = w * 1.16;
+    for (let i = 0; i <= 3; i++) { const yy = top + h * i / 3; ctx.beginPath(); ctx.moveTo(bx, yy); ctx.lineTo(bx + bw, yy); ctx.stroke(); }
+    for (let i = 0; i <= 3; i++) { const xx = bx + bw * i / 3; ctx.beginPath(); ctx.moveTo(xx, top); ctx.lineTo(xx, 0); ctx.stroke(); }
+  }
+  ctx.restore();
+}
+
+// 雰囲気建物（タップ不可・背景）: 濃紺のシルエット＋ごく淡い金の窓。
+// ピンハネ帝国のタイトル画面の摩天楼と同じ質感にして「夜の街」に見せる。
+function drawFillerBuilding(x, y, size, stories, seed, alpha) {
+  const rnd = srand(seed);
+  const w = size * (stories >= 5 ? 0.56 : 0.70), h = size * (0.30 + stories * 0.14);
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.fillStyle = gray ? '#94a3b8' : s.wall;
-  ctx.fillRect(left, top, w, h);
-  ctx.fillStyle = gray ? '#64748b' : s.roof;
-  if (shape === 'kodate' || shape === 'apart') {      // 低層は三角屋根、中高層は陸屋根で見分ける
-    ctx.beginPath();
-    ctx.moveTo(left - w * 0.09, top);
-    ctx.lineTo(x, top - h * 0.34);
-    ctx.lineTo(left + w + w * 0.09, top);
-    ctx.closePath(); ctx.fill();
-  } else {
-    ctx.fillRect(left - w * 0.05, top - h * 0.07, w * 1.1, h * 0.07);
+  ctx.fillStyle = '#0d1a2e'; ctx.fillRect(x - w / 2, y - h, w, h);
+  ctx.fillStyle = 'rgba(148,163,184,0.16)'; ctx.fillRect(x - w / 2, y - h, w, Math.max(0.8, h * 0.05));
+  const cols = Math.max(2, Math.round(w / (size * 0.20))), rows = Math.max(1, stories);
+  const gx = w / (cols + 1), gy = h / (rows + 1);
+  for (let r = 1; r <= rows; r++) for (let c = 1; c <= cols; c++) {
+    if (rnd() < 0.45) continue;
+    ctx.fillStyle = `rgba(251,191,36,${0.26 + rnd() * 0.36})`;
+    ctx.fillRect(x - w / 2 + gx * c - gx * 0.18, y - h + gy * r - gy * 0.16, Math.max(0.7, gx * 0.36), Math.max(0.7, gy * 0.30));
   }
-  const cols = Math.max(2, Math.round(w / (size * 0.26)));
-  const gapX = w / (cols + 1), gapY = h / (s.floors + 1);
-  const ww = Math.max(1.1, gapX * 0.52), wh = Math.max(1.1, gapY * 0.5);
-  ctx.fillStyle = gray ? '#cbd5e1' : '#1e3a5f';
-  for (let r = 1; r <= s.floors; r++) {
-    for (let c = 1; c <= cols; c++) ctx.fillRect(left + gapX * c - ww / 2, top + gapY * r - wh / 2, ww, wh);
-  }
-  ctx.strokeStyle = gray ? 'rgba(51,65,85,0.55)' : 'rgba(30,41,59,0.65)';
-  ctx.lineWidth = Math.max(0.6, size * 0.035);
-  ctx.strokeRect(left, top, w, h);
   ctx.restore();
+}
+
+// 物件stateから描画パラメータへの変換。既存の svgBuildingParts をそのまま使うので、
+// DIY・修繕で修繕度が上がれば専用の分岐なしに自然と綺麗になる。
+function buildingOptsFor(p, owned) {
+  const parts = L.svgBuildingParts(p);
+  const occ = p.units && p.units.length ? p.units.filter(u => u.occupied).length / p.units.length : 1;
+  const ruined = parts.wake && p.repairState < 40;
+  return {
+    shape: parts.shape, owned, occ,
+    dirt: parts.dirtLevel, crack: parts.hasCracks ? 0.7 : 0, weed: parts.hasWeeds,
+    tilt: parts.tilt ? 0.035 : 0, broken: ruined, boarded: ruined,
+    scaffold: owned && !!p.repairJob,
+    seed: hashSeed('bld:' + p.id)() * 4294967296,
+  };
 }
 
 // 大陸の陸地パッチ（雰囲気のみ）: 中心に厚く・外周にいくほど薄く広がる分布
@@ -1718,11 +1924,14 @@ const CONTINENT_BLOBS = (() => {
 
 // 未開拓エリア（黒い影の陸地＋🔒）: 球を回すと海だけでは寂しいため、将来アップデートで解禁される
 // ことを匂わせる非インタラクティブな陸影を数か所配置する。
+// v5: 経度は大陸（lon 0・半径1.05）から十分離す。従来 lon 5.55（＝-0.73rad）の1か所が大陸の
+// 内側に入っており、黒い影が緑の地面に重なって「焦げ跡」のように見えていた（実機で確認）。
+// ブロブ半径0.34を足しても大陸に届かない位置に4か所を振り直した。
 const UNEXPLORED_CENTERS = [
-  { lat: 0.42, lon: 2.55 },
-  { lat: -0.50, lon: 4.55 },
-  { lat: -0.20, lon: 1.75 },
-  { lat: 0.15, lon: 5.55 },
+  { lat: 0.42, lon: 2.20 },
+  { lat: -0.50, lon: 3.10 },
+  { lat: -0.20, lon: 4.00 },
+  { lat: 0.15, lon: 4.75 },
 ];
 const UNEXPLORED_AREAS = UNEXPLORED_CENTERS.map((c, i) => {
   const rnd = srand(9001 + i * 137);
@@ -1736,12 +1945,12 @@ const UNEXPLORED_AREAS = UNEXPLORED_CENTERS.map((c, i) => {
   };
 });
 
-// グレー雰囲気建物（タップ不可・状態と無関係）: 中心=高密度・高層、外周=低密度・低層。
-// 密集しすぎて見づらいという指摘を受け、件数と残存確率を絞って間引いている。
-const GRAY_SLOTS = (() => {
+// 雰囲気建物のスロット: 中心=高密度・高層、外周=低密度・低層。
+// 引いたときは先頭6割だけ描いて間引く（生成順が半径に対してランダムなので偏らない）。
+const FILLER_SLOTS = (() => {
   const rnd = srand(4242);
   const out = [];
-  for (let i = 0; i < 340 && out.length < 150; i++) {
+  for (let i = 0; i < 460 && out.length < FILLER_COUNT; i++) {
     const ang = rnd() * TAU;
     const rad = rnd() * OUTER_R;
     const keepProb = rad < CORE_R ? 0.62 : rad < MID_R ? 0.32 : 0.12;
@@ -1749,11 +1958,10 @@ const GRAY_SLOTS = (() => {
     const stories = rad < CORE_R ? 4 + Math.floor(rnd() * 6)
       : rad < MID_R ? 2 + Math.floor(rnd() * 3)
       : 1 + Math.floor(rnd() * 2);
-    const pool = stories >= 5 ? FILLER_TALL : stories >= 3 ? FILLER_MID : FILLER_LOW;
     out.push({
       lat: CONTINENT.lat + Math.sin(ang) * rad,
       lon: CONTINENT.lon + Math.cos(ang) * rad,
-      stories, emoji: pool[Math.floor(rnd() * pool.length)],
+      stories, seed: 100 + i,
     });
   }
   return out;
@@ -1782,30 +1990,29 @@ function project(lat, lon) {
   return { x: cx + x * R, y: cy - y2 * R, z: z2 };
 }
 
-const STARS = Array.from({ length: 50 }, () => ({ x: Math.random(), y: Math.random() * 0.55, tw: Math.random() * TAU }));
-const SHAPE_STORIES = { kodate: 1, apart: 2, tekkotsu: 3, kubun: 4, rc: 6 };
+const STARS = Array.from({ length: 60 }, () => ({ x: Math.random(), y: Math.random() * 0.6, tw: Math.random() * TAU }));
 
+// v5: 空・海・大気光・大陸の色はピンハネ帝国と同じ値に揃えた（夜寄りの濃紺）。
 function drawSky(w, h) {
   const g = ctx.createLinearGradient(0, 0, 0, h);
-  g.addColorStop(0, '#0f2a4a'); g.addColorStop(1, '#1c3a5e');
+  g.addColorStop(0, '#050b1c'); g.addColorStop(1, '#0d1c33');
   ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = '#e2e8f0';
   const t = performance.now() / 1000;
   for (const s of STARS) {
-    const a = 0.35 + 0.5 * Math.abs(Math.sin(t / 2.3 + s.tw));
-    ctx.globalAlpha = a;
+    ctx.globalAlpha = 0.35 + 0.5 * Math.abs(Math.sin(t / 2.3 + s.tw));
     ctx.fillRect(s.x * w, s.y * h, 1.5, 1.5);
   }
   ctx.globalAlpha = 1;
 }
 
 function drawGlobeBase() {
+  ctx.beginPath(); ctx.arc(cx, cy, R + 5, 0, TAU);
+  ctx.strokeStyle = 'rgba(56,189,248,0.16)'; ctx.lineWidth = 10; ctx.stroke();
   const pg = ctx.createRadialGradient(cx - R * 0.35, cy - R * 0.35, R * 0.15, cx, cy, R);
-  pg.addColorStop(0, '#1c4a72'); pg.addColorStop(1, '#0a2038');
+  pg.addColorStop(0, '#17416e'); pg.addColorStop(1, '#081a30');
   ctx.fillStyle = pg;
   ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.fill();
-  ctx.beginPath(); ctx.arc(cx, cy, R + 4, 0, TAU);
-  ctx.strokeStyle = 'rgba(125,211,252,0.18)'; ctx.lineWidth = 8; ctx.stroke();
 }
 
 function drawLandmasses() {
@@ -1814,8 +2021,8 @@ function drawLandmasses() {
   for (const b of CONTINENT_BLOBS) {
     const p = project(b.lat, b.lon);
     if (p.z < 0.02) continue;
-    ctx.globalAlpha = Math.min(1, p.z * 4) * 0.9;
-    ctx.fillStyle = b.core ? 'hsl(160, 18%, 23%)' : 'hsl(100, 20%, 23%)';
+    ctx.globalAlpha = Math.min(1, p.z * 4) * 0.95;
+    ctx.fillStyle = b.core ? 'hsl(158, 26%, 21%)' : 'hsl(112, 26%, 20%)';
     ctx.beginPath(); ctx.arc(p.x, p.y, b.rad * R * (0.35 + 0.65 * p.z), 0, TAU); ctx.fill();
   }
   // 未開拓エリア（黒い影の陸地）
@@ -1829,7 +2036,7 @@ function drawLandmasses() {
     }
   }
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = 'rgba(148,163,184,0.10)'; ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(148,163,184,0.09)'; ctx.lineWidth = 1;
   for (let m = 0; m < 8; m++) {
     const lon = m * TAU / 8;
     ctx.beginPath(); let pen = false;
@@ -1842,6 +2049,7 @@ function drawLandmasses() {
   ctx.restore();
 
   // 未開拓エリアの🔒（将来アップデートで解禁される予感）
+  ctx.save();
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   for (const area of UNEXPLORED_AREAS) {
     const p = project(area.center.lat, area.center.lon);
@@ -1851,87 +2059,39 @@ function drawLandmasses() {
     ctx.font = `${Math.round(18 * (0.6 + p.z * 0.6))}px ${EMOJI_FONT}`;
     ctx.fillText('🔒', p.x, p.y);
   }
-  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
-// v3.9: 雰囲気建物。ctx.filterは使わず低alphaで奥に霞ませる（iOS Safariでもカラー絵文字を表示）。
-function drawGrayBuilding(lat, lon, stories, emoji) {
-  const p = project(lat, lon);
-  if (p.z < 0.05) return;
-  const scale = 0.65 + p.z * 0.85;   // v3.5: ズームでもアイコンサイズは固定（間隔だけ変わる）
-  const size = (12 + stories * 2.1) * scale;
-  const alpha = 0.32 + p.z * 0.22;   // 実物件より薄く「奥に控える」表現
-  if (!colorEmojiOK) { drawVectorBuilding(p.x, p.y, size, EMOJI_SHAPE[emoji] || 'kodate', alpha, true); return; }
-  ctx.globalAlpha = alpha;
-  ctx.fillStyle = '#334155';         // 万一モノクロ字形になっても地面の緑を引き継がないよう明示する
-  ctx.font = `${Math.round(size)}px ${EMOJI_FONT}`;
-  ctx.fillText(emoji, p.x, p.y);
-  ctx.globalAlpha = 1;
-}
-
-// カラー建物（所有・売り出し中）: ジャンル別の絵文字＋状態バッジ。市場物件は常時グレー表示。
-// お気に入り登録済みの市場物件だけタップで情報を開ける（⭐マーク付き）。
-function drawColorBuilding(p, lat, lon, kind) {
-  const parts = L.svgBuildingParts(p);
-  const pr = project(lat, lon);
-  if (pr.z < 0.04) return;
-  const scale = 0.85 + pr.z * 1.15;   // v3.5: ズームでもアイコンサイズは固定（間隔だけ変わる）
-  const stories = SHAPE_STORIES[parts.shape] ?? 1;
-  const emoji = GENRE_EMOJI[parts.shape] ?? '🏠';
-  const size = (17 + stories * 2.9) * scale;
-
-  const isFav = kind === 'market' && (st.favorites || []).some(f => f.propertyId === p.id);
+// 状態バッジ（入居率ドット・売出中・修繕中・お気に入り⭐）
+function drawBadges(p, pr, size, kind) {
   ctx.save();
   ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-  // 密集した雰囲気建物に埋もれないよう、所有物件の足元にだけ淡いハロー（円形の光暈）を敷く。
-  // v3: お気に入りは⭐のみ（所有物件より目立たないよう背景ハローは付けない）。
-  if (kind === 'owned') {
-    ctx.globalAlpha = Math.min(1, 0.35 + pr.z * 0.3);
-    ctx.fillStyle = '#a7f3d0';
-    ctx.beginPath(); ctx.arc(pr.x, pr.y - size * 0.35, size * 0.62, 0, TAU); ctx.fill();
-  }
-  // v3.9: iOS Safariはcanvasのctx.filter＋絵文字描画が不安定でシルエット化するため使用しない。
-  // 市場（未所有）物件は半透明で「奥に控える」表現にし、全デバイスでカラー絵文字を表示する。
-  // v3.12: カラー絵文字を描けない端末では図形の建物にフォールバックする。
-  const alpha = kind === 'market' ? Math.min(0.55, 0.3 + pr.z * 0.3) : Math.min(1, 0.6 + pr.z * 0.55);
-  if (!colorEmojiOK) {
-    drawVectorBuilding(pr.x, pr.y, size, parts.shape, alpha, kind === 'market');
-  } else {
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = '#334155';       // モノクロ字形になってもハローの緑を引き継がないよう明示する
-    ctx.font = `${Math.round(size)}px ${EMOJI_FONT}`;
-    ctx.fillText(emoji, pr.x, pr.y);
-    ctx.globalAlpha = 1;
-  }
-
+  const g = BLD_STYLE[L.svgBuildingParts(p).shape] || BLD_STYLE.kodate;
+  const top = pr.y - size * g.h;
   if (kind === 'owned') {
     const occ = p.units && p.units.length ? p.units.filter(u => u.occupied).length / p.units.length : 1;
     ctx.fillStyle = occ >= 0.999 ? '#4ade80' : occ > 0 ? '#fbbf24' : '#f87171';
-    ctx.beginPath(); ctx.arc(pr.x + size * 0.30, pr.y - size * 0.95, 2.6 * scale, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(pr.x + size * 0.42, top - size * 0.18, Math.max(1.8, size * 0.11), 0, TAU); ctx.fill();
     if ((st.listings || []).some(l => l.propertyId === p.id)) {
       ctx.fillStyle = '#facc15';
-      ctx.beginPath(); ctx.arc(pr.x - size * 0.30, pr.y - size * 0.95, 2.6 * scale, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(pr.x - size * 0.42, top - size * 0.18, Math.max(1.8, size * 0.11), 0, TAU); ctx.fill();
     }
-    // v3: 業者修繕中の物件は🔨マーク、v3.11: バリューアップ工事中は✨マークで一目で分かるように
     if (p.repairJob || p.valueUpJob) {
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = '#f59e0b';
-      ctx.font = `${Math.round(12 * scale)}px ${EMOJI_FONT}`;
-      ctx.fillText(p.repairJob ? '🔨' : '✨', pr.x, pr.y - size * 1.10);
+      ctx.globalAlpha = 1; ctx.fillStyle = '#f59e0b';
+      ctx.font = `${Math.round(Math.max(10, size * 0.7))}px ${EMOJI_FONT}`;
+      ctx.fillText(p.repairJob ? '🔨' : '✨', pr.x, top - size * 0.34);
     }
-  } else if (kind === 'market' && (st.favorites || []).some(f => f.propertyId === p.id)) {
-    // お気に入り登録した市場物件だけ⭐を付けタップ可能にする（未登録の市場物件は雰囲気建物と同じ扱い）
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = '#facc15';
-    ctx.font = `${Math.round(13 * scale)}px ${EMOJI_FONT}`;
-    ctx.fillText('⭐', pr.x, pr.y - size * 1.05);
+  } else if ((st.favorites || []).some(f => f.propertyId === p.id)) {
+    // お気に入り登録した市場物件だけ⭐を付けタップ可能にする（未登録の市場物件は背景と同じ扱い）
+    ctx.globalAlpha = 1; ctx.fillStyle = '#facc15';
+    ctx.font = `${Math.round(Math.max(10, size * 0.72))}px ${EMOJI_FONT}`;
+    ctx.fillText('⭐', pr.x, top - size * 0.20);
   }
   ctx.restore();
 }
 
 // 実物件（所有・市場）同士が重なってタップしづらくなるのを防ぐ決定的な間引き配置。
 // 既に配置済みの点と近すぎる場合、id由来の固定角度でスパイラル状に押し出す（毎フレーム同じ結果になる）。
-const MIN_SEP = 0.11;
 function spreadItems(items) {
   const placed = [];
   for (const it of items) {
@@ -1961,6 +2121,19 @@ function coloredItems() {
   return spreadItems(items);
 }
 
+// v5: 翌月ボタンから呼ばれるゆっくり回転。draw() の毎フレームで補間する。
+function easeInOutCubic(t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+function normAngle(a) { return ((a + Math.PI) % TAU + TAU) % TAU - Math.PI; }
+function stepViewAnim(now) {
+  if (!viewAnim) return;
+  const t = Math.min(1, (now - viewAnim.t0) / viewAnim.dur);
+  const e = easeInOutCubic(t);
+  yaw = viewAnim.fromYaw + viewAnim.dYaw * e;
+  pitch = viewAnim.fromPitch + (HOME.pitch - viewAnim.fromPitch) * e;
+  zoom = viewAnim.fromZoom + (HOME.zoom - viewAnim.fromZoom) * e;
+  if (t >= 1) { viewAnim = null; yaw = HOME.yaw; pitch = HOME.pitch; zoom = HOME.zoom; }
+}
+
 function draw(ts) {
   rafId = requestAnimationFrame(draw);
   if (ts - lastFrame < 1000 / FPS) return;
@@ -1969,23 +2142,41 @@ function draw(ts) {
   const w = canvas.width / dpr, h = canvas.height / dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  cx = w / 2; cy = h * 0.52; R = Math.min(w, h) * 0.44 * zoom;
 
-  if (!dragging) { yaw += yawV * dt; yawV *= 0.92; }
+  stepViewAnim(ts);
+  if (!dragging && !viewAnim) { yaw += yawV * dt; yawV *= 0.92; }
+
+  cx = w / 2; cy = h * 0.52; R = Math.min(w, h) * 0.44 * zoom;
 
   drawSky(w, h);
   drawGlobeBase();
   drawLandmasses();
 
-  // v3.9: 雰囲気建物。ctx.filter（iOS Safariで不安定）は使わず、drawGrayBuilding側の低alphaで「奥に霞む」表現にする。
-  ctx.save();
-  ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-  for (const s of GRAY_SLOTS) drawGrayBuilding(s.lat, s.lon, s.stories, s.emoji);
-  ctx.restore();
+  // 雰囲気建物（奥から手前へ）。引いたときは本数も間引いて、ごちゃつきを抑える。
+  const fUnit = fillerUnit();
+  const cap = zoom < 0.9 ? Math.round(FILLER_SLOTS.length * 0.6) : FILLER_SLOTS.length;
+  FILLER_SLOTS.slice(0, cap)
+    .map(s => ({ s, p: project(s.lat, s.lon) }))
+    .filter(o => o.p.z > 0.05)
+    .sort((a, b) => a.p.z - b.p.z)
+    .forEach(({ s, p }) => drawFillerBuilding(p.x, p.y, fUnit * (0.62 + p.z * 0.8), s.stories, s.seed, 0.30 + p.z * 0.26));
 
   // 実物件（所有=カラー／市場=グレー）は奥から手前へ
-  const items = coloredItems().map(it => ({ ...it, z: project(it.lat, it.lon).z })).sort((a, b) => a.z - b.z);
-  for (const it of items) drawColorBuilding(it.p, it.lat, it.lon, it.kind);
+  const pUnit = propUnit();
+  coloredItems()
+    .map(it => ({ ...it, pr: project(it.lat, it.lon) }))
+    .filter(it => it.pr.z > 0.04)
+    .sort((a, b) => a.pr.z - b.pr.z)
+    .forEach(it => {
+      const size = pUnit * (0.80 + it.pr.z * 0.55);
+      if (it.kind === 'owned') {   // 所有物件の足元に淡いハロー（自分の物件を見分けやすく）
+        ctx.save(); ctx.globalAlpha = 0.28; ctx.fillStyle = '#a7f3d0';
+        ctx.beginPath(); ctx.ellipse(it.pr.x, it.pr.y, size * 0.72, size * 0.22, 0, 0, TAU); ctx.fill(); ctx.restore();
+      }
+      const o = buildingOptsFor(it.p, it.kind === 'owned');
+      drawBuilding(it.pr.x, it.pr.y, size, { ...o, alpha: it.kind === 'owned' ? 1 : 0.85 });
+      drawBadges(it.p, it.pr, size, it.kind);
+    });
 
   // 一覧「地図を見る」からのハイライト（拡大リング＋跳ねる📍ピン）。どこかをクリックするまで維持され、
   // ピン自体をクリックすると詳細画面が開く（pointerup側で処理）。
@@ -1996,13 +2187,11 @@ function draw(ts) {
       const now = performance.now();
       const t = (now % 900) / 900;
       ctx.save();
-      // 二重の拡大リング
       ctx.strokeStyle = `rgba(250,204,21,${0.9 * (1 - t)})`;
       ctx.lineWidth = 3.5;
       ctx.beginPath(); ctx.arc(pr.x, pr.y - 8, 14 + t * 34, 0, TAU); ctx.stroke();
       ctx.strokeStyle = `rgba(250,204,21,${0.6 * (1 - ((t + 0.5) % 1))})`;
       ctx.beginPath(); ctx.arc(pr.x, pr.y - 8, 14 + ((t + 0.5) % 1) * 34, 0, TAU); ctx.stroke();
-      // 跳ねる📍ピン
       const bounce = Math.abs(Math.sin(now / 220)) * 9;
       ctx.fillStyle = '#ef4444';
       ctx.font = `28px ${EMOJI_FONT}`;
@@ -2044,18 +2233,21 @@ function hideTip() { if (tipEl) tipEl.style.display = 'none'; }
 
 function hitTest(px, py) {
   const favIds = new Set((st?.favorites || []).map(f => f.propertyId));
+  const pUnit = propUnit();
   const items = coloredItems()
     .filter(it => it.kind === 'owned' || favIds.has(it.p.id))
     .map(it => ({ ...it, pr: project(it.lat, it.lon) }))
     .filter(it => it.pr.z > 0.04)
     .sort((a, b) => b.pr.z - a.pr.z);
   for (const it of items) {
-    const scale = 0.85 + it.pr.z * 1.15;
-    const stories = SHAPE_STORIES[L.svgBuildingParts(it.p).shape] ?? 1;
-    const size = (17 + stories * 2.9) * scale;
-    const half = size * 0.55;
-    // 建物同士が近くても押しやすいよう、見た目の絵文字より少し広めの当たり判定にする。
-    if (px >= it.pr.x - half - 8 && px <= it.pr.x + half + 8 && py >= it.pr.y - size - 10 && py <= it.pr.y + 8) return it;
+    const size = pUnit * (0.80 + it.pr.z * 0.55);
+    const g = BLD_STYLE[L.svgBuildingParts(it.p).shape] || BLD_STYLE.kodate;
+    const half = size * g.w * 0.5;
+    const top = size * g.h;
+    // 建物が小さくても押しやすいよう、見た目より広めの当たり判定にする（最低22px幅を確保）。
+    const padX = Math.max(8, 11 - half), padTop = Math.max(10, 14 - top * 0.5);
+    if (px >= it.pr.x - half - padX && px <= it.pr.x + half + padX &&
+        py >= it.pr.y - top - padTop && py <= it.pr.y + 8) return it;
   }
   return null;
 }
@@ -2088,12 +2280,6 @@ function initCity(cv, callbacks) {
   canvas = cv; cbs = callbacks || {};
   ctx = canvas.getContext('2d');
   resize();
-  // v3.12: カラー絵文字が描けるかを実測。フォント確定前だと誤判定するため fonts.ready 後に実行し、
-  // 「描けない」と出た場合だけ念のため後追いでもう一度だけ確かめる（遅れて使えるようになる端末対策）。
-  const runDetect = () => { colorEmojiOK = detectColorEmoji(); };
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(runDetect, runDetect);
-  else setTimeout(runDetect, 300);
-  setTimeout(() => { if (!colorEmojiOK) colorEmojiOK = detectColorEmoji(); }, 2500);
   // Tailwind CDNのスタイル適用が非同期のため、initCity実行時点ではcanvasのレイアウトサイズが
   // まだ確定していないことがある（clientWidth=0）。ResizeObserverで実際のサイズ確定を捉える。
   if (typeof ResizeObserver !== 'undefined') {
@@ -2106,10 +2292,12 @@ function initCity(cv, callbacks) {
   // v3.4: ホイールで拡大縮小（PC）
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
+    viewAnim = null;                              // 手動操作が入ったら自動回転は中断
     const f = e.deltaY < 0 ? 1.1 : 1 / 1.1;
     zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * f));
   }, { passive: false });
   canvas.addEventListener('pointerdown', e => {
+    viewAnim = null;                              // 手動操作が入ったら自動回転は中断
     activePtrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
     // v3.4: 2本目の指が置かれたらピンチズームモードへ（回転ドラッグは中断）
     if (activePtrs.size >= 2) {
@@ -2144,7 +2332,6 @@ function initCity(cv, callbacks) {
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     if (!dragging) {
       // ホバー時: タップできる対象（所有/お気に入り物件・ピン・🔒）の上ではカーソルを指マークに。
-      // v3.3: マウスホバー中は建物の簡易情報を吹き出しで出す（どれがヒットするか一目で分かるように）。
       const hit = hitTest(mx, my);
       const over = hitPin(mx, my) || hitLock(mx, my) || hit;
       canvas.style.cursor = over ? 'pointer' : 'grab';
@@ -2205,16 +2392,28 @@ function initCity(cv, callbacks) {
   });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) { cancelAnimationFrame(rafId); rafId = 0; }
-    else if (!rafId) rafId = requestAnimationFrame(draw);
+    else if (!rafId) { lastFrame = performance.now(); rafId = requestAnimationFrame(draw); }
   });
   rafId = requestAnimationFrame(draw);
 }
 
 function setCityState(s) { st = s; }
 
-// v3.5: マップ以外のゲーム操作後に呼ばれ、ズームと視点を初期状態（都心コアが中央）へ戻す。
+// ズームと視点を即座に初期状態（都心コアが中央）へ戻す。ゲーム開始時のみ使う。
+// v5: 毎回のrender()からは呼ばれなくなった（操作しても視点が動かないように）。
 function resetMapView() {
-  zoom = 1; yaw = 0; pitch = -0.03; yawV = 0;
+  zoom = HOME.zoom; yaw = HOME.yaw; pitch = HOME.pitch; yawV = 0; viewAnim = null;
+}
+
+// v5: 翌月ボタン専用。瞬間移動ではなく、地球儀がゆっくり回って初期位置へ戻る。
+// yawは差分を±πに正規化して最短経路で回すので、何周も遠回りしない。
+function animateResetView(dur = 1400) {
+  yawV = 0;
+  viewAnim = {
+    t0: performance.now(), dur,
+    fromYaw: yaw, dYaw: normAngle(HOME.yaw - yaw),
+    fromPitch: pitch, fromZoom: zoom,
+  };
 }
 
 // 物件一覧の「地図を見る」から呼ぶ: 該当の市場物件が正面に来るよう回転しピンを立てる。
@@ -2224,6 +2423,7 @@ function focusOnMarket(propertyId) {
   const p = st.market.find(x => x.id === propertyId);
   if (!p) return;
   const s = slotFor(p.areaKey, 'm:' + p.id);
+  viewAnim = null;
   yaw = -s.lon; pitch = Math.max(-0.6, Math.min(0.2, -s.lat * 0.6));
   yawV = 0;
   pingItem = { lat: s.lat, lon: s.lon, id: propertyId, sx: null, sy: null };
@@ -2235,6 +2435,7 @@ function focusOnOwned(propertyId) {
   const p = st.properties.find(x => x.id === propertyId);
   if (!p) return;
   const s = slotFor(p.areaKey, 'o:' + p.id);
+  viewAnim = null;
   yaw = -s.lon; pitch = Math.max(-0.6, Math.min(0.2, -s.lat * 0.6));
   yawV = 0;
 }
@@ -2441,7 +2642,8 @@ function showTitle(hasSave) {
   </div>`);
   m.appendChild(box);
   box.querySelector('#ttl-start')?.addEventListener('click', () => showSetup());
-  box.querySelector('#ttl-continue')?.addEventListener('click', () => { m.classList.add('hidden'); m.innerHTML = ''; render(); });
+  // v5: 視点の初期化はゲーム開始のここだけ（以後は翌月ボタンの animateResetView のみ）
+  box.querySelector('#ttl-continue')?.addEventListener('click', () => { m.classList.add('hidden'); m.innerHTML = ''; resetMapView(); render(); });
   box.querySelector('#ttl-new')?.addEventListener('click', () => {
     if (confirm('セーブデータを消して最初からはじめますか？')) { localStorage.removeItem(SAVE_KEY); location.reload(); }
   });
@@ -2656,7 +2858,7 @@ function showSetup() {
       if (step < TOTAL - 1) { step += 1; draw(); return; }
       state = L.createInitialState({ attr: data.attr, age: data.age, goalType: data.goalType,
         goalAmount: data.goalAmount, goalYears: data.years, seedCash: data.seed });
-      m.classList.add('hidden'); m.innerHTML = ''; save(); render();
+      m.classList.add('hidden'); m.innerHTML = ''; save(); resetMapView(); render();
       if (data.tutorial) startTutorial();
     });
   };
@@ -2683,10 +2885,11 @@ function load(){
   return true;
 }
 
-// v3.5: ゲーム操作（購入・修繕・翌月など）のたびに地図のズーム・視点を初期状態へ戻す。
-// 地図側の操作（ドラッグ・ズーム・タップ）や「地図で場所を見る」はrender()を通らないため維持される。
+// v5: render()では視点を動かさない。物件詳細を開く・購入する等の操作をしても地図はその場に留まる。
+// 初期位置へ戻すのは「翌月へ進む」ときだけで、そのときも瞬間移動ではなく animateResetView() で
+// ゆっくり回って戻る（v3.5では毎回のrender()でリセットしていたが、動きすぎるという指摘を受けて変更）。
 function render(){
-  setCityState(state); resetMapView(); renderPanelLeft(); renderPanelRight(); renderMobileBars(); checkEnd(); checkNewBadges(); save(); showExpFloats();
+  setCityState(state); renderPanelLeft(); renderPanelRight(); renderMobileBars(); checkEnd(); checkNewBadges(); save(); showExpFloats();
   document.getElementById('btn-result')?.classList.toggle('hidden', !state?.freePlay);   // v3.7: クリア後はいつでもリザルトへ
   if (tutIdx >= 0) renderTutStep();   // v3.7: チュートリアル中は吹き出しを追従させる
 }
@@ -2697,14 +2900,24 @@ function renderMobileBars() {
   const actEl = document.getElementById('mobile-actions');
   if (!statusEl || !actEl || !state) return;
   const mcf = L.monthlyCF(state);
+  // v5: 上段=主要3情報、下段=物件市場／所有物件。市場・所有は従来≡ドロワーの中にしか無かったが、
+  // よく使うので表に出した。下部ではなく上部に置いているのは、操作中の親指で隠れないようにするため。
   statusEl.innerHTML = `
-    <button class="ms-kpi bg-white/95 shadow rounded-lg px-1 py-1 text-center" data-kpi="cash">
-      <div class="text-[9px] font-bold text-slate-500">💰現金</div><div class="text-[11px] font-bold truncate">${L.yen(state.cash)}</div></button>
-    <button class="ms-kpi bg-white/95 shadow rounded-lg px-1 py-1 text-center" data-kpi="cf">
-      <div class="text-[9px] font-bold text-slate-500">📈月CF</div><div class="text-[11px] font-bold truncate ${mcf >= 0 ? 'text-emerald-600' : 'text-red-600'}">${L.yen(mcf)}</div></button>
-    <div class="bg-white/95 shadow rounded-lg px-1 py-1 text-center">
-      <div class="text-[9px] font-bold text-slate-500">⚡行動力</div><div class="text-[11px] font-bold" id="hud-ap-m">${state.actionPower}/${state.baseActionPower}</div></div>`;
+    <div class="grid grid-cols-3 gap-1">
+      <button class="ms-kpi hud-panel shadow rounded-lg px-1 py-1 text-center" data-kpi="cash">
+        <div class="text-[9px] font-bold hud-sub">💰現金</div><div class="text-[11px] font-bold truncate hud-money">${L.yen(state.cash)}</div></button>
+      <button class="ms-kpi hud-panel shadow rounded-lg px-1 py-1 text-center" data-kpi="cf">
+        <div class="text-[9px] font-bold hud-sub">📈月CF</div><div class="text-[11px] font-bold truncate ${mcf >= 0 ? 'hud-money' : 'hud-bad'}">${L.yen(mcf)}</div></button>
+      <div class="hud-panel shadow rounded-lg px-1 py-1 text-center">
+        <div class="text-[9px] font-bold hud-sub">⚡行動力</div><div class="text-[11px] font-bold" id="hud-ap-m">${state.actionPower}/${state.baseActionPower}</div></div>
+    </div>
+    <div class="grid grid-cols-2 gap-1">
+      <button id="ms-listings" class="hud-panel shadow rounded-lg px-1 py-1.5 text-[11px] font-bold">🗂️ 市場（${state.market.length}）</button>
+      <button id="ms-props" class="hud-panel shadow rounded-lg px-1 py-1.5 text-[11px] font-bold">🏠 所有（${state.properties.length}）</button>
+    </div>`;
   statusEl.querySelectorAll('.ms-kpi').forEach(b => b.addEventListener('click', () => openKpiModal(b.dataset.kpi)));
+  statusEl.querySelector('#ms-listings').addEventListener('click', openListingsModal);
+  statusEl.querySelector('#ms-props').addEventListener('click', () => openKpiModal('props'));
 
   const unread = (state.notifications || []).filter(n => !n.read).length;
   actEl.innerHTML = `
@@ -2726,13 +2939,13 @@ function openMobileDrawer() {
   const g = state.goal;
   const pct = Math.max(0, Math.min(100, Math.round((g.type === 'networth' ? L.netWorth(state) : L.monthlyCF(state)) / g.amount * 100)));
   const unread = (state.notifications || []).filter(n => !n.read).length;
-  const item = (id, label) => `<button id="${id}" class="w-full text-left bg-slate-50 hover:bg-slate-100 rounded-lg px-3 py-3 text-sm font-bold flex justify-between items-center">${label}</button>`;
-  const box = el(`<div class="absolute inset-0"><div class="absolute inset-0 bg-black/40" id="dr-backdrop"></div>
-    <div class="absolute top-0 right-0 bottom-0 w-72 max-w-[85%] bg-white shadow-2xl p-3 space-y-2 overflow-y-auto">
-      <div class="flex justify-between items-center"><h2 class="font-bold">≡ メニュー</h2><button id="dr-close" class="text-slate-400 text-2xl leading-none">✕</button></div>
-      <div class="bg-slate-50 rounded-lg p-2 text-xs">
-        <div class="flex justify-between font-bold text-slate-700"><span>🎯 目標達成度</span><span>${pct}%</span></div>
-        <div class="w-full bg-slate-200 rounded-full h-2 mt-1 overflow-hidden"><div class="bg-emerald-500 h-2" style="width:${pct}%"></div></div>
+  const item = (id, label) => `<button id="${id}" class="w-full text-left hud-tile rounded-lg px-3 py-3 text-sm font-bold flex justify-between items-center">${label}</button>`;
+  const box = el(`<div class="absolute inset-0"><div class="absolute inset-0 bg-black/50" id="dr-backdrop"></div>
+    <div class="absolute top-0 right-0 bottom-0 w-72 max-w-[85%] hud-panel shadow-2xl p-3 space-y-2 overflow-y-auto">
+      <div class="flex justify-between items-center"><h2 class="font-bold hud-accent">≡ メニュー</h2><button id="dr-close" class="hud-sub text-2xl leading-none">✕</button></div>
+      <div class="hud-tile rounded-lg p-2 text-xs">
+        <div class="flex justify-between font-bold hud-accent"><span>🎯 目標達成度</span><span>${pct}%</span></div>
+        <div class="w-full hud-track rounded-full h-2 mt-1 overflow-hidden"><div class="bg-emerald-500 h-2" style="width:${pct}%"></div></div>
       </div>
       ${item('dr-listings', `🗂️ 物件市場（${state.market.length}件）`)}
       ${item('dr-notifs', `🔔 通知${unread ? `（未読${unread}）` : ''}`)}
@@ -2740,14 +2953,14 @@ function openMobileDrawer() {
       ${item('dr-assets', '💰 資産・バランスシート')}
       ${item('dr-credit', '📊 信用度・銀行取引')}
       ${item('dr-log', '📜 ログ履歴')}
-      <div class="bg-slate-50 rounded-lg p-2 text-xs space-y-1">
-        <div class="font-bold text-slate-700 mb-1">🎓 スキル状況</div>
+      <div class="hud-tile rounded-lg p-2 text-xs space-y-1">
+        <div class="font-bold hud-accent mb-1">🎓 スキル状況</div>
         ${skillRow('目利き力', 'appraisal')}${skillRow('交渉力', 'negotiation')}${skillRow('自主管理', 'selfmgmt')}
       </div>
-      <div class="flex gap-2 pt-1 border-t">
-        <button id="dr-bgm" class="flex-1 border rounded-lg py-2 text-sm">🎵 BGM</button>
-        <button id="dr-mute" class="flex-1 border rounded-lg py-2 text-sm">${muted ? '🔇 消音中' : '🔊 音あり'}</button>
-        <button id="dr-reset" class="flex-1 border rounded-lg py-2 text-sm text-red-600">リセット</button>
+      <div class="flex gap-2 pt-1 hud-divide">
+        <button id="dr-bgm" class="flex-1 hud-tile rounded-lg py-2 text-sm">🎵 BGM</button>
+        <button id="dr-mute" class="flex-1 hud-tile rounded-lg py-2 text-sm">${muted ? '🔇 消音中' : '🔊 音あり'}</button>
+        <button id="dr-reset" class="flex-1 hud-tile rounded-lg py-2 text-sm hud-bad">リセット</button>
       </div>
     </div></div>`);
   m.innerHTML = ''; m.appendChild(box);
@@ -2779,39 +2992,39 @@ function renderPanelLeft() {
   const risk = L.taxRiskLevelV2(state);
   const mcf = L.monthlyCF(state);
   c.appendChild(el(`
-    <div class="hud-panel pointer-events-auto rounded-xl bg-white/90 shadow-lg p-3 text-xs space-y-3">
-      <div class="flex justify-between items-center text-xs font-bold text-slate-800">
+    <div class="hud-panel pointer-events-auto rounded-xl shadow-lg p-3 text-xs space-y-3">
+      <div class="flex justify-between items-center text-xs font-bold">
         <div>📆 ${Math.floor(state.month / 12)}年${state.month % 12}ヶ月</div>
         <div>${state.age ?? '-'}歳</div>
       </div>
       <div class="grid grid-cols-2 gap-2">
-        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="cash">
-          <div class="text-[11px] font-bold text-slate-700">💰 現金</div>
-          <div class="font-bold truncate" id="hud-cash">${L.yen(state.cash)}</div>
+        <button class="kpi-btn hud-tile rounded-lg p-2 text-left" data-kpi="cash">
+          <div class="text-[11px] font-bold hud-sub">💰 現金</div>
+          <div class="font-bold truncate hud-money" id="hud-cash">${L.yen(state.cash)}</div>
         </button>
-        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="props">
-          <div class="text-[11px] font-bold text-slate-700">🏠 物件</div>
+        <button class="kpi-btn hud-tile rounded-lg p-2 text-left" data-kpi="props">
+          <div class="text-[11px] font-bold hud-sub">🏠 物件</div>
           <div class="font-bold">${state.properties.length}件</div>
         </button>
-        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="cf">
-          <div class="text-[11px] font-bold text-slate-700">📈 月CF</div>
-          <div class="font-bold truncate ${mcf >= 0 ? 'text-emerald-600' : 'text-red-600'}">${L.yen(mcf)}</div>
+        <button class="kpi-btn hud-tile rounded-lg p-2 text-left" data-kpi="cf">
+          <div class="text-[11px] font-bold hud-sub">📈 月CF</div>
+          <div class="font-bold truncate ${mcf >= 0 ? 'hud-money' : 'hud-bad'}">${L.yen(mcf)}</div>
         </button>
-        <button class="kpi-btn bg-slate-100 hover:bg-slate-200 rounded-lg p-2 text-left" data-kpi="credit">
-          <div class="text-[11px] font-bold text-slate-700">📊 信用度</div>
+        <button class="kpi-btn hud-tile rounded-lg p-2 text-left" data-kpi="credit">
+          <div class="text-[11px] font-bold hud-sub">📊 信用度</div>
           <div class="font-bold">${state.creditScore}</div>
         </button>
       </div>
-      <div class="border-t pt-2">
-        <div class="flex justify-between text-[11px] font-bold text-slate-700 mb-1"><span>🎯 目標達成度</span><span>${pct}%</span></div>
-        <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden"><div class="bg-emerald-500 h-2 rounded-full" style="width:${pct}%"></div></div>
+      <div class="hud-divide pt-2">
+        <div class="flex justify-between text-[11px] font-bold hud-accent mb-1"><span>🎯 目標達成度</span><span>${pct}%</span></div>
+        <div class="w-full hud-track rounded-full h-2 overflow-hidden"><div class="bg-emerald-500 h-2 rounded-full" style="width:${pct}%"></div></div>
       </div>
-      <button id="btn-bs-toggle" class="w-full text-[11px] font-bold text-slate-700 underline">${bsDetailOpen ? '▲ バランスシートを閉じる' : '▶ バランスシート詳細'}</button>
-      <div id="bs-detail" class="space-y-1 text-xs border-t pt-2 ${bsDetailOpen ? '' : 'hidden'}">
-        <div class="flex justify-between"><span>純資産</span><b class="text-emerald-700">${L.yen(L.netWorth(state))}</b></div>
-        <div class="flex justify-between"><span>総資産</span><b>${L.yen(L.totalAssetsV2(state))}</b></div>
-        <div class="flex justify-between"><span>総負債</span><b class="text-red-600">${L.yen(L.totalDebt(state))}</b></div>
-        <div class="flex justify-between"><span>税リスク</span><span class="${risk === '低' ? 'text-blue-600' : risk === '中' ? 'text-yellow-600' : 'text-red-600'} font-bold">${risk}</span></div>
+      <button id="btn-bs-toggle" class="w-full text-[11px] font-bold hud-accent underline">${bsDetailOpen ? '▲ バランスシートを閉じる' : '▶ バランスシート詳細'}</button>
+      <div id="bs-detail" class="space-y-1 text-xs hud-divide pt-2 ${bsDetailOpen ? '' : 'hidden'}">
+        <div class="flex justify-between"><span class="hud-sub">純資産</span><b class="hud-money">${L.yen(L.netWorth(state))}</b></div>
+        <div class="flex justify-between"><span class="hud-sub">総資産</span><b>${L.yen(L.totalAssetsV2(state))}</b></div>
+        <div class="flex justify-between"><span class="hud-sub">総負債</span><b class="hud-bad">${L.yen(L.totalDebt(state))}</b></div>
+        <div class="flex justify-between"><span class="hud-sub">税リスク</span><span class="${risk === '低' ? 'text-sky-400' : risk === '中' ? 'hud-accent' : 'hud-bad'} font-bold">${risk}</span></div>
       </div>
     </div>
   `));
@@ -3848,7 +4061,7 @@ function applyDiy(propId, sel, category, back) {
 
 function skillRow(name, key){
   const exp = state.skills[key].exp, lv = L.skillLevel(exp), next = L.expToNext(exp);
-  return `<div class="flex justify-between text-sm relative" data-skill="${key}"><span class="font-bold text-slate-800">${name} Lv${lv}</span><span class="font-bold text-slate-600">${next===null?'MAX':'次まで'+next}</span></div>`;
+  return `<div class="flex justify-between text-sm relative" data-skill="${key}"><span class="font-bold">${name} Lv${lv}</span><span class="font-bold hud-sub">${next===null?'MAX':'次まで'+next}</span></div>`;
 }
 
 // EXPフロート表示・実績バッジトースト。render()の後で毎回呼び、直前状態との差分から自動検知する。
@@ -3989,44 +4202,52 @@ function renderPanelRight() {
   const c = document.getElementById('panel-right'); c.innerHTML = '';
   const unread = (state.notifications || []).filter(n => !n.read).length;
   c.appendChild(el(`
-    <div class="hud-panel pointer-events-auto rounded-xl bg-white/90 shadow-lg p-3 space-y-2">
+    <div class="hud-panel pointer-events-auto rounded-xl shadow-lg p-3 space-y-2">
       <button id="btn-open-search" class="w-full bg-navy text-white rounded-lg py-2 text-xs font-bold shadow-md hover:bg-navy-dark">🏘️ 物件を探す</button>
       <button id="btn-work" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-lg py-2 text-xs font-bold shadow-md select-none touch-none">💼 働く（行動力-1・長押しOK）</button>
       <div class="grid grid-cols-2 gap-2">
-        <button id="btn-open-listings" class="bg-slate-50 border rounded-lg py-2 text-[11px] font-bold text-slate-800 hover:bg-slate-100">🗂️ 市場(${state.market.length})</button>
-        <button id="btn-open-notifs" class="bg-slate-50 border rounded-lg py-2 text-[11px] font-bold text-slate-800 hover:bg-slate-100 relative">🔔 通知(${unread})</button>
+        <button id="btn-open-listings" class="hud-tile rounded-lg py-2 text-[11px] font-bold">🗂️ 市場(${state.market.length})</button>
+        <button id="btn-open-props" class="hud-tile rounded-lg py-2 text-[11px] font-bold">🏠 所有(${state.properties.length})</button>
       </div>
-      <button id="btn-open-log" class="w-full bg-slate-50 border rounded-lg py-1.5 text-xs hover:bg-slate-100">📜 ログ履歴</button>
-      <div id="hud-ap" class="text-xs font-bold text-slate-800 text-center font-mono">⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}</div>
+      <div class="grid grid-cols-2 gap-2">
+        <button id="btn-open-notifs" class="hud-tile rounded-lg py-2 text-[11px] font-bold relative">🔔 通知(${unread})</button>
+        <button id="btn-open-log" class="hud-tile rounded-lg py-2 text-[11px] font-bold">📜 ログ</button>
+      </div>
+      <div id="hud-ap" class="text-xs font-bold text-center font-mono hud-accent">⚡ 行動力: ${state.actionPower} / ${state.baseActionPower}</div>
     </div>
   `));
   c.appendChild(el(`
-    <div class="hud-panel pointer-events-auto rounded-xl bg-white/90 shadow-lg p-3 text-[11px] space-y-1">
-      <div class="text-[11px] font-bold text-slate-700 mb-2">🎓 スキル状況</div>
+    <div class="hud-panel pointer-events-auto rounded-xl shadow-lg p-3 text-[11px] space-y-1">
+      <div class="text-[11px] font-bold hud-accent mb-2">🎓 スキル状況</div>
       ${skillRow('目利き力', 'appraisal')}${skillRow('交渉力', 'negotiation')}${skillRow('自主管理', 'selfmgmt')}
     </div>
   `));
   c.appendChild(el(`
-    <div class="mt-auto hud-panel pointer-events-auto rounded-xl bg-white/95 shadow-xl p-2">
+    <div class="mt-auto hud-panel pointer-events-auto rounded-xl shadow-xl p-2">
       <button id="btn-next-month-desk" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-xl py-4 font-bold text-base shadow-lg">📅 翌月へ進む ▶</button>
-      <div class="text-[11px] text-amber-700 font-bold text-center mt-1">⚡ 進むと行動力が全回復</div>
+      <div class="text-[11px] hud-accent font-bold text-center mt-1">⚡ 進むと行動力が全回復</div>
     </div>
   `));
   c.querySelector('#btn-open-search').addEventListener('click', openSearchModal);
   wireWorkButton(c.querySelector('#btn-work'));
   c.querySelector('#btn-open-listings').addEventListener('click', openListingsModal);
+  c.querySelector('#btn-open-props').addEventListener('click', () => openKpiModal('props'));
   c.querySelector('#btn-open-notifs').addEventListener('click', openNotificationsModal);
   c.querySelector('#btn-open-log').addEventListener('click', openLogModal);
   c.querySelector('#btn-next-month-desk').addEventListener('click', onNextMonth);
 }
 
 // === v3: 💼働く。1回タップ=1回、長押しで約120msごとに連続実行（行動力1につき¥1,000〜10,000）===
+// v5: 従来は暗い緑（text-emerald-600）で夜の地図に埋もれ、上昇量も38pxしかなく
+// スマホでは押している指の裏に出て見えなかった。白＋黒縁で拡大し、指の高さを完全に抜けるまで上げる。
+const EARN_RISE = 130;
 function floatEarn(btn, earned) {
   const r = btn.getBoundingClientRect();
-  const f = el(`<div class="fixed z-[60] pointer-events-none font-bold text-emerald-600 text-sm" style="left:${Math.round(r.left + r.width / 2 + (Math.random() * 44 - 22))}px; top:${Math.round(r.top - 6)}px; transition: top 0.8s ease-out, opacity 0.8s;">+${L.yen(earned)}</div>`);
+  const startY = Math.round(r.top - 24);
+  const f = el(`<div class="fixed z-[60] pointer-events-none font-bold text-white text-base" style="left:${Math.round(r.left + r.width / 2 + (Math.random() * 44 - 22))}px; top:${startY}px; transform:translateX(-50%); text-shadow:0 1px 0 #0f172a,0 -1px 0 #0f172a,1px 0 0 #0f172a,-1px 0 0 #0f172a,0 2px 8px rgba(0,0,0,0.7); transition: top 1.0s ease-out, opacity 1.0s;">+${L.yen(earned)}</div>`);
   document.body.appendChild(f);
-  requestAnimationFrame(() => { f.style.top = (r.top - 44) + 'px'; f.style.opacity = '0'; });
-  setTimeout(() => f.remove(), 850);
+  requestAnimationFrame(() => { f.style.top = (startY - EARN_RISE) + 'px'; f.style.opacity = '0'; });
+  setTimeout(() => f.remove(), 1100);
 }
 
 // v3: DIY・業者発注の直後、地図を該当物件へ向け、どの物件に何が起きたかをフロート表示する（約2.5秒）。
@@ -4390,26 +4611,59 @@ function openLockTeaser() {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
 
-// 翌月へ進む瞬間、シティビューの各建物から現金表示へコインが飛ぶ「回収」の動き。
+// 翌月へ進む瞬間、シティビューの各建物から現金表示へ💰（ドル袋）が飛ぶ「回収」の動き。
+// v5: 🪙のCSS直線移動をやめ、requestAnimationFrame で弧を描かせながら回転させる（ピンハネ帝国の集金の質感）。
+// 着弾すると現金表示がポップする。所有件数が多いと待ち時間が長くなるため最大12個までに丸める。
+const COIN_MAX = 12, COIN_FLY_MS = 780;
 function playCoinCollectAnimation() {
-  const cashTile = document.getElementById('hud-cash');
-  const spots = cityBuildingScreenPositions();
-  if (!cashTile || !spots.length) return;
+  const cashTile = document.getElementById('hud-cash') || document.querySelector('#mobile-status .ms-kpi[data-kpi="cash"]');
+  const all = cityBuildingScreenPositions();
+  if (!cashTile || !all.length) return;
+  const step = Math.max(1, Math.ceil(all.length / COIN_MAX));
+  const spots = all.filter((_, i) => i % step === 0).slice(0, COIN_MAX);
   const dest = cashTile.getBoundingClientRect();
   const destX = dest.left + dest.width / 2, destY = dest.top + dest.height / 2;
-  spots.forEach((pos, i) => {
-    const coin = el(`<div class="fixed z-50 text-xl pointer-events-none" style="left:${pos.x}px; top:${pos.y - 30}px; transition: left 0.7s ease-in, top 0.7s ease-in, opacity 0.7s;">🪙</div>`);
-    document.body.appendChild(coin);
-    setTimeout(() => {
-      coin.style.left = destX + 'px'; coin.style.top = destY + 'px'; coin.style.opacity = '0.2';
-      sfxCoin();
-    }, i * 90 + 20);
-    setTimeout(() => coin.remove(), i * 90 + 760);
-  });
+  const delay = spots.length > 6 ? 60 : 90;
+
+  spots.forEach((pos, i) => setTimeout(() => {
+    const bag = el(`<div class="fixed z-50 pointer-events-none" style="left:0;top:0;font-size:22px;will-change:transform;">💰</div>`);
+    document.body.appendChild(bag);
+    sfxCoin();
+    const sx = pos.x, sy = pos.y - 26;
+    // 出発点と着弾点の中間を上に持ち上げた制御点で二次ベジェを描く＝放物線状の弧になる
+    const ctrlX = (sx + destX) / 2 + (sx < destX ? 30 : -30);
+    const ctrlY = Math.min(sy, destY) - 90;
+    const spin = (i % 2 ? 1 : -1) * 320;
+    const t0 = performance.now();
+    const tick = (now) => {
+      const t = Math.min(1, (now - t0) / COIN_FLY_MS);
+      const u = 1 - t;
+      const x = u * u * sx + 2 * u * t * ctrlX + t * t * destX;
+      const y = u * u * sy + 2 * u * t * ctrlY + t * t * destY;
+      bag.style.transform = `translate(${x}px, ${y}px) translate(-50%,-50%) rotate(${spin * t}deg) scale(${1 - t * 0.45})`;
+      bag.style.opacity = String(t > 0.85 ? (1 - t) / 0.15 : 1);
+      if (t < 1) requestAnimationFrame(tick);
+      else { bag.remove(); popCashTile(cashTile); }
+    };
+    requestAnimationFrame(tick);
+  }, i * delay + 20));
 }
 
+// 着弾のたびに現金表示を弾ませる（ピンハネ帝国の cashPop 相当）
+function popCashTile(tile) {
+  tile.style.transition = 'transform 0.14s ease-out';
+  tile.style.transform = 'scale(1.12)';
+  setTimeout(() => { tile.style.transform = 'scale(1)'; }, 140);
+}
+
+// v5: 翌月ボタンで地球儀が初期位置へ戻るのにかかる時間。集金演出はこれを待ってから始める。
+// 先に飛ばすと、プレイヤーが地球儀の裏側を向けたまま翌月を押したときに建物が画面外にあり、
+// 演出が丸ごと空振りしてしまう（実機検証で発見）。
+const VIEW_RESET_MS = 1400;
+
 function onNextMonth() {
-  if (state.properties.length) playCoinCollectAnimation();
+  animateResetView(VIEW_RESET_MS);   // v5: 翌月のときだけ、地球儀がゆっくり回って初期位置へ戻る
+  if (state.properties.length) setTimeout(playCoinCollectAnimation, VIEW_RESET_MS);
   const nextMonth = state.month + 1;
   const settling = (state.pendingSales || []).filter(x => x.settleMonth <= nextMonth)
     .map(x => { const pp = state.properties.find(p => p.id === x.propertyId); return { sale: x, label: pp ? (pp.name || pp.label) : '物件' }; });
