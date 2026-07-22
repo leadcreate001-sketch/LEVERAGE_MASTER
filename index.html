@@ -693,18 +693,55 @@ export function startRestore(state, propertyId, unitIndex, opts = {}) {
 // 100%まで戻すには足場を組む大規模修繕が必要で、こちらは業者のみ。
 export const REPAIR_KINDS = {
   maint: { label: '日常メンテ・小規模補修', detail: '清掃・草刈り・部分クロス張替',
-    diyable: true,  costRate: 0.02, minCost: 30_000, gain: 15, cap: 70, diyAp: 10, diyStep: 25 },
-  large: { label: '大規模修繕', detail: '外壁・屋根・防水',
-    diyable: false, costRate: 0.10, minCost: 50_000, gain: null, cap: 100, diyAp: 0, diyStep: 0,
+    diyable: true,  gain: 15, cap: 70, diyAp: 10, diyStep: 25 },
+  large: { label: '大規模修繕', detail: '外壁・屋根・防水（足場）',
+    diyable: false, gain: null, cap: 100, diyAp: 0, diyStep: 0,
     blockedReason: '足場の設置と高所・構造の作業が必要なため、業者にしか頼めません' },
 };
 
-// 工事種別ごとの業者見積もり
+// v5.1: 修繕費は「建物の規模（戸数・構造）」で決める。物件価格には依存させない。
+// 従来は price×係数だったため、40万円の訳あり戸建ての大規模修繕が5万円で直る／
+// RCマンションの清掃が630万円になる、といった非現実が出ていた。実際の工事費は
+// 足場・外壁面積・戸数といった物理量で決まり、市場価格とは無関係。
+const LARGE_SCAFFOLD    = { '木造': 300_000, 'S': 500_000, 'RC': 700_000 };  // 足場・共通仮設の基本額
+const LARGE_SCAFFOLD_PU = 60_000;                                            // 戸数ぶんの足場加算
+const LARGE_PER_UNIT    = { '木造': 700_000, 'S': 900_000, 'RC': 1_150_000 };// 外壁・屋根・防水の1戸あたり材工
+const MAINT_PER_UNIT    = 25_000;   // 日常メンテ（清掃・草刈り・部分クロス）の1戸あたり
+const MAINT_CAP         = 400_000;  // 小工事なので上限を低く（清掃が数百万円になる非現実を防ぐ）
+const MAINT_FLOOR       = 30_000;
+
+// 工事種別ごとの業者見積もり（建物規模ベース）
 export function repairCost(property, kind) {
-  const k = REPAIR_KINDS[kind];
-  if (!k) return 0;
   const gap = Math.max(0, 100 - property.repairState);
-  return Math.max(k.minCost, Math.round(property.price * k.costRate * gap / 100 / 10000) * 10000);
+  const units = property.units.length;
+  const st = property.structure;
+  if (kind === 'maint') {
+    const raw = Math.round(MAINT_PER_UNIT * units * gap / 100 / 1000) * 1000;
+    return Math.min(MAINT_CAP, Math.max(MAINT_FLOOR, raw));
+  }
+  if (kind === 'large') {
+    const scaffold = (LARGE_SCAFFOLD[st] ?? 400_000) + LARGE_SCAFFOLD_PU * units;
+    const material = (LARGE_PER_UNIT[st] ?? 800_000) * units * (gap / 100);
+    return Math.round((scaffold + material) / 10000) * 10000;
+  }
+  return 0;
+}
+
+// 大規模修繕の工期は建物規模で決まる（足場を伴うため戸数が多いほど長い）。
+export function largeRepairMonths(property) {
+  const u = property.units.length;
+  return u <= 1 ? 1 : u <= 8 ? 2 : u <= 16 ? 3 : 4;
+}
+// 工事の工期（日常メンテは常に1ヶ月・大規模修繕は規模ベース）。
+export function repairJobMonths(property, kind) {
+  return kind === 'large' ? largeRepairMonths(property) : 1;
+}
+
+// 大規模修繕の工事内容は建物種別で異なる。区分は建物外壁ではなく専有部（室内）を直す。
+export function repairDetail(property, kind) {
+  if (kind !== 'large') return REPAIR_KINDS[kind]?.detail || '';
+  const isKubun = property.genreKey === 'kubun' || property.genreKey === 'w_kubun';
+  return isKubun ? '専有部フルリフォーム（内装・設備）' : '外壁・屋根・防水（足場）';
 }
 
 // 工事後に到達する修繕度（日常メンテは+15かつ70上限、大規模修繕は100）
@@ -754,7 +791,7 @@ export function startRepair(state, propertyId, kind, opts = {}) {
   } else {
     s.cash -= cost;
   }
-  const monthsTotal = repairMonthsForCost(cost);
+  const monthsTotal = repairJobMonths(p, kind);
   p.repairJob = { kind, monthsTotal, monthsLeft: monthsTotal, startState: p.repairState };
   return { state: s, started: true, diy: false, cost, loanAmount, financed: !!opts.financed, monthsTotal };
 }
@@ -776,9 +813,9 @@ export function reformLoansRemaining(p) {
 }
 
 // === 業者への修繕依頼（DIYより高コストだが一括で修繕度100・リフォームローン利用可）===
+// v5.1: 大規模修繕(large)と同じ規模ベースの見積もりを使う（旧APIの互換維持のため薄い委譲）。
 export function professionalRepairCost(property) {
-  const gap = Math.max(0, 100 - property.repairState);
-  return Math.max(50000, Math.round(property.price * 0.10 * gap / 100 / 10000) * 10000);
+  return repairCost(property, 'large');
 }
 
 export function reformLoanAmount(cost, creditScore) {
@@ -810,7 +847,7 @@ export function startProfessionalRepair(state, propertyId, financed = false) {
   } else {
     s.cash -= cost;
   }
-  const monthsTotal = repairMonthsForCost(cost);
+  const monthsTotal = largeRepairMonths(p);
   p.repairJob = { monthsTotal, monthsLeft: monthsTotal, startState: p.repairState };
   return { state: s, started: true, cost, loanAmount, financed: canFinance, monthsTotal };
 }
@@ -1602,7 +1639,7 @@ export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) 
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, restoreCost, startRestore, REPAIR_KINDS, repairCost, repairResultState, startRepair, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, restoreCost, startRestore, REPAIR_KINDS, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -3871,7 +3908,7 @@ function workOptions(p, category) {
   const mk = L.REPAIR_KINDS.maint, lg = L.REPAIR_KINDS.large;
   const maintGoal = L.repairResultState(p, 'maint');
   out.push({
-    type: 'maint', label: mk.label, detail: mk.detail,
+    type: 'maint', label: mk.label, detail: L.repairDetail(p, 'maint'),
     effect: `修繕度 ${p.repairState}% → ${maintGoal}%`,
     cost: L.repairCost(p, 'maint'), diyable: true, diyAp: mk.diyAp,
     disabled: maintGoal <= p.repairState,
@@ -3879,7 +3916,7 @@ function workOptions(p, category) {
     progress: (p.diyProgress && p.diyProgress.kind === 'maint') ? p.diyProgress.done : 0,
   });
   out.push({
-    type: 'large', label: lg.label, detail: lg.detail,
+    type: 'large', label: lg.label, detail: L.repairDetail(p, 'large'),
     effect: `修繕度 ${p.repairState}% → 100%・資産価値+8%`,
     cost: L.repairCost(p, 'large'), diyable: false, blockedReason: lg.blockedReason,
     disabled: p.repairState >= 100, disabledReason: '修繕度は既に100%です',
@@ -3931,7 +3968,7 @@ function openWorkMenu(propId, category, back) {
       const material = Math.round(sel.cost * L.DIY_MATERIAL_RATE);
       const months = sel.type === 'restore' ? 1
         : sel.type === 'valueup' ? L.VALUE_UP_PLANS[sel.planKey].months
-        : L.repairMonthsForCost(sel.cost);
+        : L.repairJobMonths(p, sel.type);
       body = `${head(true)}<h2 class="font-bold">${sel.label}</h2>
         <div class="text-xs text-slate-500">${sel.effect}</div>
         <button id="wk-diy" class="w-full border-2 rounded-lg p-3 text-left ${sel.diyable ? 'hover:bg-slate-50 border-emerald-500' : 'opacity-50'}" ${sel.diyable ? '' : 'disabled'}>
@@ -3992,20 +4029,157 @@ function openWorkMenu(propId, category, back) {
   draw();
 }
 
-// DIYは「壊れている箇所をタップして直す」1セッション＝ロジック1回ぶんの作業。
-// 作業量ゲージが貯まりきるまで何セッションか繰り返すことになる。
-const DIY_SPOT_POOL = [
-  { l: 30, t: 40, e: '🕸️' }, { l: 66, t: 32, e: '🕳️' }, { l: 48, t: 58, e: '🩹' },
-  { l: 22, t: 72, e: '🌿' }, { l: 76, t: 70, e: '🌿' }, { l: 54, t: 26, e: '💧' },
-];
+// v5.1: DIYミニゲームは「工事内容ごとに違うビジュアル」。絵文字をやめ、地図の建物と同じく図形で描く。
+// ボロ設備をタップすると新品に切り替わる。工事内容で背景（外観／室内／水回り）と対象物が変わる。
+// 大規模修繕は業者のみなのでここには出ない。
+
+// 各アイテムは (state) => SVG中身（viewBox 0 0 64 64）。'b'=ボロ, 'a'=新品。
+const OK = `<path d="M45 12 l3 3 l6 -8" stroke="#16a34a" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`;
+const DIY_ART = {
+  // 外まわり（日常メンテ）
+  web: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#e8eef2"/><path d="M2 2 L2 30 M2 2 L30 2" stroke="#cdd6dd" stroke-width="2"/>
+       <path d="M2 2 L22 22 M2 12 Q12 12 12 2 M2 20 Q20 20 20 2 M2 27 Q27 27 27 2" stroke="#aab4bd" stroke-width="1" fill="none"/>
+       <circle cx="17" cy="17" r="3" fill="#5b6470"/><path d="M14 17h-3 M20 17h3 M17 14v-3 M17 20v3" stroke="#5b6470" stroke-width="1"/>`
+    : `<rect width="64" height="64" fill="#eef5f9"/><path d="M2 2 L2 30 M2 2 L30 2" stroke="#cdd6dd" stroke-width="2"/>${OK}`,
+  weed: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef5f9"/><rect y="46" width="64" height="18" fill="#c8a06a"/>
+       <path d="M14 46 q-3 -18 -1 -24 M18 46 q2 -14 6 -20 M24 46 q0 -20 -3 -26 M40 46 q4 -16 9 -22 M46 46 q-2 -18 1 -24" stroke="#4d8a3a" stroke-width="3" fill="none" stroke-linecap="round"/>
+       <circle cx="49" cy="20" r="4" fill="#e6edb0"/>`
+    : `<rect width="64" height="64" fill="#eef5f9"/><rect y="46" width="64" height="18" fill="#caa878"/>
+       <path d="M12 46 v-4 M20 46 v-3 M28 46 v-4 M38 46 v-3 M46 46 v-4 M54 46 v-3" stroke="#5aa14a" stroke-width="2" stroke-linecap="round"/>${OK}`,
+  grime: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#d9cbb0"/><path d="M0 16h64 M0 32h64 M0 48h64" stroke="#c3b596" stroke-width="1.5"/>
+       <path d="M20 4 q-4 24 2 56" stroke="#5c6b4a" stroke-width="7" fill="none" opacity="0.5"/>
+       <path d="M44 8 q3 20 -1 48" stroke="#4a4636" stroke-width="5" fill="none" opacity="0.45"/>
+       <ellipse cx="30" cy="40" rx="9" ry="6" fill="#6f7d4e" opacity="0.5"/>`
+    : `<rect width="64" height="64" fill="#efe6d3"/><path d="M0 16h64 M0 32h64 M0 48h64" stroke="#d9cdb3" stroke-width="1.5"/>${OK}`,
+  leaf: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef5f9"/><rect y="48" width="64" height="16" fill="#c8a06a"/>
+       <ellipse cx="18" cy="44" rx="6" ry="3" fill="#9a6b32" transform="rotate(-20 18 44)"/>
+       <ellipse cx="34" cy="50" rx="6" ry="3" fill="#b07a3a" transform="rotate(15 34 50)"/>
+       <ellipse cx="48" cy="45" rx="6" ry="3" fill="#8a5f2c" transform="rotate(-10 48 45)"/>
+       <circle cx="28" cy="42" r="2.5" fill="#7d5a2e"/>`
+    : `<rect width="64" height="64" fill="#eef5f9"/><rect y="48" width="64" height="16" fill="#caa878"/>${OK}`,
+  // 室内（原状回復）
+  wallstain: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#e3d8c0"/><path d="M8 6 L4 6 L4 14 Z" fill="#cbbf9f"/>
+       <ellipse cx="34" cy="30" rx="14" ry="10" fill="#a98d5c" opacity="0.5"/><ellipse cx="46" cy="46" rx="8" ry="6" fill="#8f7a4e" opacity="0.45"/>
+       <path d="M20 4 v56 M44 4 v56" stroke="#cdbf9c" stroke-width="1"/>`
+    : `<rect width="64" height="64" fill="#f7f8fb"/><path d="M20 2 v60 M44 2 v60" stroke="#e6ebf1" stroke-width="1.5"/>${OK}`,
+  floor: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#a97e4e"/><path d="M0 16h64 M0 32h64 M0 48h64" stroke="#8a6338" stroke-width="2"/>
+       <path d="M10 8 L30 24 M40 40 L58 52" stroke="#6f4e2a" stroke-width="2"/><path d="M14 44 L26 40" stroke="#e8d3b0" stroke-width="2"/>
+       <ellipse cx="46" cy="20" rx="6" ry="3" fill="#5f4326" opacity="0.6"/>`
+    : `<rect width="64" height="64" fill="#c99a63"/><path d="M0 16h64 M0 32h64 M0 48h64" stroke="#b5854f" stroke-width="2"/>
+       <path d="M6 6 L58 6" stroke="#f0dcb8" stroke-width="3" opacity="0.7"/>${OK}`,
+  pinhole: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#e6dcc7"/><circle cx="20" cy="20" r="2.5" fill="#7a6b4c"/><circle cx="40" cy="16" r="2" fill="#7a6b4c"/>
+       <circle cx="30" cy="38" r="3" fill="#6f6045"/><circle cx="46" cy="44" r="2.5" fill="#7a6b4c"/><path d="M26 34 q4 4 8 1" stroke="#8a795a" stroke-width="1.5" fill="none"/>`
+    : `<rect width="64" height="64" fill="#f5f2ea"/><circle cx="30" cy="30" r="18" fill="#faf8f2"/>${OK}`,
+  ceiling: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#e8e0cf"/><ellipse cx="30" cy="26" rx="16" ry="11" fill="#c7b487" opacity="0.55"/>
+       <ellipse cx="42" cy="40" rx="9" ry="6" fill="#b39f6c" opacity="0.5"/><path d="M6 6 h52" stroke="#d3c6a6" stroke-width="2"/>`
+    : `<rect width="64" height="64" fill="#fafbfd"/><path d="M6 6 h52" stroke="#eef1f5" stroke-width="2"/>${OK}`,
+  // 設備（価値UP・軽）
+  ac: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef2f5"/><g transform="rotate(-3 32 30)">
+       <rect x="8" y="20" width="48" height="17" rx="4" fill="#e4d8bb" stroke="#b4a480" stroke-width="2"/>
+       <rect x="8" y="20" width="48" height="5" rx="2" fill="#d3c39c"/><rect x="12" y="33" width="40" height="4" rx="2" fill="#c8b78e"/>
+       <path d="M22 21 v14 M30 21 v14 M38 21 v14" stroke="#c2b088" stroke-width="1"/>
+       <path d="M18 24 q2 8 0 12 M46 25 q2 7 0 11" stroke="#9c8a5e" stroke-width="2" opacity="0.5" fill="none"/><circle cx="30" cy="44" r="2" fill="#9fb0b8"/></g>`
+    : `<rect width="64" height="64" fill="#eef7fb"/><rect x="8" y="20" width="48" height="17" rx="4" fill="#fbfdff" stroke="#c7d3de" stroke-width="2"/>
+       <rect x="8" y="20" width="48" height="5" rx="2" fill="#e8eef4"/><rect x="12" y="33" width="40" height="4" rx="2" fill="#dbe6f0"/>
+       <path d="M20 44 q3 5 0 10 M32 45 q3 5 0 10 M44 44 q3 5 0 10" stroke="#5cc2f0" stroke-width="2" fill="none" stroke-linecap="round"/>${OK}`,
+  light: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#e9edf0"/><line x1="32" y1="4" x2="32" y2="22" stroke="#8a8577" stroke-width="2"/>
+       <circle cx="32" cy="30" r="9" fill="#e6d79a" stroke="#b8a86e" stroke-width="1.5"/><path d="M28 38 q4 4 8 0" stroke="#b8a86e" stroke-width="1.5" fill="none"/>
+       <circle cx="24" cy="46" r="1" fill="#9a9384"/><circle cx="42" cy="48" r="1" fill="#9a9384"/>`
+    : `<rect width="64" height="64" fill="#f2f8fd"/><ellipse cx="32" cy="32" rx="22" ry="18" fill="#fff7d6" opacity="0.7"/>
+       <rect x="16" y="20" width="32" height="12" rx="4" fill="#fbfdff" stroke="#cdd8e2" stroke-width="1.5"/>
+       <path d="M32 8 v6 M14 18 l4 4 M50 18 l-4 4 M8 32 h6 M56 32 h-6" stroke="#facc15" stroke-width="2" stroke-linecap="round"/>
+       <path d="M45 46 l3 3 l6 -8" stroke="#16a34a" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+  door: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef2f5"/><rect x="18" y="8" width="28" height="50" rx="1" fill="#9c7f57" stroke="#6f5836" stroke-width="2"/>
+       <rect x="23" y="14" width="18" height="16" fill="#8a6f49"/><rect x="23" y="34" width="18" height="18" fill="#8a6f49"/><circle cx="40" cy="34" r="2" fill="#6f5836"/>
+       <path d="M24 44 q3 6 6 2" stroke="#5f4a2c" stroke-width="1.5" fill="none" opacity="0.6"/>`
+    : `<rect width="64" height="64" fill="#eef7fb"/><rect x="18" y="8" width="28" height="50" rx="1" fill="#f2ede3" stroke="#cdbfa4" stroke-width="2"/>
+       <rect x="23" y="14" width="18" height="16" fill="#e6dcc9"/><rect x="23" y="34" width="18" height="18" fill="#e6dcc9"/><circle cx="40" cy="34" r="2.5" fill="#b9a17a"/>${OK}`,
+  outlet: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef2f5"/><rect x="20" y="14" width="24" height="36" rx="4" fill="#e2d7bd" stroke="#b7a884" stroke-width="2"/>
+       <rect x="27" y="22" width="10" height="8" rx="1" fill="#c9b78d"/><circle cx="29" cy="40" r="1.6" fill="#8f7d55"/><circle cx="35" cy="40" r="1.6" fill="#8f7d55"/>
+       <path d="M24 44 q4 3 8 0" stroke="#9c8a5e" stroke-width="1.5" fill="none" opacity="0.5"/>`
+    : `<rect width="64" height="64" fill="#eef7fb"/><rect x="20" y="14" width="24" height="36" rx="4" fill="#fbfdff" stroke="#c7d3de" stroke-width="2"/>
+       <rect x="27" y="22" width="10" height="8" rx="1" fill="#e6edf3"/><circle cx="29" cy="40" r="1.6" fill="#aebccb"/><circle cx="35" cy="40" r="1.6" fill="#aebccb"/>${OK}`,
+  // 水回り（価値UP・標）
+  kitchen: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef2f5"/><rect x="6" y="34" width="52" height="24" fill="#9c7f57" stroke="#6f5836" stroke-width="2"/>
+       <line x1="32" y1="34" x2="32" y2="58" stroke="#6f5836" stroke-width="1.5"/><rect x="6" y="28" width="52" height="7" fill="#b3a687" stroke="#8a7d63" stroke-width="1.5"/>
+       <rect x="18" y="29" width="20" height="5" rx="1" fill="#7d7365"/><path d="M46 29 v-9 h-7" stroke="#7a7266" stroke-width="3" fill="none"/>
+       <path d="M46 20 q0 6 -2 9" stroke="#9fb0b8" stroke-width="1.5" fill="none"/><ellipse cx="20" cy="46" rx="5" ry="4" fill="#7a6444" opacity="0.5"/>`
+    : `<rect width="64" height="64" fill="#eef7fb"/><rect x="6" y="34" width="52" height="24" fill="#eef2f6" stroke="#cbd5df" stroke-width="2"/>
+       <line x1="32" y1="34" x2="32" y2="58" stroke="#cbd5df" stroke-width="1.5"/><circle cx="24" cy="46" r="1.5" fill="#94a3b8"/><circle cx="40" cy="46" r="1.5" fill="#94a3b8"/>
+       <rect x="6" y="28" width="52" height="7" fill="#dfe6ec" stroke="#c1ccd6" stroke-width="1.5"/><rect x="18" y="29" width="20" height="5" rx="1" fill="#cbd8e0"/>
+       <path d="M46 29 v-9 h-7" stroke="#9fb0c0" stroke-width="3" fill="none"/>${OK}`,
+  toilet: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef2f5"/><rect x="20" y="12" width="24" height="15" rx="2" fill="#ddd4c0" stroke="#b3a884" stroke-width="2"/>
+       <ellipse cx="32" cy="42" rx="15" ry="11" fill="#ddd4c0" stroke="#b3a884" stroke-width="2"/><ellipse cx="32" cy="42" rx="8" ry="5" fill="#b6a97f"/>
+       <path d="M26 34 q3 10 1 16" stroke="#9c8355" stroke-width="2" fill="none" opacity="0.55"/><path d="M40 30 v6" stroke="#8f7a4e" stroke-width="1.5"/>`
+    : `<rect width="64" height="64" fill="#eef7fb"/><rect x="20" y="12" width="24" height="15" rx="2" fill="#fbfdff" stroke="#c7d3de" stroke-width="2"/>
+       <ellipse cx="32" cy="42" rx="15" ry="11" fill="#fbfdff" stroke="#c7d3de" stroke-width="2"/><ellipse cx="32" cy="42" rx="8" ry="5" fill="#bfe3f7"/>
+       <path d="M45 10 l3 3 l6 -8" stroke="#16a34a" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+  bath: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef2f5"/><path d="M8 30 L56 30 L52 52 Q52 56 46 56 L18 56 Q12 56 12 52 Z" fill="#d8cfc0" stroke="#b3a884" stroke-width="2"/>
+       <rect x="6" y="26" width="52" height="6" rx="3" fill="#c8bda6" stroke="#a89c80" stroke-width="1.5"/>
+       <path d="M24 34 q2 12 -1 20" stroke="#9c8355" stroke-width="2" fill="none" opacity="0.5"/><circle cx="40" cy="50" r="3" fill="#8a7550" opacity="0.6"/>`
+    : `<rect width="64" height="64" fill="#eef7fb"/><path d="M8 30 L56 30 L52 52 Q52 56 46 56 L18 56 Q12 56 12 52 Z" fill="#fbfdff" stroke="#c7d3de" stroke-width="2"/>
+       <path d="M12 40 L54 40 L52 50 Q52 53 47 53 L19 53 Q14 53 14 50 Z" fill="#bfe3f7"/><rect x="6" y="26" width="52" height="6" rx="3" fill="#eaf1f7" stroke="#cdd8e2" stroke-width="1.5"/>${OK}`,
+  faucet: s => s === 'b'
+    ? `<rect width="64" height="64" fill="#eef2f5"/><rect x="12" y="40" width="40" height="16" rx="3" fill="#cbbfa4" stroke="#a89c80" stroke-width="2"/>
+       <ellipse cx="32" cy="48" rx="12" ry="5" fill="#8f8161"/><path d="M32 40 v-12 h-9" stroke="#9a8d6c" stroke-width="3" fill="none"/>
+       <path d="M32 28 q0 5 -2 8" stroke="#9fb0b8" stroke-width="1.5" fill="none"/><ellipse cx="24" cy="48" rx="3" ry="2" fill="#7a6b48" opacity="0.5"/>`
+    : `<rect width="64" height="64" fill="#eef7fb"/><rect x="12" y="40" width="40" height="16" rx="3" fill="#eef2f6" stroke="#c1ccd6" stroke-width="2"/>
+       <ellipse cx="32" cy="48" rx="12" ry="5" fill="#cbd8e0"/><path d="M32 40 v-12 h-9" stroke="#9fb0c0" stroke-width="3" fill="none"/>${OK}`,
+};
+// 背景（外観／室内／水回り）。220×176 のステージ全面。
+function diyBackdrop(kind) {
+  if (kind === 'exterior') return `<svg viewBox="0 0 220 176" width="220" height="176">
+    <defs><linearGradient id="dsky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#bfe3ff"/><stop offset="1" stop-color="#e8f4ff"/></linearGradient></defs>
+    <rect width="220" height="176" fill="url(#dsky)"/><rect y="132" width="220" height="44" fill="#8fbf6a"/>
+    <rect x="64" y="60" width="92" height="76" fill="#e7d9b6"/><rect x="60" y="58" width="100" height="8" fill="#c9b787"/>
+    <polygon points="58,60 110,30 162,60" fill="#9a5a34"/><rect x="98" y="106" width="24" height="30" fill="#7a5230"/></svg>`;
+  if (kind === 'water') return `<svg viewBox="0 0 220 176" width="220" height="176">
+    <rect width="220" height="176" fill="#e7eef2"/><rect y="120" width="220" height="56" fill="#b9c6cf"/>
+    <rect x="20" y="96" width="180" height="26" fill="#cdd8de"/><rect x="20" y="92" width="180" height="6" fill="#9fb0ba"/></svg>`;
+  return `<svg viewBox="0 0 220 176" width="220" height="176">
+    <rect width="220" height="176" fill="#efe7db"/><rect y="128" width="220" height="48" fill="#c8a877"/>
+    <polygon points="0,128 40,108 180,108 220,128" fill="#d8cbb6"/>
+    <rect x="150" y="52" width="46" height="42" fill="#bfe0f2" stroke="#9bb6c6" stroke-width="3"/>
+    <line x1="173" y1="52" x2="173" y2="94" stroke="#9bb6c6" stroke-width="2"/><line x1="150" y1="73" x2="196" y2="73" stroke="#9bb6c6" stroke-width="2"/></svg>`;
+}
+// 工事内容 → 背景・対象アイテム・配置。DIY可能な4種のみ（大規模修繕は業者専用で出ない）。
+const DIY_KITS = {
+  maint:   { bg: 'exterior', items: ['web', 'weed', 'grime', 'leaf'] },
+  restore: { bg: 'room',     items: ['wallstain', 'floor', 'pinhole', 'ceiling'] },
+  equip:   { bg: 'room',     items: ['ac', 'light', 'door', 'outlet'] },
+  water:   { bg: 'water',    items: ['kitchen', 'toilet', 'bath', 'faucet'] },
+};
+const DIY_POS = [{ l: 27, t: 34 }, { l: 71, t: 30 }, { l: 30, t: 74 }, { l: 73, t: 72 }];
+function diyKitFor(sel) {
+  if (sel.type === 'restore') return 'restore';
+  if (sel.type === 'valueup') return sel.planKey === 'standard' ? 'water' : 'equip';
+  return 'maint';
+}
+
 function openDiySession(propId, sel, category, back) {
   const p = state.properties.find(x => x.id === propId);
   if (!p) return;
   const m = document.getElementById('diy-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
-  const n = 4;
-  const spots = DIY_SPOT_POOL.slice(0, n);
+  const kit = DIY_KITS[diyKitFor(sel)];
+  const items = kit.items;
+  const n = items.length;
   const before = Math.min(100, Math.round(sel.progress || 0));
   let fixed = 0;
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-2">
@@ -4013,26 +4187,28 @@ function openDiySession(propId, sel, category, back) {
     <div class="text-xs text-slate-500">材料費 ${L.yen(Math.round(sel.cost * L.DIY_MATERIAL_RATE))}${before > 0 ? '（支払い済み）' : ''}・行動力-${sel.diyAp}。傷んだ箇所をタップして直そう！</div>
     <div class="w-full bg-slate-200 rounded-full h-2 overflow-hidden"><div class="bg-emerald-500 h-2 transition-all" style="width:${before}%"></div></div>
     <div class="text-xs text-slate-600 text-center">全体の進捗 ${before}%</div>
-    <div id="diy-stage" class="relative mx-auto rounded-lg bg-sky-50" style="width:220px;height:176px;">
-      <div class="absolute inset-0 flex items-center justify-center">${renderBuildingSVG(p, 'w-40 h-32')}</div>
+    <div id="diy-stage" class="relative mx-auto rounded-lg overflow-hidden" style="width:220px;height:176px;">
+      <div class="absolute inset-0">${diyBackdrop(kit.bg)}</div>
     </div>
     <div class="text-center text-sm font-bold" id="diy-progress">0 / ${n} 直した</div>
     <button id="diy-cancel" class="w-full text-slate-500 text-sm">やめる（この回の作業は行われません）</button></div>`);
   m.appendChild(box);
   const stage = box.querySelector('#diy-stage');
-  spots.forEach(sp => {
-    const spot = el(`<button class="diy-spot absolute text-2xl leading-none" style="left:${sp.l}%;top:${sp.t}%;transform:translate(-50%,-50%);">${sp.e}</button>`);
+  items.forEach((key, i) => {
+    const pos = DIY_POS[i % DIY_POS.length];
+    const spot = el(`<button class="diy-spot absolute" style="left:${pos.l}%;top:${pos.t}%;transform:translate(-50%,-50%);width:60px;height:60px;padding:0;border:0;background:transparent;cursor:pointer;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.25));">
+      <svg viewBox="0 0 64 64" width="60" height="60" style="border-radius:8px;">${DIY_ART[key]('b')}</svg></button>`);
     stage.appendChild(spot);
     spot.addEventListener('click', () => {
       if (spot.dataset.done) return;
       spot.dataset.done = '1';
-      spot.textContent = '✨';
-      spot.style.transition = 'opacity 0.5s, transform 0.5s';
-      requestAnimationFrame(() => { spot.style.opacity = '0'; spot.style.transform = 'translate(-50%,-50%) scale(1.9)'; });
+      spot.querySelector('svg').innerHTML = DIY_ART[key]('a');
+      spot.style.transition = 'transform 0.35s';
+      spot.animate([{ transform: 'translate(-50%,-50%) scale(0.7)' }, { transform: 'translate(-50%,-50%) scale(1.15)' }, { transform: 'translate(-50%,-50%) scale(1)' }], { duration: 400, easing: 'ease-out' });
       sfxKnock();
       fixed++;
       box.querySelector('#diy-progress').textContent = `${fixed} / ${n} 直した`;
-      if (fixed >= n) setTimeout(() => { close(); applyDiy(propId, sel, category, back); }, 560);
+      if (fixed >= n) setTimeout(() => { close(); applyDiy(propId, sel, category, back); }, 520);
     });
   });
   box.querySelector('#diy-close').addEventListener('click', close);
