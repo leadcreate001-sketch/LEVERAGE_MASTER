@@ -6,8 +6,15 @@
 <title>レバレッジ・マスター 〜メガ大家への道〜</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
+  // emerald をスカラーで書くと Tailwind 既定の emerald スケール(50〜950)を丸ごと上書きしてしまい、
+  // bg-emerald-100 / text-emerald-700 といった濃淡指定が全て無効（背景色なし）になる。
+  // DEFAULT 付きのオブジェクトにすることで、bg-emerald（既存コードが多用）と濃淡の両方が使える。
   tailwind.config = { theme: { extend: { colors: {
-    ink: '#1e293b', navy: '#1e3a5f', emerald: '#059669', canvas: '#f8fafc' } } } };
+    ink: '#1e293b', navy: '#1e3a5f', canvas: '#f8fafc',
+    emerald: { DEFAULT: '#059669',
+      50: '#ecfdf5', 100: '#d1fae5', 200: '#a7f3d0', 300: '#6ee7b7', 400: '#34d399',
+      500: '#10b981', 600: '#059669', 700: '#047857', 800: '#065f46', 900: '#064e3b', 950: '#022c22' },
+  } } } };
 </script>
 <style>
   html, body { font-family: system-ui, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; height: 100%; overscroll-behavior: none; }
@@ -28,6 +35,53 @@
   .hud-tile:hover { background: rgba(71,85,105,0.75); }
   .hud-track  { background: rgba(2,6,23,0.75); border: 1px solid #334155; }
   .hud-divide { border-top: 1px solid #334155; }
+
+  /* v6.2: 用語ヘルプ。目印は点線の下線だけにする（色や太字で強調すると本文が読みにくくなる）。
+     ポインタを合わせるだけで吹き出しが出る。タッチ端末にはホバーが無いのでタップでも出す。
+     ヘッダーの 📖 トグルがOFFのときは .terms-off が付き、下線も反応も消える。 */
+  .term {
+    border-bottom: 1px dotted currentColor;
+    cursor: help; white-space: nowrap;
+  }
+  .terms-off .term { border-bottom: none; cursor: inherit; }
+  /* 吹き出し本体。画面端でははみ出さないよう、JS側で left を丸めて配置する。 */
+  .term-pop {
+    position: fixed; z-index: 80; max-width: 19rem;
+    background: #1e293b; color: #f1f5f9;
+    border-radius: 10px; padding: 10px 12px; font-size: 12px; line-height: 1.6;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  .term-pop b { color: #fbbf24; }
+  .term-pop .tp-hint { color: #94a3b8; }
+  .term-pop .tp-calc {
+    background: rgba(148,163,184,0.18); border-left: 3px solid #38bdf8;
+    border-radius: 4px; padding: 4px 6px; color: #e0f2fe;
+  }
+  /* 実務でも通じる用語か、このゲームだけの指標かのバッジ */
+  .term-pop .tp-scope {
+    font-size: 10px; border-radius: 999px; padding: 1px 7px; vertical-align: middle;
+  }
+  .term-pop .tp-real { background: rgba(148,163,184,0.28); color: #cbd5e1; }
+  .term-pop .tp-game { background: rgba(251,191,36,0.22); color: #fcd34d; }
+  /* 読み仮名（種銭＝たねせん のように初見で読み違えやすい語に付ける） */
+  .term-pop .tp-yomi { font-size: 11px; color: #94a3b8; font-weight: normal; }
+  /* 吹き出しの脚注。用語集の開き方をここでも案内する（チュートリアルを飛ばした人にも届く） */
+  .term-pop .tp-foot {
+    font-size: 10px; color: #94a3b8;
+    border-top: 1px solid rgba(148,163,184,0.28); padding-top: 5px;
+  }
+
+  /* v7.2: チュートリアルで押すべきボタンを目立たせる。周囲は暗幕で覆われているので、
+     ここは「光って脈打つ」ことだけに集中させる（暗い中で動くものに目が行く）。 */
+  .tut-hl {
+    position: relative; z-index: 66;
+    animation: tutPulse 1.2s ease-in-out infinite;
+    border-radius: 8px;
+  }
+  @keyframes tutPulse {
+    0%, 100% { box-shadow: 0 0 0 3px #fbbf24, 0 0 12px 4px rgba(251,191,36,0.55); }
+    50%      { box-shadow: 0 0 0 5px #fde68a, 0 0 22px 8px rgba(251,191,36,0.85); }
+  }
 
   /* v3.12: iOSでは 100vh が「ブラウザのバーを隠した高さ」を指すため、h-screen だと画面下端が
      アドレスバーの裏に潜り込み、下部のボタン（翌月へ進む等）に一切触れなくなっていた。
@@ -65,6 +119,7 @@
     <div class="flex items-center gap-3">
       <button id="btn-result" class="text-lg leading-none hidden" title="リザルトを見る">🏆</button><button id="btn-bgm" class="text-lg leading-none" title="BGMの気分を変える">🎵</button>
       <button id="btn-mute" class="text-lg leading-none" title="音のON/OFF">🔊</button>
+      <button id="btn-terms" class="text-lg leading-none" title="用語ヘルプのON/OFF">📖</button>
       <button id="btn-reset" class="text-xs underline">リセット</button>
     </div>
   </header>
@@ -228,10 +283,47 @@ function pickJunk(genreKey, rng) {
   const pool = genreKey.includes('kubun') ? ['事故歴', '管理崩壊', '残置物']
     : genreKey === 'w_kodate' ? ['残置物', '再建築不可', '傾き', '事故歴']
     : ['残置物', '事故歴', '管理崩壊', '立退き交渉中'];
-  const n = 1 + (rng() < 0.3 ? 1 : 0);
+  const n = Math.min(pool.length, 1 + (rng() < 0.3 ? 1 : 0));
   const out = [];
-  while (out.length < n) { const f = pool[Math.floor(rng() * pool.length)]; if (!out.includes(f)) out.push(f); }
+  // 引き直しは有限回に留める。定数を返すrng（テスト用のスタブ等）だと同じ要素しか出ず、
+  // 無条件のwhileでは無限ループになるため。
+  for (let guard = 0; out.length < n && guard < 40; guard++) {
+    const f = pool[Math.floor(rng() * pool.length)];
+    if (!out.includes(f)) out.push(f);
+  }
+  for (const f of pool) { if (out.length >= n) break; if (!out.includes(f)) out.push(f); }
   return out;
+}
+
+// === v6: 築年帯と構造による傾斜 ===
+// 築浅も築古も同じ頻度でトラブルが来る状態を解消し、「築浅はほとんど手がかからない」を成立させる。
+export function ageBandOf(builtAge) {
+  return builtAge <= 10 ? 'young' : builtAge <= 25 ? 'mid' : 'old';
+}
+
+// 🏚 躯体（repairState）の経年劣化。外壁・屋根・防水は築年が進むほど、また木造ほど早く傷む。
+export const DECAY_BY_AGE = { young: 0.10, mid: 0.25, old: 0.35 };
+export const DECAY_BY_STRUCTURE = { '木造': 1.3, 'S': 1.0, 'RC': 0.8 };
+// 🧹 手入れ（careState）の劣化。清掃・草刈りの必要性は築年数と無関係なので一律。
+export const CARE_DECAY_PER_MONTH = 2.0;
+
+export function structuralDecay(property) {
+  return DECAY_BY_AGE[ageBandOf(property.builtAge)] * (DECAY_BY_STRUCTURE[property.structure] ?? 1.0);
+}
+
+// 退去率と突発修繕も築年帯で傾斜させる（旧: 退去1.0%・突発3%の一律）
+export const VACANCY_BY_AGE = { young: 0.004, mid: 0.008, old: 0.015 };
+export const TROUBLE_BY_AGE = { young: 0.01, mid: 0.03, old: 0.05 };
+
+export function vacancyRate(property) {
+  let r = VACANCY_BY_AGE[ageBandOf(property.builtAge)];
+  if ((property.junkFlags || []).includes('管理崩壊')) r += 0.01;
+  if ((property.careState ?? 100) < 50) r *= 1.5;   // 荒れた物件は住み続けてもらえない
+  return r;
+}
+
+export function troubleChanceFor(property) {
+  return TROUBLE_BY_AGE[ageBandOf(property.builtAge)];
 }
 
 // 物件名を築年数に応じて生成（築浅=モダン／築古=荘・文化・第一ビル等の古い名前）。
@@ -341,7 +433,10 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
     repairReserveM: isKubun ? Math.round(lr(5000, 15000)) : Math.round(rentTotalM * 0.02),
     pmFeeRate: 0.05,
     propTaxA: Math.max(30000, Math.round(price * 0.007)),
+    // v6: 🏚躯体（大規模修繕でのみ回復）と 🧹手入れ（日常メンテで100%まで回復）の2ゲージ
     repairState: Math.round(g.wake ? lr(0, 40) : lr(40, 90)),
+    careState: Math.round(g.wake ? lr(20, 60) : lr(70, 100)),
+    autoManage: false,
     junkFlags: g.wake ? pickJunk(genreKey, rng) : [],
     bldgRatio: g.structure === '木造' ? 0.5 : 0.45,
     deprRemaining: deprMonthsFor(g.structure, builtAge),
@@ -592,7 +687,8 @@ export function settleSale(state, sale) {
 
 export function monthlyVacancyRoll(property, rng = Math.random) {
   let vacated = 0;
-  const rate = 0.01 + (property.builtAge >= 26 ? 0.005 : 0) + (property.junkFlags.includes('管理崩壊') ? 0.01 : 0);
+  // v6: 退去率は築年帯で傾斜し、手入れが荒れているとさらに跳ねる（vacancyRate に集約）
+  const rate = vacancyRate(property);
   property.units.forEach(u => {
     if (u.occupied && rng() < rate) {
       // v4: 退去した部屋は「要原状回復」。回復するまで客付けできない。
@@ -606,12 +702,18 @@ export function monthlyVacancyRoll(property, rng = Math.random) {
   return { property, vacated };
 }
 
+// v6: 自然客付け率。基準20%を手入れの状態で ±5pt 動かす（手入れ100%で25%・0%で15%）。
+export function naturalFillChance(property) {
+  return 0.15 + 0.10 * Math.max(0, Math.min(100, property.careState ?? 100)) / 100;
+}
+
 export function naturalFillRoll(property, rng = Math.random) {
   let filled = 0;
   property.units.forEach(u => {
     if (!u.occupied) {
       if (u.needsRestore) { u.vacantMonths += 1; return; }   // v4: 原状回復前は埋まらない
-      if (rng() < 0.20) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; filled += 1; }
+      // v6: 手入れが行き届いた物件ほど自然に埋まる（草ぼうぼうの物件は内見で決まらない）
+      if (rng() < naturalFillChance(property)) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; filled += 1; }
       else u.vacantMonths += 1;
     }
   });
@@ -657,6 +759,8 @@ export function startRestore(state, propertyId, unitIndex, opts = {}) {
   const p0 = state.properties.find(x => x.id === propertyId);
   const u0 = p0 && p0.units[unitIndex];
   if (!p0 || !u0 || !u0.needsRestore || u0.restoreJob) return { state, started: false };
+  // v6: おまかせ契約中は原状回復も業者任せになる（そのぶん自動で発注される）
+  if (opts.diy && p0.autoManage) return { state, started: false, reason: 'autoManaged' };
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
   const u = p.units[unitIndex];
@@ -688,16 +792,28 @@ export function startRestore(state, propertyId, unitIndex, opts = {}) {
   return { state: s, started: true, diy: false, cost, loanAmount, financed: !!opts.financed, months: 1 };
 }
 
-// === v4: 修繕は「日常メンテ・小規模補修」と「大規模修繕」の2種類 ===
-// 日常メンテはDIYできるが修繕度70%が上限（清掃・草刈り・部分補修で躯体の劣化は直らない）。
-// 100%まで戻すには足場を組む大規模修繕が必要で、こちらは業者のみ。
+// === v4/v6: 修繕は「日常メンテ・小規模補修」と「大規模修繕」の2種類 ===
+// v6: 両者は別々のゲージを動かす。日常メンテは 🧹手入れ（careState）を100%まで戻し、
+// 大規模修繕は 🏚躯体（repairState）を100%まで戻す。清掃・草刈りで躯体が回復することはない。
+// v4にあった「日常メンテは修繕度70%が上限」という対症療法のキャップは、ゲージが分かれたので撤廃した。
 export const REPAIR_KINDS = {
   maint: { label: '日常メンテ・小規模補修', detail: '清掃・草刈り・部分クロス張替',
-    diyable: true,  gain: 15, cap: 70, diyAp: 10, diyStep: 25 },
+    gauge: 'care',       diyable: true,  cap: 100, diyAp: 10, diyStep: 25 },
   large: { label: '大規模修繕', detail: '外壁・屋根・防水（足場）',
-    diyable: false, gain: null, cap: 100, diyAp: 0, diyStep: 0,
+    gauge: 'structural', diyable: false, cap: 100, diyAp: 0, diyStep: 0,
     blockedReason: '足場の設置と高所・構造の作業が必要なため、業者にしか頼めません' },
 };
+
+// 工事種別が対象とするゲージの現在値
+export function repairGaugeValue(property, kind) {
+  return REPAIR_KINDS[kind]?.gauge === 'care' ? (property.careState ?? 100) : (property.repairState ?? 100);
+}
+
+// 工事種別が対象とするゲージへ値を書き込む
+function setRepairGauge(property, kind, value) {
+  if (REPAIR_KINDS[kind]?.gauge === 'care') property.careState = value;
+  else property.repairState = value;
+}
 
 // v5.1: 修繕費は「建物の規模（戸数・構造）」で決める。物件価格には依存させない。
 // 従来は price×係数だったため、40万円の訳あり戸建ての大規模修繕が5万円で直る／
@@ -712,7 +828,9 @@ const MAINT_FLOOR       = 30_000;
 
 // 工事種別ごとの業者見積もり（建物規模ベース）
 export function repairCost(property, kind) {
-  const gap = Math.max(0, 100 - property.repairState);
+  // v6: 見積は「その工事が直すゲージ」のギャップで決まる。
+  // 日常メンテの額を躯体の傷み具合で決めていたのが v5 までの誤りだった。
+  const gap = Math.max(0, 100 - repairGaugeValue(property, kind));
   const units = property.units.length;
   const st = property.structure;
   if (kind === 'maint') {
@@ -744,11 +862,11 @@ export function repairDetail(property, kind) {
   return isKubun ? '専有部フルリフォーム（内装・設備）' : '外壁・屋根・防水（足場）';
 }
 
-// 工事後に到達する修繕度（日常メンテは+15かつ70上限、大規模修繕は100）
+// 工事後に到達する値（v6: 日常メンテは手入れを、大規模修繕は躯体を、それぞれ100%まで戻す）
 export function repairResultState(property, kind) {
   const k = REPAIR_KINDS[kind];
-  if (!k) return property.repairState;
-  return k.gain == null ? k.cap : Math.min(k.cap, property.repairState + k.gain);
+  if (!k) return repairGaugeValue(property, kind);
+  return k.cap;
 }
 
 // 修繕に着手する。diy=true は材料費のみで作業量を貯める方式、false は業者へ発注（借入可）。
@@ -757,7 +875,9 @@ export function startRepair(state, propertyId, kind, opts = {}) {
   const k = REPAIR_KINDS[kind];
   if (!p0 || !k || p0.repairJob) return { state, started: false, reason: 'busy' };
   if (opts.diy && !k.diyable) return { state, started: false, reason: 'diyNotAllowed' };
-  if (repairResultState(p0, kind) <= p0.repairState) return { state, started: false, reason: 'noGain' };
+  // v6: おまかせ契約中は工事がすべて業者任せになる（自分で手を動かす余地がなくなるのが対価）
+  if (opts.diy && p0.autoManage) return { state, started: false, reason: 'autoManaged' };
+  if (repairResultState(p0, kind) <= repairGaugeValue(p0, kind)) return { state, started: false, reason: 'noGain' };
 
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
@@ -771,9 +891,9 @@ export function startRepair(state, propertyId, kind, opts = {}) {
     const done = (prog ? prog.done : 0) + diyWorkStep(k.diyStep, s);
     s.skills.selfmgmt.exp += 10;
     if (done >= DIY_WORK_TOTAL) {
-      // DIYできるのは日常メンテ（70%上限）だけなので、ここで100%に到達することはない。
+      // DIYできるのは日常メンテ（🧹手入れ）だけ。躯体は足場が要るので業者にしか直せない。
       // 訳あり物件の修繕実績は大規模修繕（業者）の完了時に記録される。
-      p.repairState = repairResultState(p, kind);
+      setRepairGauge(p, kind, repairResultState(p, kind));
       p.diyProgress = null;
       return { state: s, started: true, diy: true, cost: material, done: true };
     }
@@ -792,8 +912,35 @@ export function startRepair(state, propertyId, kind, opts = {}) {
     s.cash -= cost;
   }
   const monthsTotal = repairJobMonths(p, kind);
-  p.repairJob = { kind, monthsTotal, monthsLeft: monthsTotal, startState: p.repairState };
+  p.repairJob = { kind, monthsTotal, monthsLeft: monthsTotal, startState: repairGaugeValue(p, kind) };
   return { state: s, started: true, diy: false, cost, loanAmount, financed: !!opts.financed, monthsTotal };
+}
+
+// === v6: 管理会社おまかせ契約 ===
+// 手入れの維持と原状回復の発注を自動化する代わりに、工事費に手数料が乗り、DIYができなくなる。
+// v4の「金 vs 時間・手間」を最も素直に形にしたもの。大規模修繕・価値UPは金額が大きいので対象外。
+export const AUTO_MANAGE_MARKUP = 1.1;     // おまかせ工事の割増（自動で任せるぶんのマージン）
+export const AUTO_MANAGE_CARE_FLOOR = 70;  // 手入れがこの値を下回ると自動で日常メンテを発注する
+
+export function autoManageCost(cost) { return Math.round(cost * AUTO_MANAGE_MARKUP); }
+
+export function setAutoManage(state, propertyId, on) {
+  const s = structuredClone(state);
+  const p = s.properties.find(x => x.id === propertyId);
+  if (!p) return { state: s, changed: false };
+  p.autoManage = !!on;
+  // 契約した時点で手入れが荒れていれば、その場で初回の工事が走る（＝契約と同時に出費が出る）
+  if (p.autoManage && (p.careState ?? 100) < AUTO_MANAGE_CARE_FLOOR && !p.repairJob) {
+    const cost = autoManageCost(repairCost(p, 'maint'));
+    if (s.cash >= cost) {
+      s.cash -= cost;
+      p.repairJob = { kind: 'maint', monthsTotal: repairJobMonths(p, 'maint'), monthsLeft: repairJobMonths(p, 'maint'),
+        startState: p.careState, auto: true };
+      return { state: s, changed: true, started: true, cost };
+    }
+    return { state: s, changed: true, started: false, reason: 'noCash', cost };
+  }
+  return { state: s, changed: true, started: false };
 }
 
 // v4: 旧 repairTier / repairTierInfo / doDIY は廃止。
@@ -941,84 +1088,414 @@ export function taxRiskLevelV2(state) {
   return m >= 36 ? '低' : m >= 12 ? '中' : '高';
 }
 
-// === Task 10: イベントv2（発生条件・物件タイプ連動） ===
+// === Task 10 / v6: イベント（築年数・構造・戸数・手入れの状態で出し分ける） ===
+// v5までは「ジャンル」だけで判定していたため、築3年の新築アパートにシロアリが出ていた。
+// v6では物件ごとの match(p) で対象を絞り、その建物で現実に起こりうるものだけを候補にする。
+// 結果として築浅（0〜7年）では設備・躯体系のイベントがほぼ全滅し、
+// 金利・銀行・セミナーといった築年に依存しない経営イベントだけが残る。
 
-function ownedOf(s, genres) { return s.properties.filter(p => genres.includes(p.genreKey)); }
-const IKKODATE = ['kodate', 'w_kodate'];
-const ITTOU = ['apart', 'w_apart', 'tekkotsu', 'w_tekkotsu', 'rc', 'w_rc'];
-const KUBUN = ['kubun', 'w_kubun'];
+const isKodateP = p => p.genreKey === 'kodate' || p.genreKey === 'w_kodate';
+const isKubunP = p => p.genreKey === 'kubun' || p.genreKey === 'w_kubun';
+
+// 物件条件のビルダー。指定しなかった項目は無条件。
+// kind: 'kodate'=戸建て / 'kubun'=区分 / 'tou'=一棟もの / 'notKubun'=区分以外（建物全体を自分で管理する物件）
+//
+// v6.3: 「その建物に物理的に存在しない設備」のイベントを出さないよう条件を締めた。
+// 木造2階建てのアパートに受水槽・給水ポンプは無い（直圧給水）し、
+// 区分マンションの所有者が敷地の草木やハチの巣を扱うことも無い（管理組合の仕事）。
+function evTarget({ structures, minAge, minUnits, careBelow, structBelow, kind, needOccupied } = {}) {
+  return (p) => {
+    if (structures && !structures.includes(p.structure)) return false;
+    if (minAge != null && (p.builtAge ?? 0) < minAge) return false;
+    if (minUnits != null && (p.units?.length ?? 0) < minUnits) return false;
+    if (careBelow != null && (p.careState ?? 100) >= careBelow) return false;
+    // 大規模修繕を終えた直後の建物から雨漏りやタイル剥落が起きるのは不自然。
+    // 躯体に由来するイベントは、躯体がある程度傷んでいるときだけ出す。
+    if (structBelow != null && (p.repairState ?? 100) >= structBelow) return false;
+    if (kind === 'kodate' && !isKodateP(p)) return false;
+    if (kind === 'kubun' && !isKubunP(p)) return false;
+    if (kind === 'tou' && (isKodateP(p) || isKubunP(p))) return false;
+    if (kind === 'notKubun' && isKubunP(p)) return false;
+    if (needOccupied && !(p.units || []).some(u => u.occupied)) return false;
+    return true;
+  };
+}
+
+// choices の apply でよく使う操作
+const evFind = (s, id) => s.properties.find(x => x.id === id);
+const evPay = (n) => (s) => { s.cash -= n; return s; };
+const evPayPerUnit = (per) => (s, id) => { const p = evFind(s, id); s.cash -= per * (p?.units.length ?? 1); return s; };
+const evHitStruct = (n) => (s, id) => { const p = evFind(s, id); if (p) p.repairState = Math.max(0, p.repairState - n); return s; };
+const evHitCare = (n) => (s, id) => { const p = evFind(s, id); if (p) p.careState = Math.max(0, (p.careState ?? 100) - n); return s; };
+// 退去は「退去届」であり原状回復までは発生させない（monthlyVacancyRoll と役割を分ける）
+const evEvict = (n) => (s, id) => {
+  const p = evFind(s, id);
+  if (p) p.units.filter(u => u.occupied).slice(0, n).forEach(u => { u.occupied = false; u.vacantMonths = 0; });
+  return s;
+};
+const evChain = (...fns) => (s, id, ui) => fns.reduce((acc, f) => f(acc, id, ui), s);
+// v6.4: 部屋ごとの設備イベント用。対象の部屋だけを退去させる。
+const evEvictUnit = () => (s, id, ui) => {
+  const u = evFind(s, id)?.units?.[ui];
+  if (u?.occupied) { u.occupied = false; u.vacantMonths = 0; }
+  return s;
+};
+// 全室の家賃を一定率で動かす（設備更新による小幅な賃料アップ等）
+const evRentMult = (m) => (s, id) => {
+  const p = evFind(s, id);
+  if (p) p.units.forEach(u => { u.rent = Math.round(u.rent * m / 1000) * 1000; });
+  return s;
+};
+
+// v6.3: セミナーのお題。毎回同じ文面だと「またこれか」になるので、実際に世に溢れている題目から引く。
+export const SEMINAR_TOPICS = [
+  '相続対策としての一棟アパート経営',
+  '空室対策の最新テクニック',
+  'サラリーマンのための節税スキーム',
+  '新築ワンルームで安定運用',
+  '海外不動産で資産分散',
+  '民泊・マンスリーで利回り倍増',
+  '太陽光とのハイブリッド投資',
+  '借地権・底地の再生',
+  '競売物件の入門',
+  'DIYリフォームで再生する築古戸建て',
+  '法人スキームで融資枠を広げる',
+  'サブリース（家賃保証）の正しい使い方',
+  '区分から一棟へのステップアップ',
+  '地方高利回り物件の狙い方',
+  '再建築不可を活かす出口戦略',
+  '事故物件を安く買って高く貸す',
+  '賃貸経営の税務と確定申告',
+  '満室経営を実現する客付け術',
+  '築古RCで減価償却を最大化する',
+  'ペット可・楽器可で差別化する',
+];
 
 export const EVENTS = [
-  { id: 'rate_hike', title: '📈 日銀が利上げ！融資金利が上昇', genres: null,
+  // --- 経営イベント（物件を取らない。築年数に依存しないので築浅でも出る）---
+  // 繰り返し起きても不自然でないものは cooldown を短くする。
+  { id: 'rate_hike', title: '📈 日銀が利上げ！融資金利が上昇', cooldown: 24,
     condition: s => s.properties.some(p => p.loan),
     choices: [
       { label: '受け入れる（全ローン金利+0.3%）', log: '金利上昇を受け入れた',
         apply: s => { s.properties.forEach(p => { if (p.loan) p.loan.rate += 0.003; }); return s; } },
       { label: '各行と交渉（行動力-40・上昇を+0.1%に抑える）', log: '交渉で金利上昇を抑えた（交渉+15 EXP）',
         apply: s => { s.actionPower -= 40; s.skills.negotiation.exp += 15; s.properties.forEach(p => { if (p.loan) p.loan.rate += 0.001; }); return s; } } ] },
-  { id: 'bank_approach', title: '🏦 メガ地銀からのアプローチ', genres: null,
+  { id: 'bank_approach', title: '🏦 メガ地銀からのアプローチ', cooldown: 24,
     condition: s => s.creditScore >= 50 && s.properties.some(p => p.loan),
     choices: [
       { label: '低金利ローンへ借り換え（-¥300,000・全金利-0.5%）', log: '借り換えで金利を圧縮した',
         apply: s => { s.cash -= 300000; s.properties.forEach(p => { if (p.loan) p.loan.rate = Math.max(0.009, p.loan.rate - 0.005); }); return s; } },
       { label: '断る', log: '今回は見送った', apply: s => s } ] },
-  { id: 'seminar', title: '🎤 「絶対儲かる」不動産セミナーの勧誘', genres: null, condition: () => true,
+  // セミナーと大家の会は「何度でも来るもの」。お題だけ毎回変わる。
+  { id: 'seminar', cooldown: 6, condition: () => true,
+    title: () => `🎤 「${SEMINAR_TOPICS[Math.floor(Math.random() * SEMINAR_TOPICS.length)]}」セミナーの勧誘`,
     choices: [
       { label: '断る（知識で武装済み）', log: '怪しい話を即断り（目利き+10 EXP）', apply: s => { s.skills.appraisal.exp += 10; return s; } },
       { label: '話だけ聞く（行動力-20）', log: '勉強にはなった（交渉+10 EXP）', apply: s => { s.actionPower -= 20; s.skills.negotiation.exp += 10; return s; } } ] },
-  { id: 'shiroari', title: '🐜 シロアリ発見！', genres: [...IKKODATE, 'apart', 'w_apart'],
-    condition: s => ownedOf(s, [...IKKODATE, 'apart', 'w_apart']).length > 0,
+  { id: 'oyanokai', title: '🍻 大家の会に誘われた', cooldown: 6,
+    condition: s => s.properties.length > 0,
     choices: [
-      { label: '駆除する（-¥200,000）', log: 'シロアリを駆除した', apply: s => { s.cash -= 200000; return s; } },
-      { label: '放置する（修繕度-30）', log: '放置した…建物が傷む',
-        apply: (s, id) => { const p = s.properties.find(x => x.id === id); if (p) p.repairState = Math.max(0, p.repairState - 30); return s; } } ] },
-  { id: 'amamori', title: '🌧️ 雨漏り発生！', genres: [...IKKODATE, 'apart', 'w_apart'],
-    condition: s => ownedOf(s, [...IKKODATE, 'apart', 'w_apart']).length > 0,
+      { label: '参加する（行動力-15・-¥5,000）', log: '大家仲間から生の情報を仕入れた（目利き+10・交渉+10 EXP）',
+        apply: s => { s.actionPower -= 15; s.cash -= 5000; s.skills.appraisal.exp += 10; s.skills.negotiation.exp += 10; return s; } },
+      { label: '今回は見送る', log: '家で収支表とにらめっこした', apply: s => s } ] },
+
+  // --- 躯体・構造まわり（築年数が要件。新築では起きない）---
+  { id: 'shiroari', title: '🐜 シロアリ発見！', cooldown: 120,
+    // シロアリ被害は木造の土台・柱に出る。新築の防蟻処理は5〜10年もつので築15年以降に限る。
+    // 一度きちんと駆除すれば10年は再発しない。
+    match: evTarget({ structures: ['木造'], minAge: 15, structBelow: 90 }),
     choices: [
-      { label: '修理する（-¥300,000）', log: '雨漏りを修理した', apply: s => { s.cash -= 300000; return s; } },
-      { label: '様子を見る（修繕度-20・入居者1戸退去）', log: '入居者が愛想を尽かして退去…',
-        apply: (s, id) => { const p = s.properties.find(x => x.id === id); if (p) { p.repairState = Math.max(0, p.repairState - 20);
-          const u = p.units.find(u => u.occupied); if (u) { u.occupied = false; u.vacantMonths = 0; } } return s; } } ] },
-  { id: 'taikyo_rensa', title: '📦 退去連鎖！2戸同時に退去届', genres: ITTOU,
-    condition: s => ownedOf(s, ITTOU).some(p => p.units.filter(u => u.occupied).length >= 2),
+      { label: '駆除して防蟻処理（-¥200,000）', log: 'シロアリを駆除した', apply: evPay(200000) },
+      { label: '放置する（躯体-30）', log: '放置した…土台が食われていく', apply: evHitStruct(30) } ] },
+  { id: 'amamori', title: '🌧️ 雨漏りが発生！', cooldown: 96,
+    // 屋根材・防水層の寿命はおおむね15年。RCの陸屋根でも同じように起きる。
+    match: evTarget({ minAge: 15, kind: 'notKubun', structBelow: 85 }),
+    choices: [
+      { label: '防水を部分補修する（-¥300,000）', log: '雨漏りを修理した', apply: evPay(300000) },
+      { label: '様子を見る（躯体-20・入居者1戸退去）', log: '入居者が愛想を尽かして退去…',
+        apply: evChain(evHitStruct(20), evEvict(1)) } ] },
+  { id: 'daikibo_shuzen', title: '🏗️ 外壁塗装・大規模修繕の見積もりが届いた', cooldown: 144,
+    // 1回目の外壁塗装は築12〜15年で来る。区分は管理組合が積立金でやるので対象外。
+    match: evTarget({ minAge: 12, kind: 'notKubun', structBelow: 90 }),
+    choices: [
+      { label: '実施する（躯体100%・資産価値+8%）', log: '大規模修繕を実施。ピカピカに',
+        apply: (s, id) => { const p = evFind(s, id); if (p) { s.cash -= repairCost(p, 'large'); p.repairState = 100; p.timeValue = Math.round(p.timeValue * 1.08); } return s; } },
+      { label: '先送りする（躯体-15）', log: '先送りした…外壁のヒビが気になる', apply: evHitStruct(15) } ] },
+  { id: 'tile_ukiage', title: '🧱 外壁タイルの浮きが見つかった', cooldown: 144,
+    // 打診調査（10年ごとの特定建築物定期調査）で指摘される。タイル張りは主にS・RCの一棟もの。
+    match: evTarget({ structures: ['S', 'RC'], kind: 'tou', minAge: 15, minUnits: 6, structBelow: 85 }),
+    choices: [
+      { label: '打診調査して補修（-¥500,000）', log: '浮いたタイルを張り替えた', apply: evPay(500000) },
+      { label: '先送りする（躯体-15）', log: '落下事故が起きなければいいが…', apply: evHitStruct(15) } ] },
+  { id: 'bousui', title: '🛁 共用廊下・ベランダの防水層が劣化', cooldown: 144,
+    // 防水の更新周期は12〜15年。共用廊下やベランダがあるのは一棟もの。
+    match: evTarget({ kind: 'tou', minAge: 12, minUnits: 4, structBelow: 85 }),
+    choices: [
+      { label: '防水工事をする（戸数×¥80,000）', log: '防水をやり直した', apply: evPayPerUnit(80000) },
+      { label: '先送りする（躯体-10）', log: '下の階に染みが出はじめた', apply: evHitStruct(10) } ] },
+  { id: 'haisuikan', title: '💧 給排水管から漏水', cooldown: 240,
+    // 配管の更新周期は25〜30年。一度やれば当分もつ。
+    match: evTarget({ structures: ['S', 'RC'], kind: 'tou', minAge: 25, minUnits: 4, structBelow: 90 }),
+    choices: [
+      { label: '配管を更新する（戸数×¥150,000）', log: '給排水管を更新した', apply: evPayPerUnit(150000) },
+      { label: '応急処置で済ませる（-¥50,000・躯体-10）', log: 'とりあえず止めたが根本は残った',
+        apply: evChain(evPay(50000), evHitStruct(10)) } ] },
+  { id: 'taifu', title: '🌀 台風で屋根・雨樋が破損', cooldown: 60,
+    // 木造は風災の被害を受けやすい。火災保険の風災補償が使える典型例。
+    match: evTarget({ structures: ['木造'], kind: 'notKubun', minAge: 10 }),
+    choices: [
+      { label: '火災保険を申請する（行動力-10・7割が保険で戻る）', log: '風災補償が下りた（自主管理+10 EXP）',
+        apply: s => { s.actionPower -= 10; s.cash -= 90000; s.skills.selfmgmt.exp += 10; return s; } },
+      { label: '自費で直す（-¥300,000）', log: '面倒なので自費で直した', apply: evPay(300000) } ] },
+  { id: 'kaidan_sabi', title: '🪜 屋外階段の錆と腐食', cooldown: 180,
+    // 木造・鉄骨アパートの外階段は鉄骨製で、築20年を過ぎると根元から腐食して落下事故を起こす。
+    // RCマンションの階段はコンクリート造なので錆びない。2階以上＝共用階段のある一棟ものだけ。
+    match: evTarget({ structures: ['木造', 'S'], kind: 'tou', minAge: 20, minUnits: 4, structBelow: 90 }),
+    choices: [
+      { label: '鉄骨階段を補修・防錆する（-¥600,000）', log: '階段の腐食を止めた', apply: evPay(600000) },
+      { label: '見なかったことにする（躯体-15）', log: '踏み板が抜けなければいいが…', apply: evHitStruct(15) } ] },
+  { id: 'kyoukai', title: '🚧 隣地との境界でもめている', cooldown: 240,
+    // 古い戸建ては境界標が失われていることが多い。確定測量は一度やれば終わる。
+    match: evTarget({ kind: 'kodate', minAge: 30 }),
+    choices: [
+      { label: '測量して確定測量図を作る（-¥400,000）', log: '境界を確定させた（売却時に有利）', apply: evPay(400000) },
+      { label: '先送りする（売却時に値を引かれる・躯体-5）', log: '曖昧なままにした', apply: evHitStruct(5) } ] },
+
+  // --- 設備まわり（寿命が来ると必ず交換が要る。交換すれば寿命ぶんは再発しない）---
+  // v6.4: 給湯器・エアコン・火災警報器は各部屋に1台ずつある設備。
+  // 建物単位でまとめて扱うと「10戸まとめて交換」という不自然な出費になり、
+  // 一度替えたら建物全体が8年沈黙してしまう。部屋ごとに発生・部屋ごとにクールダウンする。
+  { id: 'kyutouki', title: '🚿 給湯器が寿命を迎えた', cooldown: 96, perUnit: true,
+    // 給湯器の耐用年数は10〜15年。交換すれば最低でも8年はもつ。
+    match: evTarget({ minAge: 10 }),
+    choices: [
+      { label: '交換する（-¥80,000）', log: '給湯器を交換した', apply: evPay(80000) },
+      { label: '壊れてから対応する（手入れ-5・その部屋が退去）', log: 'お湯が出ないと苦情が来て退去された',
+        apply: evChain(evHitCare(5), evEvictUnit()) } ] },
+  { id: 'aircon', title: '❄️ エアコンが故障した', cooldown: 96, perUnit: true,
+    // エアコンの寿命も10年前後。入れ替えれば当分は持つ。
+    match: evTarget({ minAge: 8 }),
+    choices: [
+      { label: '交換する（-¥120,000）', log: 'エアコンを入れ替えた', apply: evPay(120000) },
+      { label: '入居者負担にする（その部屋が退去）', log: '揉めた末に退去された', apply: evEvictUnit() } ] },
+  { id: 'kasai_hochiki', title: '🔥 住宅用火災警報器の交換期限', cooldown: 120, perUnit: true,
+    // 警報器の交換目安はちょうど10年。法定なので選択の余地はない。
+    match: evTarget({ minAge: 10 }),
+    choices: [
+      { label: '交換する（-¥10,000）', log: '火災警報器を交換した（法定）', apply: evPay(10000) } ] },
+  { id: 'pump', title: '🚰 受水槽の給水ポンプが故障', cooldown: 180,
+    // 受水槽＋高置水槽で給水するのは3階建て以上の中〜大規模建物。
+    // 木造2階建てのアパートは直圧給水なので受水槽もポンプも無い（v6.3で S/RC の一棟に限定）。
+    match: evTarget({ structures: ['S', 'RC'], kind: 'tou', minUnits: 8, minAge: 15 }),
+    choices: [
+      { label: '即交換する（-¥800,000）', log: '断水は避けられた（放置はできない）', apply: evPay(800000) } ] },
+  { id: 'elevator', title: '🛗 エレベーターの更新時期', cooldown: 300,
+    // エレベーターの更新周期は20〜25年。1基あたり1,000〜1,500万円かかる。
+    match: evTarget({ structures: ['RC'], kind: 'tou', minUnits: 16, minAge: 20 }),
+    choices: [
+      { label: '全面更新する（-¥15,000,000）', log: 'エレベーターを更新した', apply: evPay(15_000_000) },
+      { label: '部品交換でしのぐ（-¥3,000,000・躯体-10）', log: 'あと数年は延命できるはず',
+        apply: evChain(evPay(3_000_000), evHitStruct(10)) } ] },
+  // --- 定期メンテナンス（機械系は入替だけでなく毎年の保守がかかる）---
+  { id: 'elevator_hoshu', title: '🛗 エレベーターの保守契約を更新する時期', cooldown: 12,
+    // 昇降機は年1回の法定検査と保守契約が必須。更新の20年に一度ではなく毎年出る費用。
+    match: evTarget({ structures: ['RC'], kind: 'tou', minUnits: 16, minAge: 1 }),
+    choices: [
+      { label: 'フルメンテ契約にする（-¥600,000／部品交換込みで安心）', log: 'フルメンテ契約を更新した', apply: evPay(600000) },
+      { label: 'POG契約で抑える（-¥300,000／部品代は都度負担・躯体-3）', log: 'POG契約にして保守費を抑えた',
+        apply: evChain(evPay(300000), evHitStruct(3)) } ] },
+  { id: 'jusuisou_seisou', title: '🚰 受水槽の清掃と水質検査', cooldown: 12,
+    // 有効容量10㎥超の受水槽は年1回の清掃と検査が法律で義務づけられている。
+    match: evTarget({ structures: ['S', 'RC'], kind: 'tou', minUnits: 8, minAge: 1 }),
+    choices: [
+      { label: '清掃・検査を実施する（-¥80,000）', log: '受水槽を清掃した（法定）', apply: evPay(80000) } ] },
+  { id: 'teiki_seisou', title: '🧹 共用部の定期清掃の契約更新', cooldown: 12,
+    // 共用廊下・階段のある一棟ものは、月次の清掃を業者に頼むのが普通。
+    match: evTarget({ kind: 'tou', minUnits: 4 }),
+    choices: [
+      { label: '月2回の契約にする（戸数×¥6,000／手入れ+10）', log: '定期清掃を手厚くした',
+        apply: (s, id) => { const p = evFind(s, id); if (p) { s.cash -= 6000 * p.units.length; p.careState = Math.min(100, (p.careState ?? 100) + 10); } return s; } },
+      { label: '月1回に減らす（戸数×¥3,000）', log: '定期清掃を最低限にした', apply: evPayPerUnit(3000) } ] },
+  { id: 'shoubou', title: '🚨 消防設備点検で是正を指摘された', cooldown: 60,
+    // 一定規模以上の共同住宅は消防設備の定期点検と報告が義務。
+    match: evTarget({ structures: ['S', 'RC'], kind: 'tou', minUnits: 8 }),
+    choices: [
+      { label: '是正工事をする（戸数×¥30,000）', log: '消防設備を是正した（法定）', apply: evPayPerUnit(30000) } ] },
+  { id: 'antenna', title: '📺 テレビ共聴アンテナが故障', cooldown: 120,
+    // 共聴設備があるのは一棟もの。ブースターの寿命は10〜15年。
+    match: evTarget({ kind: 'tou', minAge: 15, minUnits: 4 }),
+    choices: [
+      { label: 'アンテナ・ブースターを交換（-¥250,000）', log: '共聴設備を直した', apply: evPay(250000) },
+      { label: '光テレビへ切り替える（-¥400,000・入居者満足↑）', log: '光テレビを導入した（手入れ+）',
+        apply: (s, id) => { s.cash -= 400000; const p = evFind(s, id); if (p) p.careState = Math.min(100, (p.careState ?? 100) + 10); return s; } } ] },
+  { id: 'led_kyoyo', title: '💡 共用部の照明がまだ蛍光灯のまま', cooldown: 240,
+    // 共用廊下・階段の照明があるのは一棟もの。LED化は数年で回収できる投資。
+    match: evTarget({ kind: 'tou', minAge: 15, minUnits: 4 }),
+    choices: [
+      { label: 'LEDに交換する（戸数×¥15,000・電気代が下がる）', log: '共用部をLED化した（運営費が下がった）',
+        apply: (s, id) => { const p = evFind(s, id); if (p) { s.cash -= 15000 * p.units.length; p.mgmtFeeM = Math.round(p.mgmtFeeM * 0.9); } return s; } },
+      { label: '今のまま使う', log: '電気代は高いままだ', apply: s => s } ] },
+  { id: 'kagi_koukan', title: '🔑 鍵が旧式のままで防犯性が低い', cooldown: 240,
+    // ピッキングに弱いディスクシリンダーは築25年以前の物件に多い。
+    match: evTarget({ minAge: 25 }),
+    choices: [
+      { label: 'ディンプルキーへ交換（戸数×¥25,000・家賃+2%）', log: '鍵を刷新した（防犯性が上がり家賃を上げられた）',
+        apply: evChain(evPayPerUnit(25000), evRentMult(1.02)) },
+      { label: '今のまま使う（手入れ-5）', log: '空き巣が心配だ', apply: evHitCare(5) } ] },
+  { id: 'denki_yoryo', title: '⚡ 電気容量が足りず入居者から苦情', cooldown: 240,
+    // 築30年以前は30A契約が主流。今の家電では足りずブレーカーが落ちる。
+    match: evTarget({ minAge: 30 }),
+    choices: [
+      { label: '幹線を増強して50Aに（戸数×¥40,000・家賃+2%）', log: '電気容量を増やした',
+        apply: evChain(evPayPerUnit(40000), evRentMult(1.02)) },
+      { label: '我慢してもらう（1戸退去）', log: 'ブレーカーが落ちる部屋から退去された', apply: evEvict(1) } ] },
+  { id: 'unit_bath', title: '🛀 浴室のユニットバスが限界', cooldown: 240,
+    // ユニットバスの寿命は20〜30年。入れ替えれば家賃を上げられる。
+    match: evTarget({ minAge: 25 }),
+    choices: [
+      { label: '入れ替える（戸数×¥500,000・家賃+5%）', log: '浴室を刷新した（家賃UP）',
+        apply: evChain(evPayPerUnit(500000), evRentMult(1.05)) },
+      { label: '追い焚き機能だけ直す（-¥150,000）', log: '応急処置で済ませた', apply: evPay(150000) } ] },
+
+  // --- 管理・入居者まわり（手入れの状態と戸数で出る。毎年起きても不自然でないので短め）---
+  { id: 'hachi', title: '🐝 ハチの巣と草木の繁茂', cooldown: 24,
+    // 敷地の草木を扱うのは土地付きの物件だけ。区分の所有者には関係ない（管理組合の仕事）。
+    match: evTarget({ kind: 'notKubun', careBelow: 60 }),
+    choices: [
+      { label: '駆除・伐採を頼む（-¥50,000）', log: '敷地がすっきりした', apply: evPay(50000) },
+      { label: '放置する（手入れ-15）', log: '近隣から苦情が来た', apply: evHitCare(15) } ] },
+  { id: 'gaijuu', title: '🐭 ネズミ・害獣が侵入している', cooldown: 60,
+    // 木造の築古は床下・天井裏からの侵入経路ができやすい。
+    match: evTarget({ structures: ['木造'], kind: 'notKubun', minAge: 25, careBelow: 70 }),
+    choices: [
+      { label: '駆除して侵入口を塞ぐ（-¥150,000）', log: '害獣を追い出した', apply: evPay(150000) },
+      { label: '放置する（手入れ-15・1戸退去）', log: '天井裏の足音で退去された',
+        apply: evChain(evHitCare(15), evEvict(1)) } ] },
+  { id: 'gomi', title: '🗑️ ゴミ置き場が荒れている', cooldown: 18,
+    match: evTarget({ kind: 'tou', careBelow: 50, minUnits: 2 }),
+    choices: [
+      { label: '清掃と分別ルールを掲示（-¥30,000）', log: 'ゴミ置き場を立て直した', apply: evPay(30000) },
+      { label: '放置する（1戸退去）', log: '愛想を尽かされた', apply: evEvict(1) } ] },
+  { id: 'houchi_jitensha', title: '🚲 放置自転車が通路をふさいでいる', cooldown: 24,
+    match: evTarget({ kind: 'tou', minUnits: 4, careBelow: 70 }),
+    choices: [
+      { label: '警告して撤去する（行動力-10・-¥20,000）', log: '通路がすっきりした（自主管理+10 EXP）',
+        apply: s => { s.actionPower -= 10; s.cash -= 20000; s.skills.selfmgmt.exp += 10; return s; } },
+      { label: '放置する（手入れ-10）', log: '見た目が悪く内見の印象も悪い', apply: evHitCare(10) } ] },
+  { id: 'souon', title: '👤 入居者間で騒音トラブル', cooldown: 24,
+    match: evTarget({ kind: 'tou', minUnits: 2, needOccupied: true }),
+    choices: [
+      { label: '間に入って仲裁する（行動力-20）', log: '話をまとめた（自主管理+10 EXP）',
+        apply: s => { s.actionPower -= 20; s.skills.selfmgmt.exp += 10; return s; } },
+      { label: '管理会社に丸投げする（1戸退去）', log: '当事者の片方が出ていった', apply: evEvict(1) } ] },
+  { id: 'taikyo_rensa', title: '📦 退去連鎖！2戸同時に退去届', cooldown: 36,
+    match: evTarget({ kind: 'tou', needOccupied: true, minUnits: 2 }),
     choices: [
       { label: '広告費で即募集（-家賃2ヶ月分・空きは1戸で済む）', log: '広告が効いて痛手は1戸で済んだ',
-        apply: (s, id) => { const p = s.properties.find(x => x.id === id); if (p) { const occ = p.units.filter(u => u.occupied);
+        apply: (s, id) => { const p = evFind(s, id); if (p) { const occ = p.units.filter(u => u.occupied);
           s.cash -= (occ[0]?.rent ?? 50000) * 2; if (occ[0]) { occ[0].occupied = false; occ[0].vacantMonths = 0; } } return s; } },
-      { label: '様子を見る（2戸空室に）', log: '2戸が空室になった',
-        apply: (s, id) => { const p = s.properties.find(x => x.id === id); if (p) p.units.filter(u => u.occupied).slice(0, 2)
-          .forEach(u => { u.occupied = false; u.vacantMonths = 0; }); return s; } } ] },
-  { id: 'tainou', title: '💸 家賃滞納が発覚（3ヶ月分）', genres: ITTOU,
-    condition: s => ownedOf(s, ITTOU).some(p => p.units.some(u => u.occupied)),
+      { label: '様子を見る（2戸空室に）', log: '2戸が空室になった', apply: evEvict(2) } ] },
+  { id: 'tainou', title: '💸 家賃滞納が発覚（3ヶ月分）', cooldown: 36,
+    match: evTarget({ kind: 'tou', needOccupied: true }),
     choices: [
       { label: '内容証明で回収（行動力-20・1ヶ月分だけ回収）', log: '一部回収できた（交渉+10 EXP）',
-        apply: (s, id) => { const p = s.properties.find(x => x.id === id); const u = p?.units.find(u => u.occupied);
+        apply: (s, id) => { const p = evFind(s, id); const u = p?.units.find(u => u.occupied);
           s.actionPower -= 20; s.skills.negotiation.exp += 10; if (u) s.cash += u.rent; return s; } },
-      { label: '退去してもらう（1戸空室に・未回収）', log: '滞納者に退去してもらった',
-        apply: (s, id) => { const p = s.properties.find(x => x.id === id); const u = p?.units.find(u => u.occupied);
-          if (u) { u.occupied = false; u.vacantMonths = 0; } return s; } } ] },
-  { id: 'shuzen_ichijikin', title: '🔧 管理組合から大規模修繕一時金の請求', genres: KUBUN,
-    condition: s => ownedOf(s, KUBUN).length > 0,
+      { label: '退去してもらう（1戸空室に・未回収）', log: '滞納者に退去してもらった', apply: evEvict(1) } ] },
+
+  // --- 戸建て特有 ---
+  { id: 'akiya_kanri', title: '🏚️ 空き家の管理不全を近隣から指摘された', cooldown: 36,
+    // 空いている戸建てを放置すると、郵便物・雑草・不法投棄で苦情が来る。
+    match: evTarget({ kind: 'kodate', careBelow: 60 }),
     choices: [
-      { label: '支払う（-¥300,000）', log: '一時金を支払った', apply: s => { s.cash -= 300000; return s; } },
+      { label: '定期巡回を依頼する（-¥60,000）', log: '空き家の管理を委託した', apply: evPay(60000) },
+      { label: '放置する（手入れ-20）', log: '近隣との関係が悪化した', apply: evHitCare(20) } ] },
+
+  // --- 区分マンション特有（管理組合）---
+  { id: 'shuzen_ichijikin', title: '🔧 管理組合から大規模修繕一時金の請求', cooldown: 144,
+    // 1回目の大規模修繕は築12〜15年。積立不足だと一時金を求められる。
+    match: evTarget({ kind: 'kubun', minAge: 12 }),
+    choices: [
+      { label: '支払う（-¥300,000）', log: '一時金を支払った', apply: evPay(300000) },
       { label: '分割払いを交渉（-¥100,000・修繕積立が月+¥10,000）', log: '分割にしてもらった',
-        apply: (s, id) => { s.cash -= 100000; const p = s.properties.find(x => x.id === id); if (p) p.repairReserveM += 10000; return s; } } ] },
-  { id: 'rijikai', title: '🏢 管理組合の理事就任を打診された', genres: KUBUN,
-    condition: s => ownedOf(s, KUBUN).length > 0,
+        apply: (s, id) => { s.cash -= 100000; const p = evFind(s, id); if (p) p.repairReserveM += 10000; return s; } } ] },
+  { id: 'rijikai', title: '🏢 管理組合の理事就任を打診された', cooldown: 24,
+    match: evTarget({ kind: 'kubun' }),
     choices: [
       { label: '引き受ける（行動力-20・信用度+2）', log: '理事になった。人脈が広がる',
         apply: s => { s.actionPower -= 20; s.creditScore = Math.min(100, s.creditScore + 2); return s; } },
       { label: '断る', log: '丁重に断った', apply: s => s } ] },
-  { id: 'daikibo_shuzen', title: '🏗️ 大規模修繕の見積もりが届いた（¥5,000,000）', genres: ['tekkotsu', 'w_tekkotsu', 'rc', 'w_rc'],
-    condition: s => ownedOf(s, ['tekkotsu', 'w_tekkotsu', 'rc', 'w_rc']).length > 0,
+  { id: 'kanri_hi_ne', title: '💴 管理組合が管理費・修繕積立金の値上げを決議', cooldown: 120,
+    match: evTarget({ kind: 'kubun', minAge: 15 }),
     choices: [
-      { label: '実施する（-¥5,000,000・修繕度100に）', log: '大規模修繕を実施。ピカピカに',
-        apply: (s, id) => { s.cash -= 5_000_000; const p = s.properties.find(x => x.id === id); if (p) { p.repairState = 100; p.timeValue = Math.round(p.timeValue * 1.08); } return s; } },
-      { label: '先送りする（修繕度-15）', log: '先送りした…外壁のヒビが気になる',
-        apply: (s, id) => { const p = s.properties.find(x => x.id === id); if (p) p.repairState = Math.max(0, p.repairState - 15); return s; } } ] },
+      { label: '受け入れる（修繕積立が月+¥8,000）', log: '積立金の値上げを受け入れた',
+        apply: (s, id) => { const p = evFind(s, id); if (p) p.repairReserveM += 8000; return s; } },
+      { label: '総会で反対する（行動力-20・値上げ半分に）', log: '交渉して値上げ幅を抑えた（交渉+10 EXP）',
+        apply: (s, id) => { s.actionPower -= 20; s.skills.negotiation.exp += 10; const p = evFind(s, id); if (p) p.repairReserveM += 4000; return s; } } ] },
 ];
 
-export function eligibleEvents(state) { return EVENTS.filter(e => e.condition(state)); }
+// v6: 一度起きたイベントは、同じ物件では当分のあいだ繰り返さない。
+// v6.3: クールダウンはイベントごとに決める。給湯器を替えれば次は8年後、
+// 火災警報器は10年、配管更新は20年、セミナーの勧誘は半年。
+// 「その工事をしたら現実には何年もつのか」をそのまま入れる。
+export const EVENT_COOLDOWN_MONTHS = 36;   // 物件イベントの既定値
+export const EVENT_COOLDOWN_GLOBAL = 12;   // 経営イベントの既定値
+
+export function eventCooldownOf(eventId) {
+  const e = EVENTS.find(x => x.id === eventId);
+  if (!e) return EVENT_COOLDOWN_MONTHS;
+  return e.cooldown ?? (e.match ? EVENT_COOLDOWN_MONTHS : EVENT_COOLDOWN_GLOBAL);
+}
+
+// v6.4: エアコン・給湯器・火災警報器は各部屋に1台ずつある設備なので、
+// クールダウンも部屋ごとに持つ。3号室の給湯器を替えても、5号室のはまだ古いまま。
+export function eventOnCooldown(state, eventId, propertyId = null, unitIndex = null) {
+  const now = state.month ?? 0;
+  const span = eventCooldownOf(eventId);
+  return (state.eventHistory || []).some(h =>
+    h.id === eventId && h.propertyId === propertyId
+    && (h.unitIndex ?? null) === (unitIndex ?? null)
+    && now - h.month < span);
+}
+
+function recordEventFired(s, eventId, propertyId, unitIndex = null) {
+  s.eventHistory = s.eventHistory || [];
+  s.eventHistory.push({ id: eventId, propertyId: propertyId ?? null, unitIndex: unitIndex ?? null, month: s.month });
+  // 記録は「そのイベントのクールダウンを過ぎたら」捨てる。
+  // 一律の期間で切ると、20年もつエレベーターの記録まで消えて再発してしまう。
+  s.eventHistory = s.eventHistory.filter(h => s.month - h.month < eventCooldownOf(h.id));
+}
+
+// イベントの見出し。セミナーのようにお題が毎回変わるものは関数で持つ。
+export function eventTitle(event) {
+  return typeof event.title === 'function' ? event.title() : event.title;
+}
+
+// v6: 物件イベントは対象になりうる物件が1件以上あるときだけ候補になる。
+// v6.4: 戻り値は { property, unitIndex } の組。部屋ごとの設備イベント（perUnit）は
+// 空いている部屋も含めて全戸が対象になり、部屋単位でクールダウンを判定する。
+export function eventTargets(event, state) {
+  if (!event.match) return [];
+  const out = [];
+  for (const p of state.properties || []) {
+    if (!event.match(p, state)) continue;
+    if (event.perUnit) {
+      (p.units || []).forEach((u, i) => {
+        if (!eventOnCooldown(state, event.id, p.id, i)) out.push({ property: p, unitIndex: i });
+      });
+    } else if (!eventOnCooldown(state, event.id, p.id)) {
+      out.push({ property: p, unitIndex: null });
+    }
+  }
+  return out;
+}
+
+export function eligibleEvents(state) {
+  return EVENTS.filter(e => (e.match
+    ? eventTargets(e, state).length > 0
+    : e.condition(state) && !eventOnCooldown(state, e.id)));
+}
 
 export function maxYearsForAge(age) {
   return Math.max(1, CONFIG.maxAge - age);
@@ -1184,6 +1661,43 @@ export function resultTitle(state) {
   return `執念の${scale}`;
 }
 
+// v6: おまかせ契約中の物件について、その月の自動発注を処理する。
+// 対象は「手入れの維持」と「原状回復」の2つだけ。大規模修繕・価値UPは金額が大きいのでオーナー判断のまま。
+// 現金が足りない月は黙って見送らず、必ず通知を出す（気づかないまま空室が続くのを防ぐ）。
+function autoManageMonth(s, p, logs) {
+  const nm = p.name || p.label;
+  let short = false;
+
+  // ① 退去した部屋の原状回復。放置すると募集できないので最優先で発注する。
+  for (const u of p.units) {
+    if (!u.needsRestore || u.restoreJob) continue;
+    const cost = autoManageCost(restoreCost(p, u));
+    if (s.cash < cost) { short = true; continue; }
+    s.cash -= cost;
+    u.restoreJob = { monthsTotal: 1, monthsLeft: 1, auto: true };
+    u.restoreProgress = 0;
+    logs.push(`${nm} の原状回復を管理会社が手配した（${yen(cost)}）`);
+  }
+
+  // ② 手入れの維持。基準を下回ったら日常メンテを発注し、完了時に100%へ戻る。
+  if (!p.repairJob && (p.careState ?? 100) < AUTO_MANAGE_CARE_FLOOR) {
+    const cost = autoManageCost(repairCost(p, 'maint'));
+    if (s.cash >= cost) {
+      s.cash -= cost;
+      const months = repairJobMonths(p, 'maint');
+      p.repairJob = { kind: 'maint', monthsTotal: months, monthsLeft: months, startState: p.careState, auto: true };
+      logs.push(`${nm} の日常メンテを管理会社が手配した（${yen(cost)}）`);
+    } else {
+      short = true;
+    }
+  }
+
+  if (short) {
+    pushNotification(s, 'auto_manage_nocash', p.id, nm,
+      `${nm} で残高不足のため、おまかせの自動修繕を実施できませんでした。現金を用意するか契約を見直してください`);
+  }
+}
+
 export function advanceMonth(state, rng = Math.random) {
   let s = structuredClone(state);
   const logs = [];
@@ -1202,6 +1716,10 @@ export function advanceMonth(state, rng = Math.random) {
         }
       }
     }
+    // v6: 経年劣化。🏚躯体は築年帯×構造で、🧹手入れは一律で減る。
+    // 小数のまま保持する（整数に丸めながら引くと、築浅RCの -0.08/月 が永久に0のままになる）。
+    p.repairState = Math.max(0, (p.repairState ?? 100) - structuralDecay(p));
+    p.careState = Math.max(0, (p.careState ?? 100) - CARE_DECAY_PER_MONTH);
     monthlyVacancyRoll(p, rng);
     naturalFillRoll(p, rng);
     const pl = propertyMonthlyPL(p);
@@ -1221,7 +1739,7 @@ export function advanceMonth(state, rng = Math.random) {
     p.history.push({ month: s.month, ...pl });
     if (p.history.length > 24) p.history.shift();
     p.cum.cf += pl.cf; p.cum.months += 1;
-    if (rng() < CONFIG.troubleChance) {
+    if (rng() < troubleChanceFor(p)) {   // v6: 築年帯で傾斜（旧: 全物件3%固定）
       const base = CONFIG.troubleMin + rng() * (CONFIG.troubleMax - CONFIG.troubleMin);
       const c = Math.round(troubleRepairCost(base, skillLevel(s.skills.selfmgmt.exp)));
       s.cash -= c;
@@ -1231,29 +1749,34 @@ export function advanceMonth(state, rng = Math.random) {
     if (p.repairJob) {
       p.repairJob.monthsLeft -= 1;
       const j = p.repairJob;
-      // v4: 工事種別で到達点が変わる（日常メンテは+15で70上限、大規模修繕は100・時価+8%）
-      const goal = repairResultState({ repairState: j.startState }, j.kind || 'large');
+      const kind = j.kind || 'large';
+      // v6: 工事種別ごとに動かすゲージが違う（日常メンテ=🧹手入れ／大規模修繕=🏚躯体）。どちらも到達点は100%。
+      const goal = REPAIR_KINDS[kind].cap;
       if (j.monthsLeft <= 0) {
-        const before = p.repairState;
-        p.repairState = goal;
+        const before = repairGaugeValue(p, kind);
+        setRepairGauge(p, kind, goal);
         p.repairJob = null;
         const nm = p.name || p.label;
-        if ((j.kind || 'large') === 'large') {
+        if (kind === 'large') {
           p.timeValue = Math.round(p.timeValue * 1.08);
           s.skills.selfmgmt.exp += 15;
           if (before < 100) recordJunkRepair(s, p);
-          pushNotification(s, 'repair_done', p.id, nm, `${nm} の大規模修繕が完了しました（修繕度100%・資産価値上昇）`);
-          logs.push(`${nm} の大規模修繕が完了した（修繕度100%）`);
+          pushNotification(s, 'repair_done', p.id, nm, `${nm} の大規模修繕が完了しました（躯体100%・資産価値上昇）`);
+          logs.push(`${nm} の大規模修繕が完了した（躯体100%）`);
         } else {
-          s.skills.selfmgmt.exp += 8;
-          pushNotification(s, 'repair_done', p.id, nm, `${nm} の日常メンテが完了しました（修繕度${goal}%）`);
-          logs.push(`${nm} の日常メンテが完了した（修繕度${goal}%）`);
+          // おまかせ契約による自動工事は「自分で手を動かしていない」ので自主管理EXPが入らない
+          if (!j.auto) s.skills.selfmgmt.exp += 8;
+          pushNotification(s, 'repair_done', p.id, nm,
+            `${nm} の日常メンテが完了しました（手入れ100%）${j.auto ? '／管理会社おまかせ' : ''}`);
+          logs.push(`${nm} の日常メンテが完了した（手入れ100%）`);
         }
       } else {
         const k = j.monthsTotal - j.monthsLeft;
-        p.repairState = Math.min(goal - 1, Math.round(j.startState + (goal - j.startState) * k / j.monthsTotal));
+        setRepairGauge(p, kind, Math.min(goal - 1, j.startState + (goal - j.startState) * k / j.monthsTotal));
       }
     }
+    // v6: 管理会社おまかせ契約。手入れの維持と原状回復の発注をここで自動化する。
+    if (p.autoManage) autoManageMonth(s, p, logs);
     // v3.11: バリューアップ工事の進行。完了月に各室の家賃と時価が上がる。
     if (p.valueUpJob) {
       p.valueUpJob.monthsLeft -= 1;
@@ -1265,10 +1788,10 @@ export function advanceMonth(state, rng = Math.random) {
         logs.push(`${nm} のバリューアップ完了（家賃UP・資産価値上昇）`);
       }
     }
-    // 修繕度が20%を割ったら管理会社から修繕依頼（通知は劣化中に一度だけ・回復で再アーム。修繕中は出さない）
+    // 躯体が20%を割ったら管理会社から修繕依頼（通知は劣化中に一度だけ・回復で再アーム。修繕中は出さない）
     if (p.repairState < 20 && !p.repairAlerted && !p.repairJob) {
       const nm = p.name || p.label;
-      pushNotification(s, 'repair_needed', p.id, nm, `${nm} の劣化が深刻です（修繕度${p.repairState}%）。管理会社から修繕依頼が届きました`);
+      pushNotification(s, 'repair_needed', p.id, nm, `${nm} の劣化が深刻です（躯体${Math.round(p.repairState)}%）。管理会社から修繕依頼が届きました`);
       p.repairAlerted = true;
     } else if (p.repairState >= 20) {
       p.repairAlerted = false;
@@ -1294,12 +1817,15 @@ export function advanceMonth(state, rng = Math.random) {
     const es = eligibleEvents(s);
     if (es.length) {
       const ev = es[Math.floor(rng() * es.length)];
-      let targetId = null;
-      if (ev.genres) {
-        const cands = s.properties.filter(p => ev.genres.includes(p.genreKey));
-        targetId = cands.length ? cands[Math.floor(rng() * cands.length)].id : null;
-      }
-      pendingEvent = { id: ev.id, targetId };
+      // v6: 対象はジャンルではなく match（築年数・構造・戸数・手入れ）で絞り込んだ物件から選ぶ
+      const cands = eventTargets(ev, s);
+      const pick = cands.length ? cands[Math.floor(rng() * cands.length)] : null;
+      const targetId = pick ? pick.property.id : null;
+      const unitIndex = pick ? pick.unitIndex : null;
+      // 見出しは発生した時点で確定させる（セミナーのお題は毎回変わるので、
+      // 描画のたびに引き直すと画面を開き直すだけで題目が変わってしまう）。
+      pendingEvent = { id: ev.id, targetId, unitIndex, title: eventTitle(ev) };
+      recordEventFired(s, ev.id, targetId, unitIndex);   // 同じ部屋・同じ物件で当分は繰り返さない
     }
   }
   s.actionPower = s.baseActionPower;
@@ -1316,6 +1842,9 @@ export function migrateSave(state) {
     // リフォームローンの単数→配列
     if (!Array.isArray(p.reformLoans)) p.reformLoans = p.reformLoan ? [p.reformLoan] : [];
     delete p.reformLoan;
+    // v6: 修繕度の2ゲージ化。旧セーブは1本しか持たないので、手入れは躯体と同じ値から始める。
+    if (p.careState === undefined) p.careState = p.repairState;
+    if (p.autoManage === undefined) p.autoManage = false;
     // 原状回復（部屋ごと）。既存の空室は「原状回復済み」扱いにし、いきなり客付け不可にしない。
     (p.units || []).forEach(u => {
       if (u.needsRestore === undefined) u.needsRestore = false;
@@ -1329,16 +1858,16 @@ export function migrateSave(state) {
 
 // ===== v2: ジャンル・エリア補正・銀行・耐用年数 =====
 export const GENRE = {
-  kodate:    { label:'中古戸建て',         priceMin:3_000_000,  priceMax:15_000_000,  yieldMin:0.08, yieldMax:0.16, structure:'木造', unitsMin:1, unitsMax:1,  ageMin:10, ageMax:40, wake:false },
-  apart:     { label:'一棟アパート',       priceMin:20_000_000, priceMax:80_000_000,  yieldMin:0.07, yieldMax:0.13, structure:'木造', unitsMin:4, unitsMax:10, ageMin:0,  ageMax:40, wake:false },
-  tekkotsu:  { label:'一棟鉄骨マンション', priceMin:30_000_000, priceMax:120_000_000, yieldMin:0.06, yieldMax:0.11, structure:'S',   unitsMin:6, unitsMax:16, ageMin:0,  ageMax:40, wake:false },
-  kubun:     { label:'区分マンション',     priceMin:5_000_000,  priceMax:30_000_000,  yieldMin:0.06, yieldMax:0.10, structure:'RC',  unitsMin:1, unitsMax:1,  ageMin:5,  ageMax:35, wake:false },
-  rc:        { label:'一棟RCマンション',   priceMin:80_000_000, priceMax:300_000_000, yieldMin:0.05, yieldMax:0.09, structure:'RC',  unitsMin:8, unitsMax:24, ageMin:0,  ageMax:45, wake:false },
-  w_kodate:  { label:'訳あり戸建て',       priceMin:10_000,     priceMax:3_000_000,   yieldMin:0.18, yieldMax:3.00, structure:'木造', unitsMin:1, unitsMax:1,  ageMin:30, ageMax:60, wake:true },
-  w_apart:   { label:'訳ありアパート',     priceMin:3_000_000,  priceMax:20_000_000,  yieldMin:0.18, yieldMax:0.60, structure:'木造', unitsMin:4, unitsMax:10, ageMin:23, ageMax:60, wake:true },
-  w_tekkotsu:{ label:'訳あり鉄骨',         priceMin:5_000_000,  priceMax:30_000_000,  yieldMin:0.15, yieldMax:0.50, structure:'S',   unitsMin:6, unitsMax:16, ageMin:30, ageMax:60, wake:true },
-  w_kubun:   { label:'訳あり区分',         priceMin:500_000,    priceMax:5_000_000,   yieldMin:0.15, yieldMax:0.80, structure:'RC',  unitsMin:1, unitsMax:1,  ageMin:30, ageMax:60, wake:true },
-  w_rc:      { label:'訳ありRC',           priceMin:10_000_000, priceMax:80_000_000,  yieldMin:0.15, yieldMax:0.40, structure:'RC',  unitsMin:8, unitsMax:24, ageMin:40, ageMax:60, wake:true },
+  kodate:    { label:'中古戸建て',         yieldMin:0.08, yieldMax:0.16, structure:'木造', unitsMin:1, unitsMax:1,  ageMin:10, ageMax:40, wake:false },
+  apart:     { label:'一棟アパート',       yieldMin:0.07, yieldMax:0.13, structure:'木造', unitsMin:4, unitsMax:10, ageMin:0,  ageMax:40, wake:false },
+  tekkotsu:  { label:'一棟鉄骨マンション', yieldMin:0.06, yieldMax:0.11, structure:'S',   unitsMin:6, unitsMax:16, ageMin:0,  ageMax:40, wake:false },
+  kubun:     { label:'区分マンション',     yieldMin:0.06, yieldMax:0.10, structure:'RC',  unitsMin:1, unitsMax:1,  ageMin:5,  ageMax:35, wake:false },
+  rc:        { label:'一棟RCマンション',   yieldMin:0.05, yieldMax:0.09, structure:'RC',  unitsMin:8, unitsMax:24, ageMin:0,  ageMax:45, wake:false },
+  w_kodate:  { label:'訳あり戸建て',       yieldMin:0.18, yieldMax:3.00, structure:'木造', unitsMin:1, unitsMax:1,  ageMin:30, ageMax:60, wake:true },
+  w_apart:   { label:'訳ありアパート',     yieldMin:0.18, yieldMax:0.60, structure:'木造', unitsMin:4, unitsMax:10, ageMin:23, ageMax:60, wake:true },
+  w_tekkotsu:{ label:'訳あり鉄骨',         yieldMin:0.15, yieldMax:0.50, structure:'S',   unitsMin:6, unitsMax:16, ageMin:30, ageMax:60, wake:true },
+  w_kubun:   { label:'訳あり区分',         yieldMin:0.15, yieldMax:0.80, structure:'RC',  unitsMin:1, unitsMax:1,  ageMin:30, ageMax:60, wake:true },
+  w_rc:      { label:'訳ありRC',           yieldMin:0.15, yieldMax:0.40, structure:'RC',  unitsMin:8, unitsMax:24, ageMin:40, ageMax:60, wake:true },
 };
 
 export const AREA_ADJ = {
@@ -1359,9 +1888,11 @@ export function svgBuildingParts(property) {
   const shape = SHAPE_BY_GENRE[property.genreKey] ?? 'kodate';
   const wake = !!(property.junkFlags && property.junkFlags.length > 0);
   const ageFactor = Math.min(property.builtAge, 60) / 300;
-  const dirtLevel = Math.max(0, Math.min(1, (100 - property.repairState) / 100 + (wake ? 0.25 : 0) + ageFactor));
+  // v6: 見た目も2ゲージで分ける。ひび割れは🏚躯体の傷み、汚れと雑草は🧹手入れの不足として描く。
+  const care = property.careState ?? property.repairState ?? 100;
+  const dirtLevel = Math.max(0, Math.min(1, (100 - care) / 100 + (wake ? 0.25 : 0) + ageFactor));
   const hasCracks = property.repairState < 50 || wake;
-  const hasWeeds = property.repairState < 30;
+  const hasWeeds = care < 30;
   const tilt = wake && property.junkFlags.includes('傾き');
   return { shape, dirtLevel, hasCracks, hasWeeds, tilt, wake };
 }
@@ -1638,8 +2169,213 @@ export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) 
   return { state: s, found, mundane, pressed: true, log };
 }
 
+// === v6: 用語ヘルプ ===
+// ゲーム内に専門用語の説明が一切なかったため、吹き出しで引けるようにする。
+// データを logic 側に置くのは、build-inline.mjs が logic/city/ui の3ファイル決め打ちで、
+// 4つ目のファイルを足すとビルドと dev 復元の両方に手が入るため（過去に起動不能を起こした箇所）。
+//
+// 各項目は def（1行の定義）／here（このゲームでの意味）／hint（数字の目安）の3段構成。
+// group は用語集モーダルの見出しに使う。
+export const TERM_GROUPS = ['収益', '融資', '税・会計', '売買', '管理'];
+
+// def=1行の定義／calc=計算方法（このゲームの実装そのもの）／here=この画面での意味／hint=数字の目安
+export const TERMS = {
+  yield_gross: { scope: 'real', reading: 'ひょうめんりまわり', group: '収益', label: '表面利回り',
+    def: '満室想定の年間家賃を物件価格で割った、いちばん大まかな儲けの指標。',
+    calc: '表面利回り ＝ 満室想定の年間家賃 ÷ 物件価格',
+    here: '市場の物件一覧に出ている「表面利回り」がこれ。経費も空室も引いていないので、実際の手残りはこれより必ず低くなる。',
+    hint: '都心の新しいRCで5〜7%、地方の築古木造で12%以上。訳あり物件は20%を超えることもあるが、その分だけ直す金がかかる。' },
+  yield_net: { scope: 'real', reading: 'じっしつりまわり', group: '収益', label: '実質利回り',
+    def: '運営費を引いた後の収益（NOI）を、購入価格＋諸費用で割ったもの。',
+    calc: '実質利回り ＝ NOI ÷（物件価格 ＋ 諸費用）',
+    here: '表面利回りから管理費・修繕積立・固都税などを引いた「本当の利回り」。',
+    hint: '表面利回りの7〜8割になるのが普通。表面12%なら実質8〜9%あたり。' },
+  gpi: { scope: 'real', group: '収益', label: 'GPI',
+    def: '満室想定年収（Gross Potential Income）。全部屋が埋まった場合の年間家賃。',
+    calc: 'GPI ＝ 全部屋の家賃を合計 × 12ヶ月',
+    here: '収支表のいちばん上の行。あくまで「満室ならこうなる」という理論値。',
+    hint: '空室が1戸でもあれば実際の収入はここから下がる。' },
+  egi: { scope: 'real', group: '収益', label: 'EGI',
+    def: '現況年収（Effective Gross Income）。GPI から空室ぶんを引いた、実際に入ってくる家賃。',
+    calc: 'EGI ＝ GPI − 空室損（＝空いている部屋の家賃 × 12ヶ月）',
+    here: 'いま何戸埋まっているかで毎月変わる。空室を埋めるとここが伸びる。',
+    hint: '入居率80%ならGPIの80%。満室にするインパクトが大きいのはこのため。' },
+  noi: { scope: 'real', group: '収益', label: 'NOI',
+    def: '営業純収益（Net Operating Income）。EGI から運営費を引いた、ローン返済前の利益。',
+    calc: 'NOI ＝ EGI −（管理費 ＋ 修繕積立 ＋ PM費 ＋ 固都税）',
+    here: '銀行が融資審査で見るのはこの数字。物件そのものの稼ぐ力を表す。ローン返済は引かない。',
+    hint: 'NOI からローン返済を引いた残りが手残り（CF）になる。' },
+  cf: { scope: 'real', group: '収益', label: 'CF',
+    def: 'キャッシュフロー。家賃収入から運営費とローン返済を引いて、最後に手元に残る現金。',
+    calc: '月CF ＝ 月の家賃収入 − 運営費 − ローン返済 − 税金',
+    here: '画面上部の「月CF」がこれ。ここがプラスでないと、持っているだけで現金が減っていく。',
+    hint: '1戸あたり月5,000〜15,000円あれば健全とされる。' },
+  vacancy_loss: { scope: 'real', reading: 'くうしつそん', group: '収益', label: '空室損',
+    def: '空室のせいで取り損ねている家賃。',
+    calc: '空室損 ＝ 空いている部屋の家賃を合計 × 12ヶ月',
+    here: '原状回復が終わっていない部屋は募集すらできないので、ここがずっと膨らむ。',
+    hint: '家賃5万円の部屋を3ヶ月空けると15万円の損。原状回復を先延ばしするほど高くつく。' },
+  pm_fee: { scope: 'real', group: '管理', label: 'PM費',
+    def: '賃貸管理会社に払う手数料。家賃回収・入居者対応・退去精算などを代行してもらう対価。',
+    calc: 'PM費 ＝ 実際に入った家賃 × 5%',
+    here: '運営費に毎月含まれている。空室の部屋には発生しない（家賃が入っていないため）。',
+    hint: '相場は家賃の3〜5%。自主管理にすればゼロにできるが、その手間は自分で負う。' },
+
+  dscr: { scope: 'real', group: '融資', label: 'DSCR',
+    def: '債務返済余裕率（Debt Service Coverage Ratio）。NOI が年間のローン返済額の何倍あるかを示す。',
+    calc: 'DSCR ＝ 年間NOI ÷ 年間ローン返済額',
+    here: '銀行の審査に必ず出てくる。1.0 を切ると家賃だけでは返済できない状態。頭金を増やすと返済額が減るのでDSCRは上がる。',
+    hint: 'このゲームでは 1.3 以上ないと融資が下りない。例: 年間NOI 260万・年間返済 200万 → DSCR 1.30 でぎりぎり通る。' },
+  ltv: { scope: 'real', group: '融資', label: 'LTV',
+    def: '物件価格に対する借入額の割合（Loan to Value）。',
+    calc: 'LTV ＝ 借入額 ÷ 物件価格 ＝ 100% − 頭金の割合',
+    here: 'LTV80%なら価格の8割を借りて、残り2割を頭金として自分で出す。銀行ごとに上限が決まっている。',
+    hint: '公庫70%・地銀/信金80%・ノンバンク90%。LTVが高いほど手出しは減るが、返済が重くなりDSCRが下がる。' },
+  own_cash: { scope: 'real', group: '融資', label: '自己資金',
+    def: '購入時に自分で出す現金。頭金と諸費用の合計。',
+    calc: '自己資金 ＝ 頭金（物件価格 ×（100% − LTV）） ＋ 諸費用（物件価格 × 7%）',
+    here: '「最低自己資金」は、いまの信用度で審査が通る銀行のうち、いちばん手出しが少なくて済む金額。',
+    hint: '例: 1,000万の物件をLTV80%で買うと 200万 ＋ 諸費用70万 ＝ 270万。価格の2〜3割を見ておくと安全。' },
+  closing_cost: { scope: 'real', group: '融資', label: '諸費用',
+    def: '仲介手数料・登記費用・不動産取得税・火災保険など、物件価格とは別にかかる初期費用。',
+    calc: '諸費用 ＝ 物件価格 × 7%',
+    here: '融資では基本的にカバーされないので、必ず現金で用意することになる。',
+    hint: '1,000万の物件なら70万。実務でも6〜8%が目安。' },
+  leverage: { scope: 'real', group: '融資', label: 'レバレッジ',
+    def: '借入を使って、自己資金だけでは届かない規模の物件を買うこと。',
+    calc: 'レバレッジ倍率 ＝ 物件価格 ÷ 自己資金',
+    here: 'このゲームの主題。少ない元手で大きな資産を動かせるが、失敗したときの傷も同じだけ大きくなる。',
+    hint: '自己資金500万で5,000万の物件を買えば10倍。倍率が高いほど、家賃が少し下がっただけで赤字に転落する。' },
+  yield_gap: { scope: 'real', group: '融資', label: 'イールドギャップ',
+    def: '物件の利回りと借入金利の差。',
+    calc: 'イールドギャップ ＝ 実質利回り − 借入金利',
+    here: 'この差が大きいほど、借りて買うほど儲かる。差が小さいと借金だけが残る。',
+    hint: '実質利回り8%・金利2%ならギャップ6%。2%以上は欲しいところ。ノンバンクの金利4%は差を食いつぶしやすい。' },
+  credit_score: { scope: 'game', group: '融資', label: '信用度',
+    def: '銀行から見たあなたの返済能力・信頼度。0〜100で表す。',
+    calc: '初期値はサラリーマン60・自営業10。ローンを完済する、管理組合の理事を引き受ける等で上がる。',
+    here: '高いほど多くの銀行が使え、金利も下がる。低いと審査の入口で弾かれる。',
+    hint: '公庫は20、ノンバンクは25、信金は35、地銀は50から取り扱ってもらえる。' },
+
+  depreciation: { scope: 'real', reading: 'げんかしょうきゃく', group: '税・会計', label: '減価償却',
+    def: '建物の価値の目減りを、毎年の経費として計上する仕組み。',
+    calc: '月の償却額 ＝ 建物価格 ÷ 償却期間（月数）。建物価格は木造なら物件価格の50%、S・RCなら45%。',
+    here: '現金が出ていかないのに経費にできるので、課税所得を圧縮できる。',
+    hint: '法定耐用年数は木造22年・鉄骨34年・RC47年。耐用年数を過ぎた築古は「法定年数×20%」の短期間で一気に落とせる。' },
+  depr_remaining: { scope: 'real', reading: 'ざんぞんしょうきゃく', group: '税・会計', label: '残存償却',
+    def: 'あと何ヶ月ぶん減価償却を計上できるか。',
+    calc: '購入時の償却期間から、保有した月数を引いた残り。',
+    here: '物件の概要に出ている。ここがゼロになるとデッドクロスに入る。',
+    hint: '残り12ヶ月を切ったら、売却か買い増しを考えはじめる合図。' },
+  dead_cross: { scope: 'real', group: '税・会計', label: 'デッドクロス',
+    def: '減価償却が終わり、経費に落とせるものが無いのにローン返済だけが残る状態。',
+    calc: '残存償却が0になった時点から、NOIに対して 個人40% / 法人30% の課税がかかる。',
+    here: '帳簿では黒字なのに手元の現金は減る、という一番きつい局面。',
+    hint: '法人名義なら30%で済む。償却が切れる前に法人化するか、売却を考える。' },
+  capital_gains_tax: { scope: 'real', reading: 'じょうとぜい', group: '税・会計', label: '譲渡税',
+    def: '物件を売って出た利益にかかる税金。',
+    calc: '譲渡税 ＝（売却価格 − 取得費 − 償却済み額）× 税率。個人は保有5年以内39%・5年超20%、法人は一律30%。',
+    here: '個人名義は保有5年以内だと税率がほぼ倍になる。法人名義には5年ルールがない。',
+    hint: '短期転売を狙うなら法人化を検討する。5年目前なら、あと数ヶ月待つだけで手取りが大きく変わる。' },
+  houjin_nari: { scope: 'real', reading: 'ほうじんなり', group: '税・会計', label: '法人成り',
+    def: '個人でやっていた不動産賃貸業を、会社（法人）を作ってそちらの名義に移すこと。',
+    calc: '設立費用200万円。以降は物件の名義が法人なら NOI への課税が30%（個人は償却切れ後40%）。',
+    here: '「資産・バランスシート」の中から設立できる。設立後は既存物件を1件ずつ法人へ移転していく（ローン完済済みのものだけ）。',
+    hint: '規模が大きくなるほど税率差が効く。個人の譲渡税は保有5年以内39%だが、法人は保有期間に関係なく30%。' },
+  net_worth: { scope: 'real', reading: 'じゅんしさん', group: '税・会計', label: '純資産',
+    def: '総資産（現金＋物件の時価）から総負債（ローン残債）を引いた、正味の財産。',
+    calc: '純資産 ＝ 手元現金 ＋ 全物件の時価 − ローン残債の合計',
+    here: '目標が「純資産型」ならこれを積み上げるゲームになる。',
+    hint: '物件を買った直後は諸費用ぶんだけ必ず目減りする。焦らなくてよい。' },
+  time_value: { scope: 'real', reading: 'じか', group: '税・会計', label: '時価',
+    def: 'いま売ったらいくらになるかという評価額。',
+    calc: '時価 ＝ 満室想定年収 ÷ 市場利回り × 入居率の補正 × 躯体の補正（躯体が0%だと最大15%減）',
+    here: '空室を埋める・家賃を上げる・躯体を直す、のどれでも上がる。',
+    hint: '木造は毎月0.15%ほど下がる。建物の価値は時間とともに落ちていく。' },
+
+  sashine: { scope: 'real', reading: 'さしね', group: '売買', label: '指値',
+    def: '売出価格より安い金額を提示して交渉すること。',
+    calc: '値引き率 ＝（売出価格 − 提示額）÷ 売出価格。取次ラインの範囲内なら普通に交渉してもらえる。',
+    here: '交渉力が高いほど、また売主が売り急いでいるほど、深い指値が通りやすい。',
+    hint: '1割程度なら普通に取り次いでもらえる。理由なく3割超を出すと評判が下がり、交渉EXPも減る。' },
+  toritsugi: { scope: 'game', reading: 'とりつぎライン', group: '売買', label: '取次ライン',
+    def: '不動産会社が「この値引き幅なら売主に持っていける」と判断する境目。',
+    calc: '基準の値引き幅に、交渉力レベル・訳あり・売れ残り月数・売主の売り急ぎを加算して決まる。',
+    here: 'この範囲内の指値は普通に交渉してもらえる。超えると門前払いか、評判を落とす。',
+    hint: '売れ残っている物件や相続で急いでいる売主ほどラインは広がる。焦って初月に指値しない。' },
+  wakeari: { scope: 'real', reading: 'わけあり', group: '売買', label: '訳あり',
+    def: '残置物・事故歴・再建築不可・管理崩壊など、なにか事情を抱えた物件。',
+    calc: '訳あり物件は躯体0〜40%・手入れ20〜60%で生成され、入居率も40%程度から始まる。',
+    here: '安く買えるが、躯体が傷んでいて大規模修繕に数百万かかることが多い。融資も公庫とノンバンクしか使えない。',
+    hint: '買値の安さだけで判断しない。「買値 ＋ 大規模修繕費」で採算が合うかを見る。木造6戸なら修繕に400万前後かかる。' },
+
+  rentroll: { scope: 'real', reading: 'レントロール', group: '管理', label: 'レントロール',
+    def: '部屋ごとの家賃・間取り・入居状況を一覧にした表。',
+    calc: '各室の家賃を合計したものが月の満室想定家賃になる。',
+    here: '詳細画面の「レントロール」タブ。どの部屋が空いていて、いくら取れているかが分かる。',
+    hint: '同じ建物なのに家賃差が大きい部屋は、値上げか値下げの余地がある。' },
+  kyakuduke: { scope: 'real', reading: 'きゃくづけ', group: '管理', label: '客付け',
+    def: '空室に入居者を決めること。',
+    calc: '広告を出す＝家賃1ヶ月分で成功率70%。自分で動く＝行動力30で成功率 40%＋（自主管理Lv−1）×10%。',
+    here: '何もしなくても毎月一定の確率で自然に埋まるが、その確率は手入れの状態で変わる。',
+    hint: '自然客付けは手入れ100%で25%／手入れ0%で15%。草ぼうぼうの物件は内見で決まらない。' },
+  genjo_kaifuku: { scope: 'real', reading: 'げんじょうかいふく', group: '管理', label: '原状回復',
+    def: '退去後の部屋を、次の入居者に貸せる状態まで戻す工事。',
+    calc: '費用 ＝ 家賃 ×（2 ＋ 躯体の傷み ÷ 50）×（1 ＋ 入居月数 ÷ 120）',
+    here: 'これが終わるまでその部屋は募集できない。放置するほど空室損が積み上がる。',
+    hint: '長く住んでいた部屋ほど高くつく。10年入居なら通常の約2倍。DIYなら材料費（見積の30%）だけで済む。' },
+  repair_state: { scope: 'game', reading: 'くたい', group: '管理', label: '躯体',
+    def: '外壁・屋根・防水・構造といった建物本体の状態。0〜100%。',
+    calc: '毎月 築年数の基準（築浅0.10／中古0.25／築古0.35）× 構造の係数（木造1.3／S 1.0／RC 0.8）ずつ下がる。',
+    here: '足場を組む大規模修繕でしか回復しない。清掃や草刈りでは1%も戻らない。時価と銀行の評価に効く。',
+    hint: '築40年の木造なら100%→70%まで5.5年。築5年のRCなら31年かかる。10〜15年に一度の大規模修繕が前提。' },
+  care_state: { scope: 'game', reading: 'ていれ', group: '管理', label: '手入れ',
+    def: '清掃・草刈り・共用部の管理といった、日々の手入れの状態。0〜100%。',
+    calc: '毎月一律 2.0 ずつ下がる（築年数・構造には関係しない）。日常メンテで100%に戻る。',
+    here: '客付けの決まりやすさと退去率に効く。管理会社へおまかせすれば自動で維持される。',
+    hint: '100%から70%まで15ヶ月。50%を切ると退去率が1.5倍に跳ねる。' },
+  koto_zei: { scope: 'real', reading: 'こととぜい', group: '管理', label: '固都税',
+    def: '固定資産税と都市計画税。物件を持っているだけで毎年かかる。',
+    calc: '年間の固都税 ＝ 物件価格 × 0.7%（最低3万円）',
+    here: '運営費に含まれている。空室でも容赦なくかかる固定費。',
+    hint: '1,000万の物件なら年7万円。空室が続くと、この固定費がそのまま赤字になる。' },
+  action_power: { scope: 'game', group: '管理', label: '行動力',
+    def: 'その月に動ける量。翌月へ進むと全回復する。',
+    calc: '働く＝1／物件を探す＝1／買付＝10／自主客付け＝30／査定＝5／工事の発注＝5／DIY＝1回10〜15。',
+    here: '「働く」で種銭を稼ぐか、「探す」で物件を見つけるか、DIYで工事費を浮かせるか、の取り合いになる。',
+    hint: '月100が基準。DIYで安く直すと、その月は稼げず探せない。これが「金 vs 時間」のトレードオフ。' },
+  seed_money: { scope: 'real', reading: 'たねせん', group: '売買', label: '種銭',
+    def: '不動産投資を始めるための元手の現金。',
+    calc: '「働く」1回（行動力1）につき 1,000〜10,000円。平均は約2,000円。',
+    here: 'ゲーム開始時に設定した金額からスタートする。足りなければ働いて増やす。',
+    hint: '最初の1棟は「最低自己資金」が手元現金以下の物件から選ぶ。地方の訳ありアパートなら100〜200万から狙える。' },
+};
+
+// === v6: 最低自己資金 ===
+// 「手元いくらでこの物件が買えるのか」は融資タブを開くまで分からなかった。
+// 4行の審査を回し、承認される中でいちばん手出しが少なくて済む組み合わせを返す。
+// 「現金が足りない（NO_CASH）」だけは判定から外す。いくら要るかを知るための計算なので、
+// 今その金額を持っているかどうかは関係ない。
+export function minRequiredCash(property, state, price = property.price) {
+  let best = null;
+  for (const bankKey of Object.keys(BANKS)) {
+    // 頭金を1%刻みで増やしていき、その銀行が最初に承認する点＝その銀行での最小手出し
+    for (let down = 0.05; down <= 0.95; down += 0.01) {
+      const r = reviewLoan(bankKey, property, price, down, state);
+      if (r.reasons.some(x => x.code !== 'NO_CASH')) continue;
+      const cash = Math.round(price * down + price * CONFIG.closingCostRate);
+      if (!best || cash < best.cash) best = { cash, bankKey, label: BANKS[bankKey].label, downRatio: down, financed: true };
+      break;
+    }
+  }
+  // どの銀行も通らなければ現金で買うしかない
+  const cashBuy = Math.round(price * (1 + CONFIG.closingCostRate));
+  if (!best || cashBuy < best.cash) return { cash: cashBuy, bankKey: null, label: '現金購入', downRatio: 1, financed: false };
+  return best;
+}
+
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, restoreCost, startRestore, REPAIR_KINDS, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, EVENTS, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillChance, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, restoreCost, startRestore, REPAIR_KINDS, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -2250,7 +2986,7 @@ function tipHtmlFor(hit) {
   const nm = p.name || p.label;
   if (hit.kind === 'owned') {
     const occ = p.units && p.units.length ? Math.round(p.units.filter(u => u.occupied).length / p.units.length * 100) : 100;
-    return `🏠 <b>${nm}</b><br>${p.owner === 'corp' ? '🏢法人' : '👤個人'}・入居${occ}%・修繕度${p.repairState}%${p.repairJob ? '・🔨修繕中' : ''}`;
+    return `🏠 <b>${nm}</b><br>${p.owner === 'corp' ? '🏢法人' : '👤個人'}・入居${occ}%・躯体${Math.round(p.repairState)}%・手入れ${Math.round(p.careState ?? p.repairState)}%${p.repairJob ? '・🔨修繕中' : ''}${p.autoManage ? '・🏢おまかせ' : ''}`;
   }
   return `⭐ <b>${nm}</b><br>市場（お気に入り）・${L.yen(p.price)}`;
 }
@@ -2532,6 +3268,12 @@ function sfxKnock() { playTone({ freq: 180, duration: 0.08, type: 'triangle', ga
 function sfxCoin() { [880, 1180, 1480].forEach((f, i) => playTone({ freq: f, duration: 0.12, type: 'sine', gain: 0.10, delay: i * 0.05 })); }
 function sfxFanfare() { [523, 659, 784, 1046].forEach((f, i) => playTone({ freq: f, duration: 0.28, type: 'triangle', gain: 0.15, delay: i * 0.1 })); }
 function sfxBadge() { playTone({ freq: 1046, duration: 0.15, type: 'sine', gain: 0.12 }); playTone({ freq: 1568, duration: 0.22, type: 'sine', gain: 0.10, delay: 0.1 }); }
+// v6: 営業（動いて情報を集める）の1押しごとの足音。0.2秒間隔で連打される。
+// 当初 300Hz・gain 0.05・40ms にしたが、低い音は同じ振幅でも聴感上ずっと小さく、
+// 実機では鳴っていないのと同じだった。sfxClick（700Hz・0.05）と同程度まで上げている。
+function sfxStep() { playTone({ freq: 520, duration: 0.06, type: 'triangle', gain: 0.10 }); }
+// 平凡な出物を見たときの、気の抜けた短い音（足音とは音程で区別する）
+function sfxMundane() { playTone({ freq: 330, duration: 0.10, type: 'sine', gain: 0.09 }); }
 // 買付の溜め用ドラムロール（低音の連打が徐々に速く強くなる）
 function sfxDrumroll() { for (let i = 0; i < 22; i++) playTone({ freq: 90 + (i % 2) * 20, duration: 0.05, type: 'triangle', gain: 0.05 + i * 0.004, delay: i * (0.09 - i * 0.002) }); }
 // 買付不成立の残念音（下降する短二音）
@@ -2686,20 +3428,79 @@ function showTitle(hasSave) {
   });
 }
 
-// v3.7: 初回チュートリアル。先輩大家🧑‍🏫の吹き出しが基本動作を順番に案内（スキップ可・完了は端末に記録）。
+// v7: 初回チュートリアル。先輩大家🧑‍🏫の吹き出しが基本動作を順番に案内する。
+// 「次へ」ボタンでは進めず、実際に対象ボタンを押すことでのみ次のステップへ進む（スキップは可）。
+// 各アクション処理の実処理箇所（wireWorkButton・openSearchModal・openListingsModal・
+// .listing-buy・#of-full・showPayment・onNextMonth）から tutMaybeAdvance(key) を呼び、
+// 現在のステップと一致すれば進む。開始時に state のスナップショットを取り、
+// 終了・スキップのいずれでも必ず復元する（チュートリアル中の操作を本編に持ち越さない）。
 // v3.12: 対象ボタンはPC用パネル（btn-*）とスマホ用バー（m-*）で別物なので、候補を並べて
 // 「実際に画面に出ている方」を選ぶ。従来はPC用のidだけを見ており、スマホではすべての対象が
 // 非表示（実サイズ0）だったため、吹き出しが毎回画面左上に固定され上部の情報バーに被っていた。
+// v7.2: 「1ステップ＝押すボタン1つ」に統一する。
+// 従来は「探すを押し、中の動いて情報を集めるを押す」のように1ステップに2操作を詰めており、
+// 穴が次のボタンへ移っても文面が変わらず、どちらを押すのか分からなかった。
+//
+// keep: そのステップで開いたままにしてよい重ね画面のid。ここに無いものは renderTutStep が勝手に閉じる。
+// 従来は探すモーダルが開いたまま「🗂️市場」を指しており、対象ボタンがモーダルの裏に隠れて
+// 押せず手詰まりになっていた。「説明に不要な画面は出さない」を仕組みで保証する。
+const TUT_OVERLAYS = ['search-modal', 'listings-modal', 'purchase-modal', 'detail-modal', 'mobile-drawer'];
 const TUTORIAL_STEPS = [
-  { targets: ['m-work', 'btn-work'], text: 'まずは💼「働く」で種銭を作ろう。長押しで連続で稼げるぞ。' },
-  { targets: ['m-search', 'btn-open-search'], text: '次は🏘️「物件を探す」。1回ごとに行動力1。何度も足を運ぶほど出物に近づく。' },
-  { targets: ['btn-open-listings', 'm-menu'], text: '見つけた物件は🗂️市場一覧に並ぶ（スマホは≡メニューの中）。「買付を検討」から満額か指値で申し込もう。指値は断られることもある。' },
-  { targets: ['btn-open-listings', 'm-menu'], text: '支払いは現金一括か融資。融資なら頭金をスライダーで自由に決めて、4つの銀行の審査結果を見比べよう。' },
-  { targets: ['m-next', 'btn-next-month-desk'], text: '📅「翌月へ進む」と家賃が入り、行動力が全回復する。ここからは君の腕次第だ！' },
+  { key: 'work', keep: [], targets: ['m-work', 'btn-work'],
+    text: 'まずは種銭づくり。💼「働く」を押してみよう。' },
+  { key: 'openSearch', keep: [], targets: ['m-search', 'btn-open-search'],
+    text: '次は物件探し。🏘️「物件を探す」を押そう。' },
+  { key: 'search', keep: ['search-modal'], targets: ['btn-search'], rebuild: () => openSearchModal(),
+    text: '🔍「動いて情報を集める」を押そう。押すほど出物に近づく。' },
+  // スマホは市場一覧が≡メニューの中にあるため1手増える。PCでは対象が無いので自動で飛ぶ。
+  { key: 'drawer', keep: [], targets: ['m-menu'], optional: true,
+    text: '見つけた物件は市場一覧に並ぶ。≡「メニュー」を開こう。' },
+  { key: 'listings', keep: ['mobile-drawer'], targets: ['dr-listings', 'btn-open-listings'],
+    text: '🗂️「市場」を押して、見つけた物件を見てみよう。' },
+  { key: 'buy', keep: ['listings-modal'], selector: '.listing-buy', rebuild: () => openListingsModal(),
+    text: '物件の「買付を検討」を押そう。' },
+  { key: 'offer', keep: ['purchase-modal'], selector: '#of-full',
+    text: '「満額」を押そう。満額なら必ず通る（指値は断られることもある）。' },
+  { key: 'payment', keep: ['purchase-modal'], selector: '#pay-cash',
+    text: '「現金一括」を押そう。融資を使うなら頭金をスライダーで決める。' },
+  // v7.4: 月が変わると行動力が全回復する、という一番大事な循環をここで体験させる。
+  // prepare で行動力をわざと一桁まで減らしておき、押した瞬間に満タンへ戻るのを見せる。
+  { key: 'next', keep: [], targets: ['m-next', 'btn-next-month-desk'],
+    prepare: () => { state.actionPower = 6; },
+    text: '行動力が残り6しかない。📅「翌月へ進む」を押そう。' },
+  // ここから先は押すボタンが無い説明。吹き出しの「次へ」で進む。
+  // v7.5: 回復は専用の演出ではなく、実際の行動力の欄を指して見せる。
+  // チュートリアルだけの特別な画面を作ると、本編で同じものを探しても見つからない。
+  { key: 'apRecovered', keep: [], info: true, targets: ['hud-ap', 'hud-ap-m'],
+    text: 'ここを見てほしい。行動力が6から満タンに戻っている。月が変わるたび、ここが全回復する。' },
+  { key: 'terms', keep: [], info: true, targets: ['btn-terms'],
+    text: '点線の用語はポインタを合わせると説明が出る。📖 で表示のON/OFF、長押しで用語集がまとめて読める。' },
+  // v7.6: ここで「押して確認してみよう」とは言わない。押すと開く画面は暗幕の下に入って読めず、
+  // 促しておきながら確認できない状態になる。場所だけ教えて、確認は本編に入ってからにしてもらう。
+  { key: 'panel', keep: [], info: true, targets: ['panel-left', 'mobile-status'],
+    text: 'ここに経過年数・現金・月CF・バランスシート。純資産や負債といった財務の状況、法人成りもこの中から。各項目はあとでゆっくりチェックしてみてね。' },
+  { key: 'finish', keep: [], final: true,
+    text: 'ひととおり触れた！ここまでの操作はリセットされ、本編は最初から始まる。' },
 ];
-// 候補のうち実際に表示されている（実サイズを持つ）ものを返す
-function visibleTutTarget(ids) {
-  for (const id of ids) {
+
+// そのステップに不要な重ね画面を閉じる。各モーダルの close() と同じ後始末をする。
+function closeTutOverlays(keep = []) {
+  for (const id of TUT_OVERLAYS) {
+    if (keep.includes(id)) continue;
+    const m = document.getElementById(id);
+    if (!m || m.classList.contains('hidden')) continue;
+    m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = '';
+  }
+}
+// ステップの対象を実DOMから探す（実際に画面に出ている＝実サイズを持つものだけを返す）
+function visibleTutTarget(stp) {
+  if (stp.selector) {
+    const e = document.querySelector(stp.selector);
+    if (!e) return null;
+    const r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 ? e : null;
+  }
+  for (const id of stp.targets) {
     const e = document.getElementById(id);
     if (!e) continue;
     const r = e.getBoundingClientRect();
@@ -2707,37 +3508,209 @@ function visibleTutTarget(ids) {
   }
   return null;
 }
-let tutIdx = -1, tutBubble = null;
-function startTutorial() { tutIdx = 0; renderTutStep(); }
+let tutIdx = -1, tutBubble = null, tutSnapshot = null;
+// v7.1: 対象ボタンの周囲だけ穴を開けた4枚の暗幕（上下左右）で覆い、対象以外は暗くしつつクリックも塞ぐ。
+// 単一のオーバーレイに穴を開けるのではなく、対象の矩形を避けて上下左右の帯を敷き詰める方式。
+let tutMaskEls = [];
+// renderTutStep の世代。次フレームでの再測定が「古いステップの予約」かを判別するために使う。
+let tutRenderSeq = 0;
+let tutObserver = null;   // 対象の実寸が決まるのを待つ監視役（ステップごとに張り替える）
+function clearTutMask() { tutMaskEls.forEach(e => e.remove()); tutMaskEls = []; }
+function buildTutMask(rect) {
+  clearTutMask();
+  const pad = 8;
+  const l = Math.max(0, rect.left - pad), t = Math.max(0, rect.top - pad);
+  const w = rect.width + pad * 2, h = rect.height + pad * 2;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const bands = [
+    { left: 0, top: 0, width: vw, height: t },                              // 上
+    { left: 0, top: t + h, width: vw, height: Math.max(0, vh - t - h) },    // 下
+    { left: 0, top: t, width: l, height: h },                               // 左
+    { left: l + w, top: t, width: Math.max(0, vw - l - w), height: h },     // 右
+  ];
+  bands.forEach(b => {
+    if (b.width <= 0 || b.height <= 0) return;
+    const d = document.createElement('div');
+    d.style.cssText = `position:fixed;left:${b.left}px;top:${b.top}px;width:${b.width}px;height:${b.height}px;background:rgba(2,6,23,0.6);z-index:64;`;
+    d.addEventListener('click', (e) => e.stopPropagation());
+    document.body.appendChild(d);
+    tutMaskEls.push(d);
+  });
+}
+function startTutorial() {
+  tutSnapshot = structuredClone(state);
+  tutStepStates = [];
+  closeTutOverlays([]);   // 開いたままの画面があると1手目から対象が隠れる
+  tutIdx = 0;
+  renderTutStep();
+}
 function endTutorial() {
   localStorage.setItem('lm_tutorial_done', '1');
   tutBubble?.remove(); tutBubble = null;
-  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl', 'ring-4', 'ring-amber-400'));
+  tutObserver?.disconnect(); tutObserver = null;
+  tutStepStates = [];
+  clearTutMask();
+  closeTutOverlays([]);   // 途中でスキップしても、開きっぱなしの画面を残さない
+  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl'));
   tutIdx = -1;
+  if (tutSnapshot) {
+    state = tutSnapshot; tutSnapshot = null;
+    save(); render();
+    showTutEndToast();
+  }
 }
+// 進捗表示。optional（レイアウト依存で出ないことがある）は数に入れないので、
+// PCでもスマホでも分母が変わらない。
+function tutStepTotal() { return TUTORIAL_STEPS.filter(s => !s.optional).length; }
+function tutStepNo() {
+  let n = 0;
+  for (let i = 0; i <= tutIdx && i < TUTORIAL_STEPS.length; i++) if (!TUTORIAL_STEPS[i].optional) n += 1;
+  return Math.max(1, n);
+}
+
+// v7.3: 「← 前に戻る」。押した操作はゲームの状態を変えてしまうので（働けば現金が増え、
+// 買えば物件が増える）、各ステップに入る直前の状態を控えておき、戻るときはそこへ復元する。
+// 巻き戻さずに画面だけ戻すと、2回働いた・2回買ったという状態が残ってしまう。
+let tutStepStates = [];
+
+// 戻り先にできるのは「実際に表示された」かつ「画面を作り直せる」ステップだけ。
+// 満額・現金一括の段は買付フローの途中状態（指値が通った直後）で、外から復元できない。
+// その場合はさらに手前（買付を検討）まで戻し、そこからやり直してもらう。
+function tutCanReturnTo(i) {
+  const stp = TUTORIAL_STEPS[i];
+  if (!tutStepStates[i]) return false;             // 表示されなかった段（飛ばした段）
+  if (!stp.keep || stp.keep.length === 0) return true;   // 重ね画面が要らない段はそのまま戻れる
+  return typeof stp.rebuild === 'function';        // 要る段は作り直せるものだけ
+}
+
+function tutPrevIdx() {
+  for (let i = tutIdx - 1; i >= 0; i--) if (tutCanReturnTo(i)) return i;
+  return -1;
+}
+
+function tutGoBack() {
+  const prev = tutPrevIdx();
+  if (prev < 0) return;
+  state = structuredClone(tutStepStates[prev]);
+  // 戻り先より後の控えは捨てる（そこから進み直すと取り直される）
+  tutStepStates = tutStepStates.slice(0, prev);
+  tutIdx = prev;
+  save(); render();
+  renderTutStep();
+}
+
+// 現在のステップに対応する実操作が起きたときだけ呼ばれる。一致しなければ何もしない。
+function tutMaybeAdvance(key) {
+  if (tutIdx < 0 || TUTORIAL_STEPS[tutIdx].key !== key) return;
+  tutIdx += 1;
+  if (tutIdx >= TUTORIAL_STEPS.length) { endTutorial(); return; }
+  const nx = TUTORIAL_STEPS[tutIdx];
+  // 段に入る前の下ごしらえ（行動力を減らす等）。render() が続けて renderTutStep を呼ぶので
+  // ここで renderTutStep を直接呼ぶと二重描画になる。
+  if (typeof nx.prepare === 'function') { nx.prepare(); save(); render(); return; }
+  renderTutStep();
+}
+
+function showTutEndToast() {
+  const t = el(`<div class="fixed top-4 left-1/2 -translate-x-1/2 bg-amber-500 text-white rounded-lg shadow-lg px-4 py-2 z-50 text-sm font-bold">🧑‍🏫 チュートリアル終了！ここからが本編だ</div>`);
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.transition = 'opacity 0.5s'; t.style.opacity = '0'; setTimeout(() => t.remove(), 500); }, 2200);
+}
+// v7.4: 締めの画面。指すボタンが無いので画面全体を暗幕1枚で覆い、中央に吹き出しを置く。
+// ここで初めて「本編を始める」を押させる（それまでは勝手に本編へ入らない）。
+function renderTutFinal(stp) {
+  if (!tutStepStates[tutIdx]) tutStepStates[tutIdx] = structuredClone(state);
+  clearTutMask();
+  const veil = document.createElement('div');
+  veil.style.cssText = 'position:fixed;inset:0;background:rgba(2,6,23,0.72);z-index:64;';
+  veil.addEventListener('click', (e) => e.stopPropagation());
+  document.body.appendChild(veil);
+  tutMaskEls.push(veil);
+
+  const canBack = tutPrevIdx() >= 0;
+  tutBubble = el(`<div class="fixed inset-0 z-[65] flex items-center justify-center p-4 pointer-events-none">
+    <div class="bg-white rounded-xl shadow-2xl p-4 w-full max-w-xs space-y-3 border-2 border-amber-400 pointer-events-auto text-center">
+      <div class="text-3xl">🧑‍🏫</div>
+      <div class="font-bold text-slate-800">チュートリアル終了</div>
+      <div class="text-xs text-slate-700 leading-relaxed text-left">${linkTerms(stp.text)}</div>
+      <button class="tut-finish w-full bg-amber-500 hover:bg-amber-600 text-white rounded-lg py-2.5 text-sm font-bold shadow">🎬 本編を始める</button>
+      <button class="tut-back text-navy text-[11px] font-bold ${canBack ? '' : 'invisible'}">← 前に戻る</button>
+    </div></div>`);
+  document.body.appendChild(tutBubble);
+  tutBubble.querySelector('.tut-finish').addEventListener('click', endTutorial);
+  tutBubble.querySelector('.tut-back').addEventListener('click', tutGoBack);
+}
+
 function renderTutStep() {
   if (tutIdx < 0) return;
   tutBubble?.remove(); tutBubble = null;
-  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl', 'ring-4', 'ring-amber-400'));
+  clearTutMask();
+  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl'));
   if (tutIdx >= TUTORIAL_STEPS.length) { endTutorial(); return; }
   const stp = TUTORIAL_STEPS[tutIdx];
-  const target = visibleTutTarget(stp.targets);
+  // v7.2: このステップに不要な重ね画面は先に閉じる。開いたままだと対象ボタンが裏に隠れて押せない。
+  closeTutOverlays(stp.keep || []);
+  // v7.4: 最終ステップは指すボタンが無い。画面全体を暗くして中央に締めの吹き出しを出す。
+  if (stp.final) { renderTutFinal(stp); return; }
+  let target = visibleTutTarget(stp);
+  // v7.3: 「戻る」で来たときは必要な画面が閉じている。作り直せる段はここで開き直す。
+  if (!target && typeof stp.rebuild === 'function') {
+    stp.rebuild();
+    target = visibleTutTarget(stp);
+  }
+  // 対象が画面に無いステップは飛ばす（スマホだけのメニュー等）。説明に不要な操作は勝手に省く。
   if (!target) { tutIdx += 1; renderTutStep(); return; }
-  target.classList.add('tut-hl', 'ring-4', 'ring-amber-400');
-  tutBubble = el(`<div class="fixed z-[65]" style="visibility:hidden; left:0; top:0;">
-    <div class="relative bg-white rounded-xl shadow-2xl p-3 text-xs space-y-2 border-2 border-amber-400">
-      <div class="font-bold text-slate-800">🧑‍🏫 先輩大家（${tutIdx + 1}/${TUTORIAL_STEPS.length}）</div>
-      <div class="text-slate-700 leading-relaxed">${stp.text}</div>
-      <div class="flex gap-2">
-        <button class="tut-next flex-1 bg-amber-500 hover:bg-amber-600 text-white rounded py-1.5 font-bold">${tutIdx === TUTORIAL_STEPS.length - 1 ? 'はじめる！' : '次へ ▶'}</button>
-        <button class="tut-skip text-slate-500 px-2">スキップ</button>
+  // この段に入る直前の状態を控える（戻るときの復元点）。再表示では上書きしない。
+  if (!tutStepStates[tutIdx]) tutStepStates[tutIdx] = structuredClone(state);
+  target.classList.add('tut-hl');
+  buildTutMask(target.getBoundingClientRect());
+  // v7.2: 吹き出しと三角はクリックを透過させる。三角は対象ボタンの上にかぶることがあり、
+  // 透過しないと「光っているボタンを押したのに反応しない」状態になる（実際に3段目で起きていた）。
+  // スキップだけは押せる必要があるので、そこだけ pointer-events を戻す。
+  // v7.3: クリック透過は「三角」だけにする。吹き出し本体まで透過させると、
+  // 中の用語（種銭・行動力など）にポインタを合わせても説明が出なくなる。
+  // 対象ボタンに実際にかぶるのは対象側へ16px飛び出す三角なので、そこだけ透過すれば足りる。
+  const canBack = tutPrevIdx() >= 0;
+  tutBubble = el(`<div class="fixed z-[65] pointer-events-none" style="visibility:hidden; left:0; top:0;">
+    <div class="relative bg-white rounded-xl shadow-2xl p-3 text-xs space-y-2 border-2 border-amber-400 pointer-events-auto">
+      <div class="flex items-center justify-between gap-2">
+        <span class="font-bold text-slate-800">🧑‍🏫 先輩大家</span>
+        <span class="text-[10px] text-slate-500">${tutStepNo()} / ${tutStepTotal()}</span>
       </div>
-      <div class="tut-arrow absolute"></div>
+      <div class="text-slate-700 leading-relaxed">${linkTerms(stp.text)}</div>
+      ${stp.info
+        ? '<button class="tut-nextstep w-full bg-navy hover:bg-navy-dark text-white rounded-lg py-1.5 text-xs font-bold">次へ ▶</button>'
+        : '<div class="text-[11px] text-amber-700 font-bold">👆 光っているボタンを押してください</div>'}
+      <div class="flex items-center justify-between gap-2 pt-1">
+        <button class="tut-back text-navy text-[11px] font-bold ${canBack ? '' : 'invisible'}">← 前に戻る</button>
+        <button class="tut-skip text-slate-500 text-[11px] underline">スキップ</button>
+      </div>
+      <div class="tut-arrow absolute pointer-events-none"></div>
     </div></div>`);
   document.body.appendChild(tutBubble);
   placeTutBubble(tutBubble, target.getBoundingClientRect());
-  tutBubble.querySelector('.tut-next').addEventListener('click', () => { tutIdx += 1; renderTutStep(); });
   tutBubble.querySelector('.tut-skip').addEventListener('click', endTutorial);
+  tutBubble.querySelector('.tut-back').addEventListener('click', tutGoBack);
+  // 押すボタンが無い説明の段は、吹き出しの「次へ」で進む
+  tutBubble.querySelector('.tut-nextstep')?.addEventListener('click', () => tutMaybeAdvance(stp.key));
+  // v7.2: 対象の実寸が確定してから穴と吹き出しを置き直す。
+  // CDN版TailwindはCSSを非同期に生成するため、開いた直後のモーダルやドロワーは
+  // まだ w-72 等が効いておらず、その瞬間に測ると幅がまるで違う。実際スマホの≡メニューでは
+  // 穴が別の場所に開き、光っているボタンが暗幕に覆われて押せなくなっていた。
+  // ResizeObserver で「実際に大きさが決まった瞬間」に追従し、遅れて効くCSSも取りこぼさない。
+  const seq = ++tutRenderSeq;
+  const reflow = () => {
+    if (seq !== tutRenderSeq || tutIdx < 0 || !tutBubble || !document.body.contains(target)) return;
+    const r = target.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+    buildTutMask(r);
+    placeTutBubble(tutBubble, r);
+  };
+  requestAnimationFrame(reflow);
+  tutObserver?.disconnect();
+  tutObserver = new ResizeObserver(reflow);
+  tutObserver.observe(target);
+  setTimeout(reflow, 250);   // ResizeObserverが動かない環境向けの保険
 }
 
 // v3.12: 吹き出しを「対象ボタンに重ならない空いている側」へ置き、対象を指す三角を出す。
@@ -2808,9 +3781,9 @@ function showSetup() {
     if (step === 0) {
       inner = `<div class="grid grid-cols-1 gap-2">
         <button class="wz-attr border-2 rounded-xl p-3 text-left ${data.attr === 'employee' ? 'border-navy bg-slate-50' : ''}" data-v="employee">
-          <div class="font-bold">💼 サラリーマン</div><div class="text-xs text-slate-600">信用度60・行動力100。<b>信用こそ融資の武器だ。</b></div></button>
+          <div class="font-bold">💼 サラリーマン</div><div class="text-xs text-slate-600">${term('credit_score', '信用度')}60・${term('action_power', '行動力')}100。<b>信用こそ融資の武器だ。</b></div></button>
         <button class="wz-attr border-2 rounded-xl p-3 text-left ${data.attr === 'self' ? 'border-navy bg-slate-50' : ''}" data-v="self">
-          <div class="font-bold">🛠️ 自営業</div><div class="text-xs text-slate-600">信用度10・行動力120。<b>自由な時間は最大の資本。</b></div></button></div>`;
+          <div class="font-bold">🛠️ 自営業</div><div class="text-xs text-slate-600">${term('credit_score', '信用度')}10・${term('action_power', '行動力')}120。<b>自由な時間は最大の資本。</b></div></button></div>`;
       m.appendChild(el(frame('あなたは、何者だ？', '大家への道はここから始まる。', inner)));
       m.querySelectorAll('.wz-attr').forEach(b => b.addEventListener('click', () => { data.attr = b.dataset.v; step = 1; draw(); }));
       m.querySelector('#wz-next')?.addEventListener('click', () => { step = 1; draw(); });
@@ -2828,7 +3801,7 @@ function showSetup() {
       inner = `<div class="text-center text-2xl font-black mb-1"><span id="wz-seed-v">${L.yen(data.seed)}</span></div>
         <input id="wz-seed" type="range" min="0" max="${L.CONFIG.seedMax}" step="500000" value="${data.seed}" class="w-full">
         <div class="flex gap-1 text-xs mt-1">${[[1_000_000, '100万'], [10_000_000, '1,000万'], [30_000_000, '3,000万']].map(([v, l]) => `<button class="wz-seedp flex-1 border rounded py-1" data-v="${v}">${l}</button>`).join('')}</div>
-        <div class="text-xs text-slate-500 mt-1">これまで貯めた元手（0〜5,000万円）。足りない分は💼働いて稼げばいい。</div>`;
+        <div class="text-xs text-slate-500 mt-1">これまで貯めた${term('seed_money', '種銭')}（0〜5,000万円）。足りない分は💼働いて稼げばいい。</div>`;
       m.appendChild(el(frame('種銭は、いくらある？', '最初の一歩は種銭づくりから。', inner)));
       const si = m.querySelector('#wz-seed');
       const upd = () => { data.seed = Number(si.value); m.querySelector('#wz-seed-v').textContent = L.yen(data.seed); };
@@ -2842,7 +3815,7 @@ function showSetup() {
         <div class="text-center text-2xl font-black mt-2"><span id="wz-goal-v">${L.yen(data.goalAmount)}</span></div>
         <input id="wz-goal" type="range" class="w-full">
         <div id="wz-goalp" class="flex gap-1 text-xs mt-1"></div>
-        <div class="text-xs text-slate-500 mt-1">純資産＝資産から負債を引いた本当の財産。月間CF＝毎月の不労所得。</div>`;
+        <div class="text-xs text-slate-500 mt-1">${term('net_worth', '純資産')}＝資産から負債を引いた本当の財産。月間${term('cf', 'CF')}＝毎月の不労所得。</div>`;
       m.appendChild(el(frame('目指す頂は？', '目標なき航海に、追い風は吹かない。', inner)));
       const gi = m.querySelector('#wz-goal');
       // 目標タイプごとにスライダーの範囲・刻みを切り替え
@@ -2944,9 +3917,9 @@ function renderMobileBars() {
       <button class="ms-kpi hud-panel shadow rounded-lg px-1 py-1 text-center" data-kpi="cash">
         <div class="text-[9px] font-bold hud-sub">💰現金</div><div class="text-[11px] font-bold truncate hud-money">${L.yen(state.cash)}</div></button>
       <button class="ms-kpi hud-panel shadow rounded-lg px-1 py-1 text-center" data-kpi="cf">
-        <div class="text-[9px] font-bold hud-sub">📈月CF</div><div class="text-[11px] font-bold truncate ${mcf >= 0 ? 'hud-money' : 'hud-bad'}">${L.yen(mcf)}</div></button>
+        <div class="text-[9px] font-bold hud-sub">📈月${term('cf', 'CF')}</div><div class="text-[11px] font-bold truncate ${mcf >= 0 ? 'hud-money' : 'hud-bad'}">${L.yen(mcf)}</div></button>
       <div class="hud-panel shadow rounded-lg px-1 py-1 text-center">
-        <div class="text-[9px] font-bold hud-sub">⚡行動力</div><div class="text-[11px] font-bold" id="hud-ap-m">${state.actionPower}/${state.baseActionPower}</div></div>
+        <div class="text-[9px] font-bold hud-sub">⚡${term('action_power', '行動力')}</div><div class="text-[11px] font-bold" id="hud-ap-m">${state.actionPower}/${state.baseActionPower}</div></div>
     </div>
     <div class="grid grid-cols-2 gap-1">
       <button id="ms-listings" class="hud-panel shadow rounded-lg px-1 py-1.5 text-[11px] font-bold">🗂️ 市場（${state.market.length}）</button>
@@ -2986,10 +3959,11 @@ function openMobileDrawer() {
       </div>
       ${item('dr-listings', `🗂️ 物件市場（${state.market.length}件）`)}
       ${item('dr-notifs', `🔔 通知${unread ? `（未読${unread}）` : ''}`)}
-      ${item('dr-props', `🏠 所有物件・売却センター（${state.properties.length}件）`)}
+      ${item('dr-props', `🏠 所有物件（${state.properties.length}件）`)}
       ${item('dr-assets', '💰 資産・バランスシート')}
       ${item('dr-credit', '📊 信用度・銀行取引')}
       ${item('dr-log', '📜 ログ履歴')}
+      ${item('dr-glossary', '📖 用語集')}
       <div class="hud-tile rounded-lg p-2 text-xs space-y-1">
         <div class="font-bold hud-accent mb-1">🎓 スキル状況</div>
         ${skillRow('目利き力', 'appraisal')}${skillRow('交渉力', 'negotiation')}${skillRow('自主管理', 'selfmgmt')}
@@ -3001,6 +3975,8 @@ function openMobileDrawer() {
       </div>
     </div></div>`);
   m.innerHTML = ''; m.appendChild(box);
+  // v7.2: ≡メニューを開いた時点で drawer ステップは完了。次は中の「物件市場」を指す。
+  tutMaybeAdvance('drawer');
   const go = (fn) => { close(); fn(); };
   m.querySelector('#dr-backdrop').addEventListener('click', close);
   m.querySelector('#dr-close').addEventListener('click', close);
@@ -3010,6 +3986,7 @@ function openMobileDrawer() {
   m.querySelector('#dr-assets').addEventListener('click', () => go(() => openKpiModal('cash')));
   m.querySelector('#dr-credit').addEventListener('click', () => go(() => openKpiModal('credit')));
   m.querySelector('#dr-log').addEventListener('click', () => go(openLogModal));
+  m.querySelector('#dr-glossary').addEventListener('click', () => go(openGlossaryModal));
   m.querySelector('#dr-bgm').addEventListener('click', () => go(openBgmModal));
   m.querySelector('#dr-mute').addEventListener('click', () => { setMuted(!muted); updateMuteButton(); close(); });
   m.querySelector('#dr-reset').addEventListener('click', () => { if (confirm('データをリセットしますか？')) { localStorage.removeItem(SAVE_KEY); location.reload(); } });
@@ -3044,11 +4021,11 @@ function renderPanelLeft() {
           <div class="font-bold">${state.properties.length}件</div>
         </button>
         <button class="kpi-btn hud-tile rounded-lg p-2 text-left" data-kpi="cf">
-          <div class="text-[11px] font-bold hud-sub">📈 月CF</div>
+          <div class="text-[11px] font-bold hud-sub">📈 月${term('cf', 'CF')}</div>
           <div class="font-bold truncate ${mcf >= 0 ? 'hud-money' : 'hud-bad'}">${L.yen(mcf)}</div>
         </button>
         <button class="kpi-btn hud-tile rounded-lg p-2 text-left" data-kpi="credit">
-          <div class="text-[11px] font-bold hud-sub">📊 信用度</div>
+          <div class="text-[11px] font-bold hud-sub">📊 ${term('credit_score', '信用度')}</div>
           <div class="font-bold">${state.creditScore}</div>
         </button>
       </div>
@@ -3085,7 +4062,7 @@ function openKpiModal(which, keepBulk = false) {
       <tr><td>手元現金</td><td class="text-right font-bold">${L.yen(state.cash)}</td></tr>
       <tr class="border-t"><td>総資産（現金＋物件時価）</td><td class="text-right">${L.yen(L.totalAssetsV2(state))}</td></tr>
       <tr><td>総負債（残債）</td><td class="text-right text-red-600">-${L.yen(L.totalDebt(state))}</td></tr>
-      <tr class="border-t font-bold"><td>純資産</td><td class="text-right text-emerald">${L.yen(L.netWorth(state))}</td></tr>
+      <tr class="border-t font-bold"><td>${term('net_worth', '純資産')}</td><td class="text-right text-emerald">${L.yen(L.netWorth(state))}</td></tr>
     </table>
     ${!state.isIncorporated ? `<div class="mt-4 pt-4 border-t">
       <h3 class="font-bold text-sm mb-1">🏢 法人化</h3>
@@ -3096,7 +4073,7 @@ function openKpiModal(which, keepBulk = false) {
     // v3.5: 売却センター。名義・売出中・修繕中・入居状況をバッジで常時表示し、複数まとめて査定できる。
     const corpN = state.properties.filter(p => p.owner === 'corp').length;
     const persN = state.properties.length - corpN;
-    title = `🏠 所有物件・売却センター（${state.properties.length}件）`;
+    title = `🏠 所有物件（${state.properties.length}件）`;
     const header = state.properties.length ? `
       <div class="flex items-center justify-between text-xs mb-1">
         <div class="font-bold text-slate-700">👤個人${persN}件 ・ 🏢法人${corpN}件</div>
@@ -3110,7 +4087,9 @@ function openKpiModal(which, keepBulk = false) {
         p.owner === 'corp' ? '<span class="bg-navy text-white rounded px-1">🏢法人</span>' : '<span class="bg-slate-200 text-slate-700 rounded px-1">👤個人</span>',
         listing ? `<span class="bg-amber-500 text-white rounded px-1">📢売出中${listing.listedMonths + 1}ヶ月目</span>` : '',
         p.repairJob ? `<span class="bg-amber-100 text-amber-700 rounded px-1">🔨${L.REPAIR_KINDS[p.repairJob.kind || 'large'].label}中 残り${p.repairJob.monthsLeft}ヶ月</span>` : '',
-        (!p.repairJob && p.repairState < 20) ? '<span class="bg-red-100 text-red-700 rounded px-1">⚠️要修繕</span>' : '',
+        (!p.repairJob && p.repairState < 20) ? '<span class="bg-red-100 text-red-700 rounded px-1">⚠️躯体が限界</span>' : '',
+        (!p.repairJob && (p.careState ?? 100) < 40) ? '<span class="bg-amber-100 text-amber-700 rounded px-1">🧹要メンテ</span>' : '',
+        p.autoManage ? '<span class="bg-emerald-100 text-emerald-700 rounded px-1">🏢おまかせ中</span>' : '',
         // v4: 原状回復が済んでいない部屋は募集できない＝空室損が続くので一覧で目立たせる
         p.units.filter(u => u.needsRestore).length
           ? `<span class="bg-red-500 text-white rounded px-1">要原状回復${p.units.filter(u => u.needsRestore).length}室</span>` : '',
@@ -3124,7 +4103,7 @@ function openKpiModal(which, keepBulk = false) {
           ${bulkMode ? `<input type="checkbox" class="kpi-check w-4 h-4 shrink-0" data-id="${p.id}">` : ''}
           ${renderBuildingSVG(p, 'w-10 h-10')}
           <div class="min-w-0 flex-1"><div class="font-bold">${p.name || p.label}</div>
-          <div class="text-slate-500">${p.label}｜利回り${(p.grossYield * 100).toFixed(1)}%・修繕度${p.repairState}%</div>
+          <div class="text-slate-500">${p.label}｜利回り${(p.grossYield * 100).toFixed(1)}%・躯体${Math.round(p.repairState)}%・手入れ${Math.round(p.careState ?? p.repairState)}%</div>
           <div class="mt-0.5 space-x-1 text-[11px]">${badges}</div></div>
         </div>
         ${la ? `<div class="mt-1 pt-1 border-t flex items-center justify-between"><span>査定額 <b class="text-emerald-700">${L.yen(la.amount)}</b> <span class="text-slate-500">（${laAge}）</span></span><button class="kpi-sell bg-emerald text-white rounded px-2 py-1" data-id="${p.id}">売出設定へ</button></div>` : ''}
@@ -3206,23 +4185,77 @@ function openSellWithAppraisal(propId, appraisal) {
   drawPricing(m, p, appraisal, close, back);
 }
 
+// v6: 管理会社おまかせ契約のトグル。
+// 説明文を並べた「読ませる行」にしたら押せると気づかれにくかったので、
+// 見た目をスイッチそのものにした。文字は最小限にして、詳細は押したあとの確認ダイアログで説明する。
+function autoManageToggleHtml(p) {
+  const on = !!p.autoManage;
+  const track = on ? 'bg-emerald-500' : 'bg-slate-300';
+  const knob = on ? 'translate-x-5' : 'translate-x-0.5';
+  return `<button class="dt-automanage w-full rounded-lg py-2.5 px-2.5 flex items-center gap-2 border transition-colors active:scale-[0.98]
+      ${on ? 'bg-emerald-50 border-emerald-500' : 'bg-white hover:bg-slate-50'}">
+    <span class="text-base leading-none">🏢</span>
+    <span class="text-left min-w-0 flex-1">
+      <span class="block text-xs font-bold ${on ? 'text-emerald-800' : 'text-slate-700'}">管理会社におまかせ</span>
+      <span class="block text-[11px] ${on ? 'text-emerald-700' : 'text-slate-500'}">
+        ${on ? '<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse align-middle mr-1"></span>自動で手配中（+10%・DIY不可）'
+             : '修繕の判断を丸ごと任せる（+10%）'}
+      </span>
+    </span>
+    <span class="shrink-0 inline-flex items-center w-11 h-6 rounded-full ${track} transition-colors">
+      <span class="w-5 h-5 rounded-full bg-white shadow transform ${knob} transition-transform"></span>
+    </span>
+  </button>`;
+}
+
+// 契約は出費を伴い、契約中はDIYが封じられるので、ON/OFFとも必ず確認を取ってから切り替える。
+function onAutoManageToggle(p, redraw) {
+  const care = p.careState ?? p.repairState ?? 100;
+  if (!p.autoManage) {
+    const firstCost = care < L.AUTO_MANAGE_CARE_FLOOR ? L.autoManageCost(L.repairCost(p, 'maint')) : 0;
+    const msg = `${p.name || p.label} を管理会社におまかせしますか？\n\n`
+      + `・手入れが${L.AUTO_MANAGE_CARE_FLOOR}%を切ると自動で日常メンテを発注\n`
+      + `・退去した部屋の原状回復も自動で業者手配\n`
+      + `・工事費は通常見積の+10%\n`
+      + `・この物件ではDIYができなくなります（自主管理EXPも入りません）\n`
+      + `・大規模修繕と価値UPは対象外（今までどおり自分で判断）\n\n`
+      + (firstCost ? `いま手入れが${Math.round(care)}%なので、契約と同時に初回の日常メンテ ${L.yen(firstCost)} が発生します。` : '手入れは足りているので、今すぐの出費はありません。');
+    if (!confirm(msg)) return;
+    const r = L.setAutoManage(state, p.id, true);
+    state = r.state;
+    if (r.started) pushLog(`${p.name || p.label} を管理会社へおまかせした（初回メンテ ${L.yen(r.cost)}）`);
+    else if (r.reason === 'noCash') { alert(`現金が足りないため初回の日常メンテを発注できませんでした（必要 ${L.yen(r.cost)}）。契約自体は有効です。`); }
+    else pushLog(`${p.name || p.label} を管理会社へおまかせした`);
+  } else {
+    if (!confirm(`${p.name || p.label} のおまかせ契約を解除しますか？\n\n以降は手入れも原状回復も自分で判断・発注することになりますが、DIYで安く済ませられるようになります。`)) return;
+    state = L.setAutoManage(state, p.id, false).state;
+    pushLog(`${p.name || p.label} のおまかせ契約を解除した`);
+  }
+  save(); render(); redraw();
+}
+
 // back を渡すと「← 戻る」を表示し、閉じたあと元のモーダルへ戻れる（別モーダルから開いた場合の重なりも解消）。
 function openDetail(propId, from, back) {
-  const p = (from === 'market' ? state.market : state.properties).find(x => x.id === propId);
-  if (!p) return;
+  const find = () => (from === 'market' ? state.market : state.properties).find(x => x.id === propId);
+  if (!find()) return;
   const m = document.getElementById('detail-modal');
   m.classList.remove('hidden'); m.classList.add('flex');
   const tabs = ['概要', 'レントロール', '収支', '融資'];
   let active = 0;
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   const draw = () => {
+    // state を書き換える操作（おまかせ契約の切替等）は structuredClone で新しい物件オブジェクトを作るため、
+    // 描画のたびに引き直さないと古いオブジェクトを表示し続けてしまう。
+    const p = find();
+    if (!p) { close(); return; }
     m.innerHTML = '';
     // v4: 大分類は「修繕」と「価値UP」の2つ。実施方法（DIY/業者→借入）は各画面で選ぶ。
     const busy = from === 'owned' && (p.repairJob || p.valueUpJob);
     const vuMaxed = (p.valueUpLevel || 0) >= L.VALUE_UP_MAX_LEVEL;
     const restoreCount = from === 'owned' ? p.units.filter(u => u.needsRestore).length : 0;
     const footer = from === 'owned' ? `<div class="p-2 border-t space-y-1">
-        ${p.repairJob ? `<div class="text-center text-xs text-amber-600 font-bold py-1">🔨 ${L.REPAIR_KINDS[p.repairJob.kind || 'large'].label}を工事中（残り${p.repairJob.monthsLeft}ヶ月）</div>` : ''}
+        ${autoManageToggleHtml(p)}
+        ${p.repairJob ? `<div class="text-center text-xs text-amber-600 font-bold py-1">🔨 ${L.REPAIR_KINDS[p.repairJob.kind || 'large'].label}を工事中（残り${p.repairJob.monthsLeft}ヶ月）${p.repairJob.auto ? '／おまかせ' : ''}</div>` : ''}
         ${p.valueUpJob ? `<div class="text-center text-xs text-indigo-600 font-bold py-1">✨ 価値UP工事中（残り${p.valueUpJob.monthsLeft}ヶ月）</div>` : ''}
         ${p.diyProgress ? `<div class="text-center text-xs text-emerald-700 font-bold py-1">🔨 DIY作業中（${Math.min(100, Math.round(p.diyProgress.done))}%）</div>` : ''}
         <div class="flex gap-1.5">
@@ -3264,6 +4297,7 @@ function openDetail(propId, from, back) {
       box.querySelector('.dt-repair')?.addEventListener('click', () => { close(); openWorkMenu(p.id, 'repair', backHere); });
       box.querySelector('.dt-valueup')?.addEventListener('click', () => { close(); openWorkMenu(p.id, 'valueup', backHere); });
       box.querySelector('.dt-sell').addEventListener('click', () => { close(); openSell(p.id); });
+      box.querySelector('.dt-automanage')?.addEventListener('click', () => onAutoManageToggle(p, draw));
     }
     // v3.1: 市場物件はタブの上の固定「買付」ボタンからいつでも買付へ（買付画面から「戻る」でここへ戻れる）
     box.querySelector('#dt-buy')?.addEventListener('click', () => { close(); openPurchase(p.id, () => openDetail(propId, from, back)); });
@@ -3283,24 +4317,202 @@ function openDetail(propId, from, back) {
   draw();
 }
 
-// 修繕度ゲージ: 緑(60%以上)→黄(20〜59%)→赤(20%未満)で一目で分かる。20%割れは管理会社アラートを併記。
-function repairGauge(pct) {
-  const color = pct >= 60 ? 'bg-emerald' : pct >= 20 ? 'bg-yellow-400' : 'bg-red-500';
-  const warn = pct < 20 ? '<span class="text-red-600 text-[11px] font-bold ml-1">⚠️管理会社から修繕依頼</span>' : '';
+// === v6: 用語ヘルプ ===
+// 専門用語を term('dscr') で包むと点線の下線が付き、押すと吹き出しで説明が出る。
+// ページ遷移はしない（読んでいた場所を見失わせない）。
+// 第2引数を渡すと表示文字を差し替えられる（「NOI（営業純収益）」のような表記に使う）。
+function term(key, text) {
+  const t = L.TERMS[key];
+  if (!t) return text || key;   // 定義漏れでも表示は壊さない（テストで検出する）
+  return `<span class="term" data-term="${key}">${text || t.label}</span>`;
+}
+
+// 銀行の否認理由やチュートリアル文など、logic 側で組み立てられた文字列にも用語ヘルプを付ける。
+// 長い語から先に処理し、置換済みの箇所はトークンに退避して二度と触らない
+// （「自己資金」を先に処理しないと「資金」だけが引っかかる、といった食い違いを防ぐ）。
+const TERM_BY_LABEL = Object.entries(L.TERMS)
+  .map(([key, t]) => ({ key, label: t.label }))
+  .sort((a, b) => b.label.length - a.label.length);
+
+function linkTerms(text) {
+  let out = String(text);
+  const slots = [];
+  // 退避先の目印には制御文字を使う。本文には現れないので「金利1.5%」のような数字を巻き込まない。
+  const M = String.fromCharCode(1);
+  for (const { key, label } of TERM_BY_LABEL) {
+    const i = out.indexOf(label);
+    if (i < 0) continue;
+    out = out.slice(0, i) + M + slots.length + M + out.slice(i + label.length);
+    slots.push(term(key, label));
+  }
+  return out.replace(new RegExp(M + '([0-9]+)' + M, 'g'), (_, n) => slots[Number(n)]);
+}
+
+// v6.3: 実務でも通じる言葉なのか、このゲームだけの指標なのかを区別して見せる。
+// 「行動力」を実務用語だと思い込ませない／「DSCR」を覚えて損はないと分かるようにする。
+function scopeLabel(t) {
+  return t.scope === 'game' ? 'このゲーム独自' : '実務で使う用語';
+}
+
+let termPop = null;
+function closeTermPopover() { termPop?.remove(); termPop = null; }
+
+function showTermPopover(anchor) {
+  closeTermPopover();
+  const t = L.TERMS[anchor.dataset.term];
+  if (!t) return;
+  termPop = el(`<div class="term-pop">
+    <div><b>${t.label}</b>${t.reading ? ` <span class="tp-yomi">（${t.reading}）</span>` : ''} <span class="tp-scope tp-${t.scope}">${scopeLabel(t)}</span></div>
+    <div class="mt-1">${t.def}</div>
+    <div class="mt-1 tp-calc">🧮 ${t.calc}</div>
+    <div class="mt-1">${t.here}</div>
+    <div class="mt-1 tp-hint">💡 ${t.hint}</div>
+    <div class="mt-2 tp-foot">📖 長押しで用語集（全${Object.keys(L.TERMS).length}語）・押すと用語の表示ON/OFF</div>
+  </div>`);
+  termPop.dataset.for = anchor.dataset.term;
+  document.body.appendChild(termPop);
+  const a = anchor.getBoundingClientRect();
+  const w = termPop.offsetWidth, h = termPop.offsetHeight;
+  const pad = 8;
+  // 下に出すのが基本。下に入らなければ上へ回す。左右は画面内に丸める。
+  const top = (a.bottom + h + pad <= window.innerHeight) ? a.bottom + 6 : Math.max(pad, a.top - h - 6);
+  const left = Math.max(pad, Math.min(window.innerWidth - w - pad, a.left + a.width / 2 - w / 2));
+  termPop.style.top = `${top}px`;
+  termPop.style.left = `${left}px`;
+}
+
+// v6.2: 用語ヘルプのON/OFF。ヘッダーの 📖 で切り替え、音のON/OFFと同じくlocalStorageに残す。
+const TERMS_KEY = 'leverage_master_terms_off';
+let termsOff = localStorage.getItem(TERMS_KEY) === '1';
+
+function applyTermsMode() {
+  document.body.classList.toggle('terms-off', termsOff);
+  const b = document.getElementById('btn-terms');
+  if (b) { b.textContent = termsOff ? '📕' : '📖'; b.style.opacity = termsOff ? '0.45' : '1'; }
+  if (termsOff) closeTermPopover();
+}
+
+function setTermsOff(off) {
+  termsOff = off;
+  localStorage.setItem(TERMS_KEY, off ? '1' : '0');
+  applyTermsMode();
+}
+
+// 用語はモーダルの中にも動的に生えるので、個別に登録せず document で一度だけ拾う。
+// v6.2: ポインタを合わせるだけで出す。タッチ端末にはホバーが無いのでタップでも出す。
+function initTermHelp() {
+  const anchorOf = (e) => (termsOff ? null : e.target?.closest?.('.term'));
+
+  document.addEventListener('pointerover', (e) => {
+    const a = anchorOf(e);
+    // マウス以外（タッチ・ペン）の pointerover は click と二重に走るのでここでは扱わない
+    if (!a || e.pointerType !== 'mouse') return;
+    if (termPop?.dataset.for === a.dataset.term) return;   // 同じ語に留まっている間は出し直さない
+    showTermPopover(a);
+  });
+  document.addEventListener('pointerout', (e) => {
+    if (e.pointerType !== 'mouse') return;
+    const from = e.target?.closest?.('.term');
+    // 用語の外へ出たら閉じる（用語内の子要素へ移っただけなら閉じない）
+    if (from && !from.contains(e.relatedTarget)) closeTermPopover();
+  });
+
+  // タッチ端末用。同じ語を再度タップすると閉じる。
+  document.addEventListener('click', (e) => {
+    const a = anchorOf(e);
+    if (!a) { closeTermPopover(); return; }
+    e.stopPropagation();
+    if (termPop?.dataset.for === a.dataset.term) { closeTermPopover(); return; }
+    showTermPopover(a);
+  }, true);
+
+  window.addEventListener('resize', closeTermPopover);
+  document.addEventListener('scroll', closeTermPopover, true);
+  applyTermsMode();
+}
+
+// 📖 用語集。吹き出しを閉じたあとでも引き直せる入口。
+function openGlossaryModal() {
+  const m = document.getElementById('detail-modal');
+  m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
+  const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  const section = (g) => {
+    const rows = Object.entries(L.TERMS).filter(([, t]) => t.group === g).map(([, t]) => `
+      <div class="border-b last:border-0 py-2">
+        <div class="font-bold text-sm">${t.label}${t.reading ? `<span class="text-[11px] font-normal text-slate-500">（${t.reading}）</span>` : ''}
+          <span class="align-middle text-[10px] font-normal rounded px-1.5 py-0.5 ${t.scope === 'game' ? 'bg-amber-100 text-amber-800' : 'bg-slate-200 text-slate-700'}">${scopeLabel(t)}</span></div>
+        <div class="text-xs text-slate-700 mt-0.5">${t.def}</div>
+        <div class="text-xs text-navy bg-slate-50 rounded px-2 py-1 mt-1">🧮 ${t.calc}</div>
+        <div class="text-xs text-slate-600 mt-1">${t.here}</div>
+        <div class="text-[11px] text-slate-500 mt-0.5">💡 ${t.hint}</div>
+      </div>`).join('');
+    return `<div class="mb-3"><h3 class="font-bold text-xs text-navy bg-slate-100 rounded px-2 py-1 mb-1">${g}</h3>${rows}</div>`;
+  };
+  const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
+    <div class="p-3 border-b shrink-0 flex justify-between items-center">
+      <h2 class="font-bold">📖 用語集（${Object.keys(L.TERMS).length}語）</h2>
+      <button id="gl-close" class="text-slate-400 text-xl leading-none">✕</button></div>
+    <div class="p-3 overflow-y-auto min-h-0 flex-1">
+      <div class="text-[11px] text-slate-500 mb-2">ゲーム中は、点線の下線が引かれた用語を押すと同じ説明が吹き出しで出ます。</div>
+      ${L.TERM_GROUPS.map(section).join('')}</div></div>`);
+  m.appendChild(box);
+  box.querySelector('#gl-close').addEventListener('click', close);
+}
+
+// 構造の表示名。'木造' には既に「造」が入っているので、S・RCのときだけ「造」を足す
+// （そのまま `${structure}造` と書くと「木造造」になる）。
+function structureLabel(p) {
+  return p.structure === '木造' ? '木造' : `${p.structure}造`;
+}
+
+// v6: ゲージは2本。🏚躯体は大規模修繕でしか戻らず、🧹手入れは日常メンテで100%まで戻る。
+// 内部は小数で持っているので、表示のたびに丸める。
+// 色は 緑(60%以上)→黄(20〜59%)→赤(20%未満)。
+function repairGauge(pct, width = 'w-24') {
+  const v = Math.max(0, Math.min(100, Math.round(pct ?? 100)));
+  const color = v >= 60 ? 'bg-emerald' : v >= 20 ? 'bg-yellow-400' : 'bg-red-500';
+  const warn = v < 20 ? '<span class="text-red-600 text-[11px] font-bold ml-1">⚠️管理会社から修繕依頼</span>' : '';
   return `<span class="inline-flex items-center gap-1 align-middle">
-    <span class="inline-block w-24 bg-slate-200 rounded h-2 overflow-hidden"><span class="${color} block h-2" style="width:${Math.max(0, Math.min(100, pct))}%"></span></span>
-    <b>${pct}%</b>${warn}</span>`;
+    <span class="inline-block ${width} bg-slate-200 rounded h-2 overflow-hidden"><span class="${color} block h-2" style="width:${v}%"></span></span>
+    <b>${v}%</b>${warn}</span>`;
+}
+
+// 躯体と手入れを2行で並べて出す。どちらの工事が要るのかが一目で分かるようにする。
+function twoGauges(p, opts = {}) {
+  const care = p.careState ?? p.repairState ?? 100;
+  return `<div class="space-y-1">
+    <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">
+      <span class="shrink-0 mr-2">🏚 ${term('repair_state', '躯体')}</span>${repairGauge(p.repairState, 'w-20')}
+      ${p.repairJob && (p.repairJob.kind || 'large') === 'large' ? `<span class="text-amber-600 font-bold ml-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : ''}
+    </div>
+    <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">
+      <span class="shrink-0 mr-2">🧹 ${term('care_state', '手入れ')}</span>${repairGauge(care, 'w-20')}
+      ${p.repairJob && p.repairJob.kind === 'maint' ? `<span class="text-amber-600 font-bold ml-1">🔨メンテ中${p.repairJob.auto ? '（おまかせ）' : ''}</span>` : ''}
+    </div>
+    ${opts.hint ? '<div class="text-[11px] text-slate-500 px-1">躯体は大規模修繕でのみ回復します。清掃・草刈りの日常メンテで戻るのは手入れだけです。</div>' : ''}
+  </div>`;
 }
 
 function noiTable(p) {
   const gpi = L.gpiAnnual(p), egi = L.egiAnnual(p), opex = L.opexAnnual(p), noi = L.noiAnnualV2(p);
   return `<table class="w-full text-xs mt-2">
-      <tr><td>満室想定年収（GPI）</td><td class="text-right">${L.yen(gpi)}</td></tr>
-      <tr><td>現況の空室損</td><td class="text-right">-${L.yen(L.vacancyLossAnnual(p))}</td></tr>
-      <tr><td>現況年収（EGI）</td><td class="text-right">${L.yen(egi)}</td></tr>
-      <tr><td>年間運営費（管理費・修繕積立・PM・固都税）</td><td class="text-right">-${L.yen(opex)}</td></tr>
-      <tr class="font-bold border-t"><td>NOI（営業純収益）</td><td class="text-right">${L.yen(noi)}</td></tr>
+      <tr><td>満室想定年収（${term('gpi')}）</td><td class="text-right">${L.yen(gpi)}</td></tr>
+      <tr><td>現況の${term('vacancy_loss', '空室損')}</td><td class="text-right">-${L.yen(L.vacancyLossAnnual(p))}</td></tr>
+      <tr><td>現況年収（${term('egi')}）</td><td class="text-right">${L.yen(egi)}</td></tr>
+      <tr><td>年間運営費（管理費・修繕積立・${term('pm_fee', 'PM')}・${term('koto_zei', '固都税')}）</td><td class="text-right">-${L.yen(opex)}</td></tr>
+      <tr class="font-bold border-t"><td>${term('noi')}（営業純収益）</td><td class="text-right">${L.yen(noi)}</td></tr>
     </table>`;
+}
+
+// v6: 「手元いくらあればこの物件を買えるのか」を購入前に必ず見せる。
+// 従来は詳細画面の「融資」タブを開くまで分からず、市場一覧では判断できなかった。
+function minCashLine(p) {
+  const r = L.minRequiredCash(p, state);
+  const ok = state.cash >= r.cash;
+  return `<div class="flex items-center justify-between text-xs p-2 rounded-lg ${ok ? 'bg-emerald-50' : 'bg-slate-50'}">
+    <span>最低${term('own_cash', '自己資金')}<span class="text-slate-500">（${r.financed ? r.label : '融資不可・現金のみ'}）</span></span>
+    <b class="${ok ? 'text-emerald-700' : 'text-red-600'}">${L.yen(r.cash)}${ok ? '' : ' <span class="font-normal">…資金不足</span>'}</b>
+  </div>`;
 }
 
 function overviewTab(p, from) {
@@ -3313,15 +4525,15 @@ function overviewTab(p, from) {
       <div class="space-y-2">
       <div class="grid grid-cols-2 gap-2 text-xs">
         <div class="bg-slate-50 rounded-lg p-2">現況入居率<div class="font-bold ${occ >= 100 ? 'text-emerald-600' : occ > 0 ? 'text-amber-600' : 'text-red-600'}">${occ}%</div></div>
-        <div class="bg-slate-50 rounded-lg p-2">直近月CF<div class="font-bold ${(lastCf ?? 0) >= 0 ? 'text-emerald-600' : 'text-red-600'}">${lastCf == null ? '—' : L.yen(lastCf)}</div></div>
-        <div class="bg-slate-50 rounded-lg p-2">現在の時価<div class="font-bold">${L.yen(p.timeValue)}</div></div>
+        <div class="bg-slate-50 rounded-lg p-2">直近月${term('cf', 'CF')}<div class="font-bold ${(lastCf ?? 0) >= 0 ? 'text-emerald-600' : 'text-red-600'}">${lastCf == null ? '—' : L.yen(lastCf)}</div></div>
+        <div class="bg-slate-50 rounded-lg p-2">現在の${term('time_value', '時価')}<div class="font-bold">${L.yen(p.timeValue)}</div></div>
         <div class="bg-slate-50 rounded-lg p-2">購入差額<div class="font-bold ${gain >= 0 ? 'text-emerald-600' : 'text-red-600'}">${gain >= 0 ? '+' : ''}${L.yen(gain)}</div></div>
       </div>
-      <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">🔧 修繕度 ${repairGauge(p.repairState)}${p.repairJob ? `<span class="text-amber-600 font-bold ml-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : ''}</div>
+      ${twoGauges(p, { hint: true })}
       ${(p.valueUpLevel || p.valueUpJob) ? `<div class="flex items-center justify-between text-xs p-2 bg-indigo-50 rounded-lg"><span>✨ バリューアップ ${p.valueUpLevel ? `Lv${p.valueUpLevel}` : ''}</span>${p.valueUpJob ? `<span class="text-indigo-600 font-bold">工事中 残り${p.valueUpJob.monthsLeft}ヶ月</span>` : '<span class="text-slate-500">家賃UP済み</span>'}</div>` : ''}
-      <div class="text-xs text-slate-600">${p.structure}造・築${p.builtAge}年・${p.units.length}戸／残存償却 ${p.deprRemaining}ヶ月</div>
+      <div class="text-xs text-slate-600">${structureLabel(p)}・築${p.builtAge}年・${p.units.length}戸／${term('depr_remaining', '残存償却')} ${p.deprRemaining}ヶ月</div>
       ${buildingComposition(p) ? `<div class="text-xs text-slate-600">🏠 ${buildingComposition(p)}</div>` : ''}
-      ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
+      ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold">${term('wakeari', '訳あり')}: ${p.junkFlags.join('・')}</div>` : ''}
       <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>名義</span><b>${p.owner === 'corp' ? '🏢 法人' : '👤 個人'}</b></div>
       ${p.lastAppraisal ? `<div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg"><span>査定額（参考）</span><b>${L.yen(p.lastAppraisal.amount)} <span class="text-slate-500 font-normal">（${state.month - p.lastAppraisal.month === 0 ? '今月' : `${state.month - p.lastAppraisal.month}ヶ月前`}）</span></b></div>` : ''}
       ${(state.isIncorporated && p.owner !== 'corp') ? `<button class="dt-to-corp w-full border border-navy text-navy rounded-lg py-2 text-xs font-bold hover:bg-slate-50 ${(p.loan || (p.reformLoans || []).length) ? 'opacity-40' : ''}" ${(p.loan || (p.reformLoans || []).length) ? 'disabled' : ''}>🏢 法人へ売却（移転）${(p.loan || (p.reformLoans || []).length) ? '｜ローン完済後に可能' : ''}</button>` : ''}
@@ -3332,9 +4544,10 @@ function overviewTab(p, from) {
   return `<div class="flex flex-col items-center">${svg}</div>
     <div class="space-y-2 text-sm">
     <div class="font-bold text-center">売出価格: ${cut ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> ` : ''}<span class="text-emerald-700 text-lg">${L.yen(p.price)}</span></div>
-    <div class="text-center text-xs text-slate-500">${p.structure}造・築${p.builtAge}年・${p.units.length}戸${buildingComposition(p) ? `／${buildingComposition(p)}` : ''}</div>
-    <div class="flex items-center justify-center text-xs p-2 bg-slate-50 rounded-lg">🔧 修繕度 ${repairGauge(p.repairState)}</div>
-    ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold text-center">訳あり: ${p.junkFlags.join('・')}</div>` : ''}
+    ${minCashLine(p)}
+    <div class="text-center text-xs text-slate-500">${structureLabel(p)}・築${p.builtAge}年・${p.units.length}戸${buildingComposition(p) ? `／${buildingComposition(p)}` : ''}</div>
+    ${twoGauges(p)}
+    ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold text-center">${term('wakeari', '訳あり')}: ${p.junkFlags.join('・')}</div>` : ''}
     ${p.sellerUrgency ? `<div class="text-xs text-rose-600 font-bold text-center">🏃 売り急ぎ: ${p.sellerUrgency.reason}そうだ</div>` : ''}
     <button class="dt-map-jump w-full border rounded-lg py-2 text-xs text-navy font-bold hover:bg-slate-50">📍 地図で場所を見る</button>
     ${noiTable(p)}</div>`;
@@ -3347,12 +4560,12 @@ function rentRollTab(p, from) {
       <td class="text-center">${u.layout ? `${u.layout}・${u.sizeSqm}㎡` : '—'}</td>
       <td class="text-center">${L.yen(u.rent)}</td>
       <td class="text-center">${u.occupied ? '<span class="text-emerald">入居中</span>'
-        : u.needsRestore ? `<span class="text-amber-600 font-bold">${u.restoreJob ? `🔨原状回復中(残${u.restoreJob.monthsLeft}ヶ月)` : '要原状回復'}</span>`
+        : u.needsRestore ? `<span class="text-amber-600 font-bold">${u.restoreJob ? `🔨${term('genjo_kaifuku', '原状回復')}中(残${u.restoreJob.monthsLeft}ヶ月)` : `要${term('genjo_kaifuku', '原状回復')}`}</span>`
         : `<span class="text-red-600">空室${u.vacantMonths}ヶ月</span>`}</td>
       <td class="text-right">${!u.occupied && from === 'owned' ? (u.needsRestore
         ? '<span class="text-[11px] text-slate-500">原状回復するまで募集できません</span>'
         : `<button class="fill-ad text-xs border rounded px-1" data-i="${i}">広告料(家賃1ヶ月)</button>
-        <button class="fill-self text-xs border rounded px-1" data-i="${i}">自主客付け(-30)</button>`) : ''}</td></tr>`).join('')}
+        <button class="fill-self text-xs border rounded px-1" data-i="${i}">自主${term('kyakuduke', '客付け')}(-30)</button>`) : ''}</td></tr>`).join('')}
   </table>
   ${from === 'owned' && p.units.some(u => u.needsRestore) ? '<div class="mt-2 text-xs text-amber-700 bg-amber-50 rounded p-2">退去した部屋は原状回復するまで募集できません。フッターの「🔨修繕」から着手できます。</div>' : ''}`;
 }
@@ -3386,13 +4599,15 @@ function financeTab(p) {
       <div>残債: <b>${L.yen(rem)}</b></div></div>`;
   }
   const rs = L.reviewAllBanks(p, p.price, 0.2, state);
-  return `<div class="text-xs text-slate-500 mb-1">頭金2割とした場合の事前審査見込み:</div>` + bankReviewList(rs);
+  return minCashLine(p)
+    + `<div class="text-xs text-slate-500 mt-2 mb-1">${term('own_cash', '頭金')}2割とした場合の事前審査見込み（${term('ltv')}80%）:</div>`
+    + bankReviewList(rs);
 }
 
 function bankReviewList(rs) {
   return `<div class="space-y-1">${rs.map(r => r.approved
-    ? `<div class="border rounded p-2"><b>◯ ${r.label}</b><div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要自己資金${L.yen(r.terms.requiredCash)}</div></div>`
-    : `<div class="border rounded p-2 bg-slate-50"><b>✕ ${r.label}</b><div class="text-xs text-red-600">${r.reasons.map(x => x.msg).join('／')}</div></div>`).join('')}</div>`;
+    ? `<div class="border rounded p-2"><b>◯ ${r.label}</b><div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div></div>`
+    : `<div class="border rounded p-2 bg-slate-50"><b>✕ ${r.label}</b><div class="text-xs text-red-600">${linkTerms(r.reasons.map(x => x.msg).join('／'))}</div></div>`).join('')}</div>`;
 }
 
 function wireFillButtons(body, p, from) {
@@ -3424,10 +4639,10 @@ function openPurchase(propId, back) {
     <div><h2 class="font-bold">${p.name || p.label} に買付を入れる（行動力-10）</h2><div class="text-[11px] text-slate-500">${p.label}</div></div>
     <div class="text-sm">売出価格: ${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}<b>${L.yen(p.price)}</b>${p.origPrice && p.price < p.origPrice ? ' <span class="text-[11px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}${p.staleFlag ? ' <span class="text-[11px] bg-amber-500 text-white rounded px-1">売れ残り中</span>' : ''}</div>
     ${p.sellerUrgency ? `<div class="text-xs"><span class="bg-rose-100 text-rose-700 rounded px-1.5 py-0.5 font-bold">🏃 売り急ぎ</span> <span class="text-slate-600">${p.sellerUrgency.reason}そうだ</span></div>` : ''}
-    <button id="of-detail" class="w-full text-xs text-navy underline">📋 レントロール・収支・融資の詳細を見る</button>
-    <button id="of-full" class="w-full border rounded py-2 text-sm font-bold">満額 ${L.yen(p.price)}（必ず通る）</button>
+    <button id="of-detail" class="w-full text-xs text-navy underline">📋 ${term('rentroll', 'レントロール')}・収支・融資の詳細を見る</button>
+    <button id="of-full" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white rounded py-2 text-sm font-bold">満額 ${L.yen(p.price)}（必ず通る）</button>
     <div class="pt-1 border-t ${blocked ? 'opacity-50' : ''}">
-      <div class="text-sm">指値 <b id="of-cutpct">5%</b>引き → <b id="of-cutprice">${L.yen(Math.round(p.price * 0.95))}</b></div>
+      <div class="text-sm">${term('sashine', '指値')} <b id="of-cutpct">5%</b>引き → <b id="of-cutprice">${L.yen(Math.round(p.price * 0.95))}</b></div>
       <input id="of-slider" type="range" min="1" max="99" step="1" value="5" class="w-full" ${blocked ? 'disabled' : ''}>
       <div class="flex items-center gap-2 text-xs">
         <span class="text-slate-500 shrink-0">成功率</span>
@@ -3460,7 +4675,8 @@ function openPurchase(propId, back) {
     gauge.style.width = `${Math.max(3, Math.round(chance * 100))}%`;
     gauge.style.background = chance >= 0.5 ? '#059669' : chance >= 0.2 ? '#f59e0b' : '#dc2626';
     if (cut <= line) {
-      noteEl.textContent = `🏢「頑張って交渉します」（取次ライン: ${Math.round(line * 100)}%引きまで）`;
+      // 用語ヘルプのspanを出すため innerHTML で入れる（中身は自前の文字列のみ）
+      noteEl.innerHTML = `🏢「頑張って交渉します」（${term('toritsugi', '取次ライン')}: ${Math.round(line * 100)}%引きまで）`;
       noteEl.className = 'text-[11px] mt-1 text-slate-600';
       submit.textContent = 'この指値で申し込む（行動力-10）';
       submit.className = 'w-full bg-navy text-white rounded py-2 text-sm font-bold mt-1';
@@ -3494,6 +4710,7 @@ function openPurchase(propId, back) {
       }
       pushLog(`${p.label} の買付が通った！（${L.yen(r.price)}・交渉+${5 + Math.round(cut * 100)} EXP）`);
       showPayment(propId, r.price, close);
+      tutMaybeAdvance('offer');
     });
   };
   box.querySelector('#of-full').addEventListener('click', () => doOffer(0));
@@ -3622,8 +4839,8 @@ function showPayment(propId, price, close) {
         <label class="flex-1 border rounded p-1.5 text-center cursor-pointer ${buyOwner === 'corp' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="corp" ${buyOwner === 'corp' ? 'checked' : ''} class="mr-1">🏢 法人</label></div>` : ''}
       <button id="pay-cash" class="w-full border rounded py-2 text-sm ${state.cash < cashNeed ? 'opacity-40' : ''}" ${state.cash < cashNeed ? 'disabled' : ''}>現金一括（必要 ${L.yen(cashNeed)}）</button>
       <div class="text-sm font-bold pt-2 border-t">融資（4行同時審査）</div>
-      <div class="text-sm">頭金 <b id="pay-down-pct">${Math.round(downRatio * 100)}%</b>＝<span id="pay-down-amt" class="font-bold">${L.yen(Math.round(price * downRatio))}</span>
-        <span class="text-[11px] text-slate-500">（諸費用込み必要現金 <span id="pay-down-need">${L.yen(Math.round(price * downRatio) + Math.round(price * L.CONFIG.closingCostRate))}</span>）</span></div>
+      <div class="text-sm">${term('own_cash', '頭金')} <b id="pay-down-pct">${Math.round(downRatio * 100)}%</b>＝<span id="pay-down-amt" class="font-bold">${L.yen(Math.round(price * downRatio))}</span>
+        <span class="text-[11px] text-slate-500">（${term('closing_cost', '諸費用')}込み必要現金 <span id="pay-down-need">${L.yen(Math.round(price * downRatio) + Math.round(price * L.CONFIG.closingCostRate))}</span>）</span></div>
       <input id="pay-down-range" type="range" min="0" max="${maxDownPct}" step="1" value="${Math.round(downRatio * 100)}" class="w-full">
       <div class="text-[11px] text-slate-500">スライドで自由に設定できます（手持ち現金で払える上限 ${maxDownPct}%）。離すと審査結果が更新されます。</div>
       <div id="pay-banks"></div>
@@ -3633,9 +4850,9 @@ function showPayment(propId, price, close) {
     banksDiv.innerHTML = rs.map(r => r.approved
       ? `<div class="border rounded p-2 mb-1"><div class="flex justify-between items-center"><b>◯ ${r.label}</b>
           <button class="pay-bank bg-navy text-white rounded px-2 py-1 text-sm" data-k="${r.bankKey}">借りる</button></div>
-          <div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要自己資金${L.yen(r.terms.requiredCash)}</div></div>`
+          <div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div></div>`
       : `<div class="border rounded p-2 mb-1 bg-slate-50"><b>✕ ${r.label}</b>
-          <div class="text-xs text-red-600">${r.reasons.map(x => x.msg).join('／')}</div></div>`).join('');
+          <div class="text-xs text-red-600">${linkTerms(r.reasons.map(x => x.msg).join('／'))}</div></div>`).join('');
     const range = box.querySelector('#pay-down-range');
     range.addEventListener('input', () => {
       const pct = Number(range.value);
@@ -3650,11 +4867,13 @@ function showPayment(propId, price, close) {
       const r = L.buyPropertyV2(state, propId, { method: 'cash', price, owner: buyOwner });
       state = r.state; r.logs.forEach(pushLog); save(); render(); close(); checkEnd();
       playPurchaseCelebration(p.name || p.label, `${L.yen(price)}（現金一括・${ownerLabel()}）`);
+      tutMaybeAdvance('payment');
     });
     box.querySelectorAll('.pay-bank').forEach(b => b.addEventListener('click', () => {
       const r = L.buyPropertyV2(state, propId, { method: b.dataset.k, downRatio, price, owner: buyOwner });
       state = r.state; r.logs.forEach(pushLog); save(); render(); close(); checkEnd();
       playPurchaseCelebration(p.name || p.label, `${L.yen(price)}（融資利用・${ownerLabel()}）`);
+      tutMaybeAdvance('payment');
     }));
     box.querySelector('#pay-cancel').addEventListener('click', () => { pushLog('買付を取り下げた'); close(); });
     box.querySelector('#pay-x').addEventListener('click', () => { pushLog('買付を取り下げた'); close(); });
@@ -3680,14 +4899,14 @@ function openCorpTransfer(propId) {
     <div class="flex justify-between items-start gap-2"><h2 class="font-bold">🏢 ${p.name || p.label} を法人へ売却（移転）</h2><button id="tc-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
     <table class="w-full text-sm">
       <tr><td>移転価格（現在の時価）</td><td class="text-right font-bold">${L.yen(price)}</td></tr>
-      <tr class="border-t"><td>譲渡税（個人側・${heldYears <= 5 ? '短期39%' : '長期20%'}）</td><td class="text-right text-red-600">-${L.yen(capTax)}</td></tr>
+      <tr class="border-t"><td>${term('capital_gains_tax', '譲渡税')}（個人側・${heldYears <= 5 ? '短期39%' : '長期20%'}）</td><td class="text-right text-red-600">-${L.yen(capTax)}</td></tr>
       <tr><td>取得コスト（法人側・5%）</td><td class="text-right text-red-600">-${L.yen(acqCost)}</td></tr>
       <tr class="border-t font-bold"><td>支払い合計</td><td class="text-right text-red-600">${L.yen(total)}</td></tr>
     </table>
     <div class="text-xs text-slate-600 bg-slate-50 rounded p-2 space-y-1">
-      <div>✅ 以後の課税は法人税率30%（デッドクロス後も40%にならない）</div>
-      <div>✅ <b>減価償却が再スタート</b>（中古簡便法・取得価額=現在の時価）</div>
-      <div>✅ 売却時の譲渡税が保有期間に関係なく30%に</div>
+      <div>✅ 以後の課税は法人税率30%（${term('dead_cross', 'デッドクロス')}後も40%にならない）</div>
+      <div>✅ <b>${term('depreciation', '減価償却')}が再スタート</b>（中古簡便法・取得価額=現在の時価）</div>
+      <div>✅ 売却時の${term('capital_gains_tax', '譲渡税')}が保有期間に関係なく30%に</div>
     </div>
     <button id="tc-run" class="w-full bg-navy text-white rounded py-2 text-sm font-bold ${state.cash < total ? 'opacity-40' : ''}" ${state.cash < total ? 'disabled' : ''}>法人へ移転する（${L.yen(total)} 支払い）</button>
     <button id="tc-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
@@ -3744,7 +4963,7 @@ function drawPricing(m, p, appraisal, close, back) {
     <div class="flex gap-1 text-xs">
       ${[0.9, 1.0, 1.1, 1.2].map(f => `<button class="sl-preset flex-1 border rounded py-1" data-f="${f}">査定×${Math.round(f * 100)}%</button>`).join('')}
     </div>
-    <div class="text-center text-sm text-slate-600">この価格の表面利回り <span id="sl-yield" class="font-bold text-lg text-emerald-700">${yieldOf(appraisal)}</span>%
+    <div class="text-center text-sm text-slate-600">この価格の${term('yield_gross', '表面利回り')} <span id="sl-yield" class="font-bold text-lg text-emerald-700">${yieldOf(appraisal)}</span>%
       <div class="text-[11px] text-slate-500">（満室想定・年間家賃収入 ${L.yen(gpi)} 基準）</div></div>
     <div class="text-xs text-slate-500">安くすれば早く売れ、高いほど時間がかかる。訳あり物件を高利回りで仕入れ、通常の利回り水準の価格で売り抜く戦略も。</div>
     <button id="sl-list" class="w-full bg-emerald text-white rounded py-2">この価格で売りに出す</button>
@@ -3900,26 +5119,30 @@ function workOptions(p, category) {
       type: 'restore', unitIndex: i, label: `現状回復（${i + 1}号室 ${u.layout || ''}）`,
       detail: u.restoreJob ? `業者が施工中（残り${u.restoreJob.monthsLeft}ヶ月）` : '退去後の原状回復。業者なら工期1ヶ月',
       effect: 'この部屋の募集を再開できる',
-      cost: L.restoreCost(p, u), diyable: true, diyAp: L.RESTORE_DIY_AP,
+      cost: L.restoreCost(p, u), diyable: !p.autoManage, diyAp: L.RESTORE_DIY_AP,
+      blockedReason: p.autoManage ? 'おまかせ契約中は原状回復も業者へ自動手配されます' : undefined,
       disabled: !!u.restoreJob, disabledReason: '施工中です',
       progress: u.restoreProgress || 0,
     });
   });
+  // v6: 日常メンテは 🧹手入れ、大規模修繕は 🏚躯体 と、それぞれ別のゲージを直す。
   const mk = L.REPAIR_KINDS.maint, lg = L.REPAIR_KINDS.large;
-  const maintGoal = L.repairResultState(p, 'maint');
+  const care = Math.round(p.careState ?? p.repairState ?? 100);
+  const struct = Math.round(p.repairState ?? 100);
   out.push({
     type: 'maint', label: mk.label, detail: L.repairDetail(p, 'maint'),
-    effect: `修繕度 ${p.repairState}% → ${maintGoal}%`,
-    cost: L.repairCost(p, 'maint'), diyable: true, diyAp: mk.diyAp,
-    disabled: maintGoal <= p.repairState,
-    disabledReason: `修繕度${mk.cap}%が上限です。これ以上戻すには大規模修繕が必要`,
+    effect: `🧹 手入れ ${care}% → 100%`,
+    cost: L.repairCost(p, 'maint'), diyable: !p.autoManage, diyAp: mk.diyAp,
+    blockedReason: p.autoManage ? 'おまかせ契約中は工事がすべて業者任せになります' : undefined,
+    disabled: care >= 100,
+    disabledReason: '手入れは既に100%です',
     progress: (p.diyProgress && p.diyProgress.kind === 'maint') ? p.diyProgress.done : 0,
   });
   out.push({
     type: 'large', label: lg.label, detail: L.repairDetail(p, 'large'),
-    effect: `修繕度 ${p.repairState}% → 100%・資産価値+8%`,
+    effect: `🏚 躯体 ${struct}% → 100%・資産価値+8%`,
     cost: L.repairCost(p, 'large'), diyable: false, blockedReason: lg.blockedReason,
-    disabled: p.repairState >= 100, disabledReason: '修繕度は既に100%です',
+    disabled: struct >= 100, disabledReason: '躯体は既に100%です',
   });
   return out;
 }
@@ -4308,8 +5531,8 @@ function playIncorporationCelebration() {
       <div class="bg-white/95 rounded-xl p-4 text-left text-sm text-slate-800 space-y-2">
         <div class="font-bold text-navy">ここが変わりました</div>
         <div>✅ 購入時に<b>名義（👤個人／🏢法人）</b>を選べるように</div>
-        <div>✅ 法人名義の物件は<b>デッドクロス後の課税が30%</b>に軽減（個人は40%）</div>
-        <div>✅ 法人名義の売却は<b>保有期間に関係なく譲渡税30%</b>（個人の短期39%より転売に有利）</div>
+        <div>✅ 法人名義の物件は<b>${term('dead_cross', 'デッドクロス')}後の課税が30%</b>に軽減（個人は40%）</div>
+        <div>✅ 法人名義の売却は<b>保有期間に関係なく${term('capital_gains_tax', '譲渡税')}30%</b>（個人の短期39%より転売に有利）</div>
         <div>✅ 既存の物件は<b>👤個人名義のまま</b>。詳細画面の「🏢法人へ売却」で移転できます（ローン完済物件のみ・移転すると減価償却が再スタート）</div>
       </div>
       <button id="ic-close" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-xl py-3 font-bold">経営を続ける ▶</button>
@@ -4380,7 +5603,7 @@ function renderPanelRight() {
   c.appendChild(el(`
     <div class="hud-panel pointer-events-auto rounded-xl shadow-lg p-3 space-y-2">
       <button id="btn-open-search" class="w-full bg-navy text-white rounded-lg py-2 text-xs font-bold shadow-md hover:bg-navy-dark">🏘️ 物件を探す</button>
-      <button id="btn-work" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-lg py-2 text-xs font-bold shadow-md select-none touch-none">💼 働く（行動力-1・長押しOK）</button>
+      <button id="btn-work" class="w-full bg-amber-500 hover:bg-amber-600 text-white rounded-lg py-2 text-xs font-bold shadow-md select-none touch-none">💼 働く（${term('action_power', '行動力')}-1・長押しOK）</button>
       <div class="grid grid-cols-2 gap-2">
         <button id="btn-open-listings" class="hud-tile rounded-lg py-2 text-[11px] font-bold">🗂️ 市場(${state.market.length})</button>
         <button id="btn-open-props" class="hud-tile rounded-lg py-2 text-[11px] font-bold">🏠 所有(${state.properties.length})</button>
@@ -4459,6 +5682,7 @@ function wireWorkButton(btn) {
     updateHudLive();
     sfxCoin();
     floatEarn(btn, r.earned);
+    tutMaybeAdvance('work');
   };
   const startWork = (e) => {
     e.preventDefault();
@@ -4506,6 +5730,7 @@ function openListingsModal() {
         <button class="fav-toggle text-base leading-none shrink-0" data-id="${p.id}" title="お気に入り">${fav ? '★' : '☆'}</button>
       </div>
       <div>${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}${L.yen(p.price)}${p.origPrice && p.price < p.origPrice ? ' <span class="text-[11px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}・表面利回り${(p.grossYield * 100).toFixed(1)}%${p.staleFlag ? '・<span class="text-amber-600">売れ残り中</span>' : ''}${p.sellerUrgency ? '・<span class="text-rose-600 font-bold">🏃売り急ぎ</span>' : ''}</div>
+      ${minCashLine(p)}
       ${fav ? `<div class="text-slate-500">お気に入り登録から${state.month - fav.addedMonth}ヶ月</div>` : ''}
       <div class="grid grid-cols-3 gap-1">
         <button class="listing-detail border rounded py-1" data-id="${p.id}">📋 詳細</button>
@@ -4518,6 +5743,7 @@ function openListingsModal() {
     <div class="flex justify-between items-center"><h2 class="font-bold">🗂️ 物件情報（${state.market.length}件）</h2><button id="listings-close" class="text-slate-400 text-xl">✕</button></div>
     ${rows}</div>`);
   m.appendChild(box);
+  tutMaybeAdvance('listings');
   box.querySelector('#listings-close').addEventListener('click', close);
   box.querySelectorAll('.listing-detail').forEach(b => b.addEventListener('click', () => {
     close(); openDetail(parsePropId(b.dataset.id), 'market', () => openListingsModal());
@@ -4527,6 +5753,7 @@ function openListingsModal() {
   }));
   box.querySelectorAll('.listing-buy').forEach(b => b.addEventListener('click', () => {
     close(); openPurchase(parsePropId(b.dataset.id), () => openListingsModal());
+    tutMaybeAdvance('buy');
   }));
   box.querySelectorAll('.fav-toggle').forEach(b => b.addEventListener('click', () => {
     const id = parsePropId(b.dataset.id);
@@ -4572,13 +5799,14 @@ function openSoldSnapshot(p) {
     <div class="p-4 text-sm overflow-y-auto min-h-0 flex-1 space-y-2">
       <table class="w-full text-sm">
         <tr><td>売出価格</td><td class="text-right font-bold">${L.yen(p.price)}</td></tr>
-        <tr class="border-t"><td>表面利回り</td><td class="text-right">${(p.grossYield * 100).toFixed(1)}%</td></tr>
+        <tr class="border-t"><td>${term('yield_gross', '表面利回り')}</td><td class="text-right">${(p.grossYield * 100).toFixed(1)}%</td></tr>
         <tr class="border-t"><td>構造・築年</td><td class="text-right">${p.structure}・築${p.builtAge}年</td></tr>
-        <tr class="border-t"><td>修繕度</td><td class="text-right">${p.repairState}%</td></tr>
+        <tr class="border-t"><td>🏚 躯体</td><td class="text-right">${Math.round(p.repairState)}%</td></tr>
+        <tr class="border-t"><td>🧹 手入れ</td><td class="text-right">${Math.round(p.careState ?? p.repairState)}%</td></tr>
         <tr class="border-t"><td>入居率</td><td class="text-right">${occ}%</td></tr>
         ${p.junkFlags?.length ? `<tr class="border-t"><td>訳あり</td><td class="text-right text-red-600">${p.junkFlags.join('・')}</td></tr>` : ''}
       </table>
-      <div class="text-xs font-bold pt-2 border-t">レントロール</div>
+      <div class="text-xs font-bold pt-2 border-t">${term('rentroll', 'レントロール')}</div>
       <table class="w-full text-xs">${rows || '<tr><td class="text-slate-500">データなし</td></tr>'}</table>
       <div class="text-[11px] text-slate-500">この物件は他の買主で成約済みのため、買付・お気に入り登録はできません。</div>
     </div></div>`);
@@ -4659,6 +5887,31 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && _toasts.length) { e.preventDefault(); dismissToast(_toasts[0]); }
 });
 
+// v7: チュートリアル専用。乱数の出物待ちにせず、1回の押下で必ずサンプル物件を1件 state.market に追加する。
+// 終了時に state はスナップショットへ復元されるため、本編の資産や市場には影響しない。
+function tutForceFind(box, closeModal) {
+  const rng = () => 0.4;
+  const p = L.generateProperty('kodate', 'local', rng, null, {});
+  state.nextPropertyId = state.nextPropertyId || 1;
+  p.id = 'p' + state.nextPropertyId++;
+  p.name = L.propertyName(p.genreKey, p.builtAge, p.id);
+  state.market.unshift(p);
+  // 体験用に、購入と融資審査が必ず通るぶんだけ所持金を底上げする（不足分のみ）
+  state.cash = Math.max(state.cash, Math.round(p.price * 1.5) + 100000);
+  setCityState(state);
+  save();
+  const feed = box.querySelector('#sr-feed');
+  feed.querySelector('.sr-empty')?.remove();
+  const line = el(`<div class="sr-found font-bold text-emerald-700 underline cursor-pointer">🖥️ ポータルサイトを巡回した…おっ！ ${p.name || p.label} の情報を掴んだ（タップで詳細）</div>`);
+  line.addEventListener('click', () => { closeModal(); openDetail(p.id, 'market', openSearchModal); });
+  feed.insertBefore(line, feed.firstChild);
+  sfxKnock();
+  pushLog(`${p.name || p.label}（${p.label}）を発見（表面${(p.grossYield * 100).toFixed(1)}%・${L.yen(p.price)}）`);
+  box.querySelector('#sr-progress').textContent = '発見！ 続けて探すこともできます';
+  renderPanelRight();
+  tutMaybeAdvance('search');
+}
+
 // 営業ポップオーバー: 条件（ジャンル/エリア/築年帯）はボタンを押すと出てくる。
 function openSearchModal() {
   const m = document.getElementById('search-modal');
@@ -4680,10 +5933,12 @@ function openSearchModal() {
       <label><input type="checkbox" class="sel-age" value="old" ${searchSelection.ages.includes('old') ? 'checked' : ''}> 築古26年〜</label>
     </div>
     <div id="sr-progress" class="text-[11px] font-bold text-slate-600 text-center">${(state.salesSearch?.spent || 0) > 0 ? `調査継続中（累計 行動力${state.salesSearch.spent}消費）` : '足で稼いだ情報が出物につながる'}</div>
-    <button id="btn-search" class="w-full bg-navy text-white rounded py-2 text-sm font-bold select-none touch-none">🔍 動いて情報を集める（行動力-1・長押しOK）</button>
+    <button id="btn-search" class="w-full bg-navy text-white rounded py-2 text-sm font-bold select-none touch-none">🔍 動いて情報を集める（${term('action_power', '行動力')}-1・長押しOK）</button>
     <div id="sr-feed" class="text-[11px] leading-relaxed h-28 overflow-y-auto space-y-0.5 bg-slate-50 rounded p-2"><div class="sr-empty text-slate-500">ここに調査ログが流れます。物件を見つけたらログをタップで詳細へ。</div></div>
     <button id="btn-search-close" class="w-full text-slate-500 text-sm">閉じる</button></div>`);
   m.appendChild(box);
+  // v7.2: モーダルを開いた時点で「物件を探すを押す」ステップは完了。次は中のボタンを指す。
+  tutMaybeAdvance('openSearch');
   box.querySelectorAll('.sel-genre, .sel-area, .sel-age, #sel-wakeari').forEach(cb =>
     cb.addEventListener('change', () => { searchSelection = readSearchSelection(); }));
   // v3.8: 働くと同様の長押し対応。押している間は約0.2秒ごとに連続調査し、発見か行動力切れで自動停止。
@@ -4694,7 +5949,12 @@ function openSearchModal() {
     const res = onSearchPress(box, close);
     if (!res || !res.pressed || res.found) srStop();
   };
-  searchBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); if (srTimer) return; srOnce(); srTimer = setInterval(srOnce, 200); });
+  searchBtn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (srTimer) return;
+    if (tutIdx >= 0 && TUTORIAL_STEPS[tutIdx].key === 'search') { tutForceFind(box, close); return; }
+    srOnce(); srTimer = setInterval(srOnce, 200);
+  });
   searchBtn.addEventListener('pointerup', srStop);
   searchBtn.addEventListener('pointerleave', srStop);
   searchBtn.addEventListener('pointercancel', srStop);
@@ -4750,6 +6010,7 @@ function onSearchPress(box, closeModal) {
       line.addEventListener('click', () => { closeModal(); openDetail(mp.id, 'market', openSearchModal); });
       feed.insertBefore(line, feed.firstChild);
     }
+    sfxMundane();
     pushLog(`平凡な出物を${r.mundane.length}件見た（低利回り・売れ残り）`);
     renderPanelRight();
   }
@@ -4764,6 +6025,7 @@ function onSearchPress(box, closeModal) {
     renderPanelRight();
     return { pressed: true, found: true };
   }
+  sfxStep();   // v6: 「働く」と同じく、1押しごとに手応えの音を返す
   const miss = SEARCH_MISS[Math.floor(Math.random() * SEARCH_MISS.length)];
   feed.insertBefore(el(`<div>${act}${miss}</div>`), feed.firstChild);
   box.querySelector('#sr-progress').textContent = `調査継続中（累計 行動力${state.salesSearch.spent}消費）`;
@@ -4838,6 +6100,16 @@ function popCashTile(tile) {
 const VIEW_RESET_MS = 1400;
 
 function onNextMonth() {
+  // v7.4: チュートリアルの「翌月へ進む」では本物の月送り（イベント・空室判定・収支）は走らせない。
+  // どのみち捨てる状態なので、伝えたいこと＝「月が変わると行動力が全回復する」だけを見せる。
+  // v7.5: 回復の告知はしない。次の段で実際の行動力の欄を指して見せる。
+  if (tutIdx >= 0 && TUTORIAL_STEPS[tutIdx].key === 'next') {
+    state.actionPower = state.baseActionPower;
+    state.month += 1;                       // 左上の経過年数も動かして、次の説明につなげる
+    save(); render();
+    tutMaybeAdvance('next');
+    return;
+  }
   animateResetView(VIEW_RESET_MS);   // v5: 翌月のときだけ、地球儀がゆっくり回って初期位置へ戻る
   if (state.properties.length) setTimeout(playCoinCollectAnimation, VIEW_RESET_MS);
   const nextMonth = state.month + 1;
@@ -4866,12 +6138,28 @@ function showEvent(pending) {
   if (!ev) { checkEnd(); return; }
   const m = document.getElementById('event-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
-  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3"><h2 class="font-bold">${ev.title}</h2></div>`);
+  // v6: イベントは物件ごとの条件（築年数・構造・戸数・手入れ）で出るようになったので、
+  // どの建物で起きているのかを必ず示す。物件を持たない経営イベントのときは出さない。
+  const tp = pending.targetId != null ? state.properties.find(x => x.id === pending.targetId) : null;
+  // v6.4: 部屋ごとの設備（給湯器・エアコン・火災警報器）は何号室で起きたのかまで示す。
+  const ui = pending.unitIndex;
+  const unit = (tp && ui != null) ? tp.units[ui] : null;
+  const room = unit
+    ? `<div class="mt-1 font-bold text-navy">🚪 ${ui + 1}号室（${unit.layout || ''}${unit.occupied ? '・入居中' : '・空室'}）</div>`
+    : '';
+  const where = tp
+    ? `<div class="text-xs text-slate-600 bg-slate-50 rounded-lg p-2">🏠 <b>${tp.name || tp.label}</b>（${structureLabel(tp)}・築${tp.builtAge}年・${tp.units.length}戸）${room}</div>`
+    : '';
+  // 見出しは発生時に確定済み（セミナーのお題など）。古いセーブには無いので関数側で解決する。
+  const title = pending.title || L.eventTitle(ev);
+  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3"><h2 class="font-bold">${title}</h2>${where}</div>`);
   ev.choices.forEach(ch => {
     const b = el(`<button class="w-full border rounded py-2 text-sm">${ch.label}</button>`);
     b.addEventListener('click', () => {
-      state = ch.apply(structuredClone(state), pending.targetId);
-      pushLog(ch.log);
+      state = ch.apply(structuredClone(state), pending.targetId, pending.unitIndex);
+      // 何号室の話だったかをログにも残す（あとから履歴を見て思い出せるように）
+      const nm = tp ? (tp.name || tp.label) : null;
+      pushLog(nm ? `${nm}${ui != null ? ` ${ui + 1}号室` : ''}: ${ch.log}` : ch.log);
       m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = '';
       save(); render();
       const withOffer = (state.listings || []).find(l => l.offer);
@@ -5003,7 +6291,7 @@ function openResultScreen(kind) {
         <tr><td>手元現金</td><td class="text-right font-bold">${L.yen(state.cash)}</td></tr>
         <tr class="border-t"><td>総資産（現金＋物件時価）</td><td class="text-right">${L.yen(ta)}</td></tr>
         <tr><td>総負債（残債）</td><td class="text-right text-red-600">-${L.yen(td)}</td></tr>
-        <tr class="border-t font-bold"><td>純資産</td><td class="text-right text-emerald-700">${L.yen(nw)}</td></tr>
+        <tr class="border-t font-bold"><td>${term('net_worth', '純資産')}</td><td class="text-right text-emerald-700">${L.yen(nw)}</td></tr>
         <tr class="border-t"><td>月間キャッシュフロー</td><td class="text-right">${L.yen(L.monthlyCF(state))}</td></tr>
       </table>
     </div>
@@ -5047,6 +6335,7 @@ function checkEnd() {
 }
 
 wireGlobalAudioHooks();
+initTermHelp();   // v6: 用語の吹き出しは document 委譲で拾う（モーダル内に動的に生えるため）
 
 // シティビュー初期化（建物タップ→詳細、売出し看板タップ→買付フロー）
 initCity(document.getElementById('city-canvas'), {
@@ -5074,6 +6363,21 @@ if (btnMute) {
 }
 const btnBgm = document.getElementById('btn-bgm');
 if (btnBgm) btnBgm.addEventListener('click', openBgmModal);
+
+// v6.2: 用語ヘルプのON/OFF（音のON/OFFと同じ並び）。長押しで用語集を開く。
+const btnTerms = document.getElementById('btn-terms');
+if (btnTerms) {
+  let held = false, holdTimer = null;
+  btnTerms.addEventListener('pointerdown', () => {
+    held = false;
+    holdTimer = setTimeout(() => { held = true; openGlossaryModal(); }, 500);
+  });
+  const cancelHold = () => { clearTimeout(holdTimer); };
+  btnTerms.addEventListener('pointerup', cancelHold);
+  btnTerms.addEventListener('pointerleave', cancelHold);
+  btnTerms.addEventListener('pointercancel', cancelHold);
+  btnTerms.addEventListener('click', () => { if (!held) setTermsOff(!termsOff); });
+}
   </script>
 </body>
 </html>
