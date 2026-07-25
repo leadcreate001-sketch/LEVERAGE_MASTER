@@ -83,6 +83,23 @@
     50%      { box-shadow: 0 0 0 5px #fde68a, 0 0 22px 8px rgba(251,191,36,0.85); }
   }
 
+  /* v8: 用語クイズの演出。既存のスタンプ演出はオーバーレイ内の <style> に閉じていて
+     クイズ画面からは使えないので、クイズ用のキーフレームをここへ常設する。 */
+  @keyframes qzStamp { 0% { transform: scale(3.2) rotate(14deg); opacity: 0; } 55% { transform: scale(0.92) rotate(-8deg); opacity: 1; } 75% { transform: scale(1.07) rotate(-8deg); } 100% { transform: scale(1) rotate(-8deg); opacity: 1; } }
+  @keyframes qzFloat { 0% { transform: translateY(0) scale(1); opacity: 1; } 100% { transform: translateY(-90px) scale(1.4); opacity: 0; } }
+  @keyframes qzShake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-7px); } 75% { transform: translateX(7px); } }
+
+  /* v8: 使用不能・管理崩壊のゲージ。数字を読まなくても「止まっている」ことが分かるよう点滅させる。 */
+  .lm-blink { animation: lmBlink 1s ease-in-out infinite; }
+  @keyframes lmBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  /* v8: 初心者モードの危険域バナー。地図の上に重ねるので、地図操作は透過させる。 */
+  #danger-banner {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    top: calc(env(safe-area-inset-top, 0px) + 64px);
+    z-index: 15; pointer-events: none; max-width: min(92%, 480px);
+  }
+
   /* v3.12: iOSでは 100vh が「ブラウザのバーを隠した高さ」を指すため、h-screen だと画面下端が
      アドレスバーの裏に潜り込み、下部のボタン（翌月へ進む等）に一切触れなくなっていた。
      実際に見えている高さを指す 100dvh を使う（非対応ブラウザは 100vh にフォールバック）。 */
@@ -115,7 +132,13 @@
 </head>
 <body class="bg-canvas text-ink overflow-hidden flex flex-col">
   <header class="bg-navy text-white px-3 py-2 flex items-center justify-between shrink-0 z-10">
-    <h1 class="font-bold text-sm md:text-base">レバレッジ・マスター</h1>
+    <!-- v8: ゲーム名を置いていた枠を「経過年数・年齢」に明け渡す。ヘッダーは常時表示なので
+         PCの左パネルが出ないスマホでも、いま何年目で何歳なのかが必ず目に入る。
+         ゲーム名は初期設定ウィザードで名乗る。state が無いあいだは hidden。 -->
+    <div id="hud-clock" class="flex items-center gap-3 font-bold text-sm md:text-base hidden">
+      <span>📆 <span id="hud-elapsed">0年0ヶ月</span></span>
+      <span>🎂 <span id="hud-age">-</span>歳</span>
+    </div>
     <div class="flex items-center gap-3">
       <button id="btn-result" class="text-lg leading-none hidden" title="リザルトを見る">🏆</button><button id="btn-bgm" class="text-lg leading-none" title="BGMの気分を変える">🎵</button>
       <button id="btn-mute" class="text-lg leading-none" title="音のON/OFF">🔊</button>
@@ -139,6 +162,11 @@
     <!-- v3.12: 表示条件（幅が狭い or 高さが低い）と位置（セーフエリア）は<style>側で指定する -->
     <div id="mobile-status" class="absolute z-10 gap-1"></div>
     <div id="mobile-actions" class="absolute z-20 gap-2"></div>
+
+    <!-- v8: 初心者モードの危険域バナー。通知に気づかないまま家賃が止まるのを防ぐ -->
+    <div id="danger-banner" class="hidden"></div>
+    <!-- v8: 初心者モードの巻き戻しボタン。月送り直後だけ出る -->
+    <div id="rewind-bar" class="absolute left-1/2 -translate-x-1/2 z-20 hidden pointer-events-none" style="bottom: calc(env(safe-area-inset-bottom, 0px) + 72px);"></div>
   </main>
 
   <!-- 選択肢イベント／各種モーダル -->
@@ -311,6 +339,80 @@ export function structuralDecay(property) {
   return DECAY_BY_AGE[ageBandOf(property.builtAge)] * (DECAY_BY_STRUCTURE[property.structure] ?? 1.0);
 }
 
+// === v8: 難易度モード ===
+// 中上級（normal）は v7 までと完全に同じ挙動になるよう、すべての係数を 1.0 / 0 に置いている。
+// 初心者（beginner）は「厳しさ」ではなく「取り返しのつかなさ」を削る方向で緩める——
+// 数字を甘くするだけでなく、劣化を遅くして考える時間を与え、巻き戻しで一度だけ失敗を帳消しにできる。
+export const DIFFICULTY = {
+  beginner: { label: '初心者向け', seedMult: 1.5, creditBonus: 10, rateAdj: -0.003, decayMult: 0.7,
+              eventMult: 0.6, fillBonus: 0.10, rewind: 1, quizForced: true,
+              diyEasy: true, goalScale: 0.5, yearsBonus: 5, quizSeconds: 18 },
+  normal:   { label: '中上級者向け', seedMult: 1.0, creditBonus: 0, rateAdj: 0, decayMult: 1.0,
+              eventMult: 1.0, fillBonus: 0, rewind: 0, quizForced: false,
+              diyEasy: false, goalScale: 1.0, yearsBonus: 0, quizSeconds: 12 },
+};
+// state を持たない純関数（generateProperty 等）からも呼ぶので、undefined でも落ちないようにする。
+export function difficultyOf(state) { return DIFFICULTY[state?.difficulty] || DIFFICULTY.normal; }
+
+// === v8: 危険域（帯）===
+// v7まで、2つのゲージは0まで落ちても実害がほとんど無かった（手入れ<50で退去1.5倍になるだけ）。
+// 放置のコストが軽すぎて2ゲージ制が機能していなかったので、3段階の帯を切って段階的に痛くする。
+// 設計の芯は「0にしてから直すと高くつく」——予防に経済合理性を持たせること。
+export const STRUCT_BANDS = { warn: 30, danger: 10 };   // 🏚 躯体 repairState
+export const CARE_BANDS   = { warn: 40, danger: 20 };   // 🧹 手入れ careState
+export const BAND_RANK = { ok: 0, warn: 1, danger: 2, dead: 3 };
+
+function bandOf(value, bands) {
+  const v = value ?? 100;
+  if (v <= 0) return 'dead';
+  if (v < bands.danger) return 'danger';
+  if (v < bands.warn) return 'warn';
+  return 'ok';
+}
+export function structBandOf(property) { return bandOf(property.repairState, STRUCT_BANDS); }
+export function careBandOf(property)   { return bandOf(property.careState, CARE_BANDS); }
+// 2ゲージのうち悪い方。一覧のソートや警告バナーの判定に使う。
+export function worstBandOf(property) {
+  return BAND_RANK[structBandOf(property)] >= BAND_RANK[careBandOf(property)]
+    ? structBandOf(property) : careBandOf(property);
+}
+
+// 躯体が傷んだ建物は市場で買い叩かれる。fairValue は独自の repairFactor を持っているので、
+// ここで割り引くのは「timeValue をそのまま資産額として使っている経路」だけ（純資産・買付・法人移転）。
+export const STRUCT_VALUE_FACTOR = { ok: 1.0, warn: 0.95, danger: 0.90, dead: 0.85 };
+export function marketValueOf(property) {
+  return Math.round((property.timeValue ?? 0) * STRUCT_VALUE_FACTOR[structBandOf(property)]);
+}
+
+// 危険域の物件を抱えていると銀行からの評価が下がる。担保評価を個別に持たせる代わりに、
+// 「管理のできない大家」として信用度の実効値を削る形で表現する（審査ロジックを増やさずに済む）。
+export const CREDIT_HIT_DANGER = 3;
+export const CREDIT_HIT_DEAD = 8;
+export const CREDIT_HIT_CAP = 20;
+export function creditPenalty(state) {
+  let hit = 0;
+  for (const p of state.properties || []) {
+    const b = worstBandOf(p);
+    if (b === 'dead') hit += CREDIT_HIT_DEAD;
+    else if (b === 'danger') hit += CREDIT_HIT_DANGER;
+  }
+  return Math.min(CREDIT_HIT_CAP, hit);
+}
+export function effectiveCredit(state) {
+  return Math.max(0, (state.creditScore ?? 0) - creditPenalty(state));
+}
+
+// 躯体0＝使用不能。全戸退去のうえ募集を止め、大規模修繕を終えるまで家賃がゼロになる。
+export function isCondemned(property) { return structBandOf(property) === 'dead'; }
+// 使用不能からの復旧は割高・長期。傷む前に直した方が安い、を成立させるための係数。
+export const CONDEMNED_COST_MULT = 1.5;
+export const CONDEMNED_EXTRA_MONTHS = 1;
+// 危険域（躯体10%未満）では毎月この確率で1戸が退去する。
+export const STRUCT_DANGER_VACATE_CHANCE = 0.20;
+// 手入れ危険域（20%未満）では毎月この確率でクレームが起きて行動力を持っていかれる。
+export const CARE_DANGER_CLAIM_CHANCE = 0.25;
+export const CARE_DANGER_CLAIM_AP = 10;
+
 // 退去率と突発修繕も築年帯で傾斜させる（旧: 退去1.0%・突発3%の一律）
 export const VACANCY_BY_AGE = { young: 0.004, mid: 0.008, old: 0.015 };
 export const TROUBLE_BY_AGE = { young: 0.01, mid: 0.03, old: 0.05 };
@@ -318,12 +420,15 @@ export const TROUBLE_BY_AGE = { young: 0.01, mid: 0.03, old: 0.05 };
 export function vacancyRate(property) {
   let r = VACANCY_BY_AGE[ageBandOf(property.builtAge)];
   if ((property.junkFlags || []).includes('管理崩壊')) r += 0.01;
-  if ((property.careState ?? 100) < 50) r *= 1.5;   // 荒れた物件は住み続けてもらえない
+  // 荒れた物件は住み続けてもらえない。v8で閾値を50→40（注意帯の入口）に揃えた。
+  if (careBandOf(property) !== 'ok') r *= 1.5;
   return r;
 }
 
 export function troubleChanceFor(property) {
-  return TROUBLE_BY_AGE[ageBandOf(property.builtAge)];
+  const base = TROUBLE_BY_AGE[ageBandOf(property.builtAge)];
+  // v8: 躯体が注意帯に入ると突発修繕が増える。傷んだ建物は壊れやすい。
+  return structBandOf(property) === 'ok' ? base : base * 1.5;
 }
 
 // 物件名を築年数に応じて生成（築浅=モダン／築古=荘・文化・第一ビル等の古い名前）。
@@ -498,7 +603,18 @@ export function makeOffer(state, propertyId, cutRate, rng = Math.random) {
   s.actionPower -= 10;
   const lv = skillLevel(s.skills.negotiation.exp);
   const beyondLine = cutRate > maxBrokerCut(p, lv);
-  if (rng() < offerSuccessChance(p, cutRate, lv)) {
+  // v8: 用語クイズ全問正解の「耳より情報」は、この1回の指値だけ成功率を底上げして消える。
+  // s.market の参照（p）を保ったまま消費したいので、clone を返す consumeSashineBuff ではなく
+  // ここで直接 s.buffs を削る（結果は同じ）。
+  const buff = sashineBuffBonus(s);
+  const base = offerSuccessChance(p, cutRate, lv);
+  // 満額（base=1）は「必ず通る」が仕様なので、上乗せもクランプもしない。
+  const chance = base >= 1 ? base : Math.min(0.95, base + buff);
+  if (buff > 0 && base < 1) {
+    const bi = s.buffs.findIndex(b => b.type === 'sashine');
+    if (bi >= 0 && --s.buffs[bi].uses <= 0) s.buffs.splice(bi, 1);
+  }
+  if (rng() < chance) {
     // v3.8: 深い指値を通すほど交渉EXPが多く入る
     s.skills.negotiation.exp += 5 + Math.round(cutRate * 100);
     return { state: s, accepted: true, price: Math.max(10000, Math.round(p.price * (1 - cutRate))) };
@@ -632,7 +748,8 @@ export function offerChance(askingPrice, timeValue, fullyOccupied, listedMonths)
 
 export function rollBuyOffer(listing, property, rng = Math.random) {
   const full = property.units.every(u => u.occupied);
-  if (rng() >= offerChance(listing.askingPrice, property.timeValue, full, listing.listedMonths)) return null;
+  // v8: 買い手は傷んだ建物を割り引いて見る。同じ売出価格でも躯体が悪いほど買付が入りにくい。
+  if (rng() >= offerChance(listing.askingPrice, marketValueOf(property), full, listing.listedMonths)) return null;
   const mustSashine = listing.listedMonths >= 6;
   const sashine = mustSashine || rng() < 0.4;
   if (!sashine) return { price: listing.askingPrice, type: 'full' };
@@ -656,24 +773,86 @@ export function respondToOffer(state, propertyId, action, negotiationLv, rng = M
   return { state: s, result: 'counter_ng' };
 }
 
+// === v8.1: 売却の損得を「決める前」に見せるための計算 ===
+// v8までは譲渡税が settleSale の中だけで計算され、プレイヤーは決済後のログで初めて金額を知った。
+// このゲームの一番おいしい判断（短期で売るか、長期まで待つか）が見えないままだったので、
+// 実際の精算と同じ関数を UI からも呼べるように切り出した（表示と実処理が食い違わないことが肝）。
+export const LONG_TERM_MONTHS = 60;   // これを超えて保有すると長期譲渡（税率が下がる）
+
+export function heldMonthsOf(state, property) {
+  return Math.max(0, (state.month ?? 0) - (property.boughtMonth ?? state.month ?? 0));
+}
+export function isLongTermHold(state, property) {
+  return heldMonthsOf(state, property) > LONG_TERM_MONTHS;
+}
+// 長期になるまであと何ヶ月か（法人名義・すでに長期なら0）
+export function monthsToLongTerm(state, property) {
+  if (property.owner === 'corp' || isLongTermHold(state, property)) return 0;
+  return LONG_TERM_MONTHS + 1 - heldMonthsOf(state, property);
+}
+// v3.5: 法人名義は保有期間に関係なく法人税率（短期転売の5年ルールは個人のみ）
+export function capGainTaxRate(state, property) {
+  if (property.owner === 'corp') return CONFIG.corporateTaxRate;
+  return isLongTermHold(state, property) ? CONFIG.capGainTaxLong : CONFIG.capGainTaxShort;
+}
+// 課税対象益は「売却価格 − 簿価」。簿価は減価償却で毎月下がるので、
+// 画面に出ている「購入差額（時価−購入価格）」よりも大きくなるのが普通。
+export function capGainOf(property, price) {
+  return Math.max(0, price - bookValueV2(property));
+}
+export function capGainTaxOf(state, property, price) {
+  return Math.round(capGainOf(property, price) * capGainTaxRate(state, property));
+}
+export function loanPayoffOf(property) {
+  let payoff = 0;
+  if (property.loan) {
+    payoff += Math.round(remainingPrincipal(property.loan.principal, property.loan.rate,
+      property.loan.years, property.loan.monthsPaid));
+  }
+  return payoff + reformLoansRemaining(property);
+}
+// 売却の手取り一式。価格決定・買付承諾・決済演出のすべてがこれを使う。
+export function saleBreakdown(state, property, price) {
+  const book = bookValueV2(property);
+  const gain = capGainOf(property, price);
+  const rate = capGainTaxRate(state, property);
+  const tax = Math.round(gain * rate);
+  const payoff = loanPayoffOf(property);
+  return { price, book, gain, rate, tax, payoff, net: price - tax - payoff,
+    longTerm: property.owner === 'corp' || isLongTermHold(state, property) };
+}
+
+// v8.1: 個人名義の物件がすべて法人名義だったら、年間の税額がいくら変わるか。
+// 法人化の判断を「雰囲気」ではなく数字でできるようにするための試算。
+// 課税はデッドクロス後にしか発生しないので、償却が残っている物件では0になる（それが正しい）。
+export function incorporationSaving(state) {
+  let monthly = 0;
+  for (const p of state.properties || []) {
+    if (p.owner === 'corp') continue;
+    monthly += propertyMonthlyPL({ ...p, owner: 'personal' }).tax
+             - propertyMonthlyPL({ ...p, owner: 'corp' }).tax;
+  }
+  return Math.round(monthly * 12);
+}
+// 設立費用を年間節税額で割った回収年数。まだ節税が発生しない場合は null。
+export function incorporationPaybackYears(state) {
+  const saving = incorporationSaving(state);
+  return saving > 0 ? CONFIG.corporateSetupCost / saving : null;
+}
+
 export function settleSale(state, sale) {
   const s = structuredClone(state);
   const i = s.properties.findIndex(x => x.id === sale.propertyId);
   const p = s.properties[i];
   const logs = [];
-  const book = bookValueV2(p);
-  const gain = Math.max(0, sale.price - book);
-  const heldYears = (s.month - p.boughtMonth) / 12;
-  // v3.5: 法人名義は保有期間に関係なく法人税率（短期転売の5年ルールは個人のみ）
-  const taxRate = p.owner === 'corp' ? CONFIG.corporateTaxRate
-    : (heldYears <= 5 ? CONFIG.capGainTaxShort : CONFIG.capGainTaxLong);
-  const capTax = Math.round(gain * taxRate);
-  let payoff = 0;
-  if (p.loan) payoff += Math.round(remainingPrincipal(p.loan.principal, p.loan.rate, p.loan.years, p.loan.monthsPaid));
-  payoff += reformLoansRemaining(p);
+  // 表示（売却前の試算）と同じ関数で精算する。数字がズレると信用を失うので必ず共通化する。
+  const bd = saleBreakdown(s, p, sale.price);
+  const { gain, tax: capTax, payoff } = bd;
   s.cash += sale.price - capTax - payoff;
   if (p.loan) { const rel = s.bankRelations?.[p.loan.bankKey]; if (rel) rel.paidOff += 1; }
-  logs.push(`${p.label} を ${yen(sale.price)} で売却（譲渡税 ${yen(capTax)}・残債精算 ${yen(payoff)}）`);
+  const taxLabel = p.owner === 'corp' ? '法人30%'
+    : `${bd.longTerm ? '長期' : '短期'}${Math.round(bd.rate * 100)}%`;
+  logs.push(`${p.label} を ${yen(sale.price)} で売却（${taxLabel} 譲渡税 ${yen(capTax)}・残債精算 ${yen(payoff)}・手取り ${yen(bd.net)}）`);
   s.stats = s.stats || { buys: 0, sales: 0, profitSales: 0, junkFlips: 0, hadLoan: false };
   s.stats.sales += 1;
   if (gain > 0) s.stats.profitSales += 1;
@@ -703,17 +882,22 @@ export function monthlyVacancyRoll(property, rng = Math.random) {
 }
 
 // v6: 自然客付け率。基準20%を手入れの状態で ±5pt 動かす（手入れ100%で25%・0%で15%）。
+// v8: 使用不能（躯体0）と管理崩壊（手入れ0）では、そもそも募集が成立しないのでゼロにする。
 export function naturalFillChance(property) {
+  if (isCondemned(property) || careBandOf(property) === 'dead') return 0;
   return 0.15 + 0.10 * Math.max(0, Math.min(100, property.careState ?? 100)) / 100;
 }
 
-export function naturalFillRoll(property, rng = Math.random) {
+// v8: bonus は難易度による下駄（初心者+10pt）。募集そのものが止まっている物件には効かせない。
+export function naturalFillRoll(property, rng = Math.random, bonus = 0) {
   let filled = 0;
+  const base = naturalFillChance(property);
+  const chance = base > 0 ? base + bonus : 0;
   property.units.forEach(u => {
     if (!u.occupied) {
       if (u.needsRestore) { u.vacantMonths += 1; return; }   // v4: 原状回復前は埋まらない
       // v6: 手入れが行き届いた物件ほど自然に埋まる（草ぼうぼうの物件は内見で決まらない）
-      if (rng() < naturalFillChance(property)) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; filled += 1; }
+      if (rng() < chance) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; filled += 1; }
       else u.vacantMonths += 1;
     }
   });
@@ -727,6 +911,9 @@ export function fillVacancy(state, propertyId, unitIndex, method, rng = Math.ran
   if (!u || u.occupied) return { state: s, success: false };
   // v4: 原状回復が済むまでは募集できない。費用・行動力を消費する前に弾く。
   if (u.needsRestore) return { state: s, success: false, reason: 'needsRestore' };
+  // v8: 使用不能・管理崩壊の建物は、部屋が直っていても募集そのものが通らない。
+  if (isCondemned(p)) return { state: s, success: false, reason: 'condemned' };
+  if (careBandOf(p) === 'dead') return { state: s, success: false, reason: 'careCollapsed' };
   let chance;
   if (method === 'ad') { s.cash -= u.rent; chance = 0.70; }
   else { s.actionPower -= 30; const lv = skillLevel(s.skills.selfmgmt.exp); chance = 0.40 + (lv - 1) * 0.10; s.skills.selfmgmt.exp += 10; }
@@ -742,8 +929,16 @@ export const RESTORE_DIY_STEP = 25;      // DIY1回の基準作業量（スキ�
 export const DIY_MATERIAL_RATE = 0.30;   // DIYの材料費 ＝ 業者見積の30%
 
 // 自主管理スキルが高いほどDIY1回で進む量が増える
-export function diyWorkStep(base, state) {
-  return base * (1 + skillLevel(state.skills.selfmgmt.exp) * 0.12);
+// v8: qualityMult はミニゲームの出来ばえ。DIY_QUALITY を参照。
+export function diyWorkStep(base, state, qualityMult = 1) {
+  return base * (1 + skillLevel(state.skills.selfmgmt.exp) * 0.12) * qualityMult;
+}
+
+// v8: DIYの出来ばえ。基準ステップ25に対して ノーミス35 ／ ミス1回まで25 ／ ミス2回以上18 になる倍率。
+// 失敗しても進むこと（＝詰まないこと）を保証しつつ、上手いほどセッション数が減るようにしてある。
+export const DIY_QUALITY = { perfect: 1.4, good: 1.0, sloppy: 0.72 };
+export function diyQualityOf(misses) {
+  return misses === 0 ? DIY_QUALITY.perfect : misses <= 1 ? DIY_QUALITY.good : DIY_QUALITY.sloppy;
 }
 
 // 原状回復費: 家賃ベース。修繕度が低いほど高く、長期入居ほど高い（10年で約2倍）。
@@ -771,7 +966,7 @@ export function startRestore(state, propertyId, unitIndex, opts = {}) {
     // 材料費は着手時（作業量0）の1回だけ。以降のタップは行動力のみ。
     if ((u.restoreProgress || 0) <= 0) s.cash -= material;
     s.actionPower -= RESTORE_DIY_AP;
-    u.restoreProgress = (u.restoreProgress || 0) + diyWorkStep(RESTORE_DIY_STEP, s);
+    u.restoreProgress = (u.restoreProgress || 0) + diyWorkStep(RESTORE_DIY_STEP, s, opts.qualityMult);
     s.skills.selfmgmt.exp += 10;
     const done = u.restoreProgress >= DIY_WORK_TOTAL;
     if (done) { u.needsRestore = false; u.restoreProgress = 0; }
@@ -802,7 +997,22 @@ export const REPAIR_KINDS = {
   large: { label: '大規模修繕', detail: '外壁・屋根・防水（足場）',
     gauge: 'structural', diyable: false, cap: 100, diyAp: 0, diyStep: 0,
     blockedReason: '足場の設置と高所・構造の作業が必要なため、業者にしか頼めません' },
+  // v8: 管理崩壊（手入れ0）からの復旧専用。日常メンテで戻せてしまうと
+  // 「0まで放置してから一度で直す」のが最安になり、予防する動機が消える。
+  deepclean: { label: '特別清掃・原状復旧', detail: '害虫駆除・残置物撤去・全面清掃',
+    gauge: 'care',       diyable: false, cap: 100, diyAp: 0, diyStep: 0,
+    blockedReason: '手に負えない状態まで荒れているため、専門業者にしか頼めません' },
 };
+
+// その工事種別を、いまこの物件で選べるか。
+// 手入れ0のときは deepclean だけ、それ以外のときは maint だけを出す（両方は出さない）。
+export function repairKindAvailable(property, kind) {
+  const collapsed = careBandOf(property) === 'dead';
+  if (kind === 'deepclean') return collapsed;
+  if (kind === 'maint') return !collapsed;
+  return true;
+}
+export const DEEPCLEAN_COST_MULT = 2;   // 特別清掃は日常メンテ見積の2倍
 
 // 工事種別が対象とするゲージの現在値
 export function repairGaugeValue(property, kind) {
@@ -833,24 +1043,30 @@ export function repairCost(property, kind) {
   const gap = Math.max(0, 100 - repairGaugeValue(property, kind));
   const units = property.units.length;
   const st = property.structure;
-  if (kind === 'maint') {
+  if (kind === 'maint' || kind === 'deepclean') {
     const raw = Math.round(MAINT_PER_UNIT * units * gap / 100 / 1000) * 1000;
-    return Math.min(MAINT_CAP, Math.max(MAINT_FLOOR, raw));
+    const base = Math.min(MAINT_CAP, Math.max(MAINT_FLOOR, raw));
+    // v8: 特別清掃は日常メンテの2倍。0まで放置した分だけ余計に払う。
+    return kind === 'deepclean' ? base * DEEPCLEAN_COST_MULT : base;
   }
   if (kind === 'large') {
     const scaffold = (LARGE_SCAFFOLD[st] ?? 400_000) + LARGE_SCAFFOLD_PU * units;
     const material = (LARGE_PER_UNIT[st] ?? 800_000) * units * (gap / 100);
-    return Math.round((scaffold + material) / 10000) * 10000;
+    const base = Math.round((scaffold + material) / 10000) * 10000;
+    // v8: 使用不能まで落ちた建物の復旧は割増。傷む前に直した方が安い、を成立させる。
+    return isCondemned(property) ? Math.round(base * CONDEMNED_COST_MULT) : base;
   }
   return 0;
 }
 
 // 大規模修繕の工期は建物規模で決まる（足場を伴うため戸数が多いほど長い）。
+// v8: 使用不能からの復旧は解体・下地からやり直すぶん1ヶ月余計にかかる。
 export function largeRepairMonths(property) {
   const u = property.units.length;
-  return u <= 1 ? 1 : u <= 8 ? 2 : u <= 16 ? 3 : 4;
+  const base = u <= 1 ? 1 : u <= 8 ? 2 : u <= 16 ? 3 : 4;
+  return isCondemned(property) ? base + CONDEMNED_EXTRA_MONTHS : base;
 }
-// 工事の工期（日常メンテは常に1ヶ月・大規模修繕は規模ベース）。
+// 工事の工期（日常メンテ・特別清掃は常に1ヶ月・大規模修繕は規模ベース）。
 export function repairJobMonths(property, kind) {
   return kind === 'large' ? largeRepairMonths(property) : 1;
 }
@@ -874,6 +1090,8 @@ export function startRepair(state, propertyId, kind, opts = {}) {
   const p0 = state.properties.find(x => x.id === propertyId);
   const k = REPAIR_KINDS[kind];
   if (!p0 || !k || p0.repairJob) return { state, started: false, reason: 'busy' };
+  // v8: 手入れ0のときは日常メンテを封じ、特別清掃だけを通す（逆もまた然り）。
+  if (!repairKindAvailable(p0, kind)) return { state, started: false, reason: 'notAvailable' };
   if (opts.diy && !k.diyable) return { state, started: false, reason: 'diyNotAllowed' };
   // v6: おまかせ契約中は工事がすべて業者任せになる（自分で手を動かす余地がなくなるのが対価）
   if (opts.diy && p0.autoManage) return { state, started: false, reason: 'autoManaged' };
@@ -888,7 +1106,7 @@ export function startRepair(state, propertyId, kind, opts = {}) {
     const prog = (p.diyProgress && p.diyProgress.kind === kind) ? p.diyProgress : null;
     if (!prog) s.cash -= material;                       // 材料費は着手時の1回だけ
     s.actionPower -= k.diyAp;
-    const done = (prog ? prog.done : 0) + diyWorkStep(k.diyStep, s);
+    const done = (prog ? prog.done : 0) + diyWorkStep(k.diyStep, s, opts.qualityMult);
     s.skills.selfmgmt.exp += 10;
     if (done >= DIY_WORK_TOTAL) {
       // DIYできるのは日常メンテ（🧹手入れ）だけ。躯体は足場が要るので業者にしか直せない。
@@ -1038,7 +1256,7 @@ export function startValueUp(state, propertyId, planKey, opts = {}) {
     const p = s.properties.find(x => x.id === propertyId);
     if (!prog) s.cash -= material;                       // 材料費は着手時の1回だけ
     s.actionPower -= plan.diyAp;
-    const done = (prog ? prog.done : 0) + diyWorkStep(plan.diyStep, s);
+    const done = (prog ? prog.done : 0) + diyWorkStep(plan.diyStep, s, opts.qualityMult);
     s.skills.selfmgmt.exp += 10;
     if (done >= DIY_WORK_TOTAL) {
       applyValueUp(p, plan.rentMult);
@@ -1073,7 +1291,9 @@ export function applyValueUp(p, rentMult) {
   p.valueUpLevel = (p.valueUpLevel || 0) + 1;
 }
 
-export function totalAssetsV2(state) { return state.cash + state.properties.reduce((t, p) => t + p.timeValue, 0); }
+// v8: 資産額は marketValueOf（躯体の傷みぶんを割り引いた時価）で数える。
+// 放置すれば純資産が目に見えて減り、直せば戻る——ゲージが財務に直結する。
+export function totalAssetsV2(state) { return state.cash + state.properties.reduce((t, p) => t + marketValueOf(p), 0); }
 export function netWorth(state) { return Math.round(totalAssetsV2(state) - totalDebt(state)); }
 export function monthlyCF(state) { return state.properties.reduce((t, p) => t + (p.history.at(-1)?.cf ?? 0), 0); }
 export function isClearedV2(state) {
@@ -1171,6 +1391,92 @@ export const SEMINAR_TOPICS = [
   'ペット可・楽器可で差別化する',
 ];
 
+// === v8: 用語クイズ ===
+// 用語集（TERMS・50語）を「読む辞書」から「遊んで覚えるコレクション」に変える。
+// 勉強会・大家の会に参加したときに出題し、正解した語は learnedTerms に貯まって用語集に印が付く。
+export const QUIZ_MIN_Q = 3;
+export const QUIZ_MAX_Q = 5;
+export const QUIZ_COMBO_MULT = [1.0, 1.0, 1.2, 1.5, 2.0];   // 連続正解数 → 倍率（4連続以上は2.0）
+export const QUIZ_CASH_PER_CORRECT = 3_000;                  // 大家の会だけ。人脈から得た情報料という建て付け
+export const QUIZ_SASHINE_BONUS = 0.10;                      // 全問正解の「耳より情報」＝次の1件だけ指値+10pt
+
+export function quizComboMult(streak) {
+  return QUIZ_COMBO_MULT[Math.min(streak, QUIZ_COMBO_MULT.length - 1)];
+}
+
+// 正解率 → ランク。演出（判子スタンプ）の文字にそのまま使う。
+export function quizRank(correct, total) {
+  const r = total ? correct / total : 0;
+  return r >= 1 ? 'S' : r >= 0.8 ? 'A' : r >= 0.6 ? 'B' : 'C';
+}
+
+// 出題を組み立てる。同じセッション内で用語が重複しないよう、母集団から抜きながら選ぶ。
+// hard=true（中上級）は誤答選択肢を同じ group から取るので紛らわしい。初心者は別 group から取る。
+export function buildQuiz(rng = Math.random, { count, hard = false } = {}) {
+  const keys = Object.keys(TERMS);
+  const n = count ?? (QUIZ_MIN_Q + Math.floor(rng() * (QUIZ_MAX_Q - QUIZ_MIN_Q + 1)));
+  const pool = [...keys];
+  const picked = [];
+  for (let i = 0; i < n && pool.length; i++) {
+    picked.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+  }
+  return picked.map(key => {
+    const t = TERMS[key];
+    // 誤答の母集団。中上級は同グループ（似た語）から、初心者は別グループ（明らかに違う語）から。
+    const distractPool = keys.filter(k => k !== key &&
+      (hard ? TERMS[k].group === t.group : TERMS[k].group !== t.group));
+    const fallback = keys.filter(k => k !== key);
+    const src = distractPool.length >= 3 ? distractPool : fallback;
+    if (rng() < 0.5) {
+      // ○×: 半分の確率で定義を別の用語のものにすり替える
+      const swap = rng() < 0.5;
+      const other = src[Math.floor(rng() * src.length)];
+      return { key, type: 'ox', label: t.label,
+        text: `「${t.label}」とは、${swap ? TERMS[other].def : t.def}`,
+        answer: !swap };
+    }
+    // 4択: 定義から用語を当てる
+    const wrongs = [];
+    const p2 = [...src];
+    while (wrongs.length < 3 && p2.length) wrongs.push(p2.splice(Math.floor(rng() * p2.length), 1)[0]);
+    const options = [key, ...wrongs].sort(() => rng() - 0.5);
+    return { key, type: 'mc4', label: t.label, text: t.def,
+      options: options.map(k => ({ key: k, label: TERMS[k].label })), answer: key };
+  });
+}
+
+// クイズ結果を state に反映する。EXP・現金・耳より情報バフ・習得済み用語をまとめて処理する。
+export function applyQuizResult(state, { correctKeys, total, comboBest, cashReward }) {
+  const s = structuredClone(state);
+  const correct = correctKeys.length;
+  const mult = quizComboMult(comboBest);
+  s.skills.appraisal.exp += Math.round(5 * correct * mult);
+  s.skills.negotiation.exp += 3 * correct;
+  if (cashReward) s.cash += QUIZ_CASH_PER_CORRECT * correct;
+  s.learnedTerms = [...new Set([...(s.learnedTerms || []), ...correctKeys])];
+  if (total > 0 && correct === total) {
+    s.buffs = s.buffs || [];
+    s.buffs.push({ type: 'sashine', bonus: QUIZ_SASHINE_BONUS, uses: 1 });
+  }
+  return { state: s, rank: quizRank(correct, total), mult };
+}
+
+// 「耳より情報」バフの合計。指値の成功率に上乗せする。
+export function sashineBuffBonus(state) {
+  return (state.buffs || []).filter(b => b.type === 'sashine').reduce((t, b) => t + b.bonus, 0);
+}
+
+// 指値を1回使うとバフを1つ消費する（uses が尽きたものは配列から外す）。
+export function consumeSashineBuff(state) {
+  const s = structuredClone(state);
+  const i = (s.buffs || []).findIndex(b => b.type === 'sashine');
+  if (i >= 0) {
+    s.buffs[i].uses -= 1;
+    if (s.buffs[i].uses <= 0) s.buffs.splice(i, 1);
+  }
+  return s;
+}
+
 export const EVENTS = [
   // --- 経営イベント（物件を取らない。築年数に依存しないので築浅でも出る）---
   // 繰り返し起きても不自然でないものは cooldown を短くする。
@@ -1188,15 +1494,20 @@ export const EVENTS = [
         apply: s => { s.cash -= 300000; s.properties.forEach(p => { if (p.loan) p.loan.rate = Math.max(0.009, p.loan.rate - 0.005); }); return s; } },
       { label: '断る', log: '今回は見送った', apply: s => s } ] },
   // セミナーと大家の会は「何度でも来るもの」。お題だけ毎回変わる。
+  // v8: 参加すると📚用語クイズが始まる（quiz: 'seminar' | 'oyanokai'）。
+  // 初心者モードでは参加＝必ず出題、中上級では「クイズに挑む／話だけ聞く」を選べる。
   { id: 'seminar', cooldown: 6, condition: () => true,
     title: () => `🎤 「${SEMINAR_TOPICS[Math.floor(Math.random() * SEMINAR_TOPICS.length)]}」セミナーの勧誘`,
     choices: [
       { label: '断る（知識で武装済み）', log: '怪しい話を即断り（目利き+10 EXP）', apply: s => { s.skills.appraisal.exp += 10; return s; } },
-      { label: '話だけ聞く（行動力-20）', log: '勉強にはなった（交渉+10 EXP）', apply: s => { s.actionPower -= 20; s.skills.negotiation.exp += 10; return s; } } ] },
+      { label: '📚 参加して学ぶ（行動力-20）', quiz: 'seminar', log: '勉強会に参加した', apply: s => { s.actionPower -= 20; return s; } },
+      { label: '話だけ聞く（行動力-20）', beginnerHidden: true, log: '勉強にはなった（交渉+10 EXP）', apply: s => { s.actionPower -= 20; s.skills.negotiation.exp += 10; return s; } } ] },
   { id: 'oyanokai', title: '🍻 大家の会に誘われた', cooldown: 6,
     condition: s => s.properties.length > 0,
     choices: [
-      { label: '参加する（行動力-15・-¥5,000）', log: '大家仲間から生の情報を仕入れた（目利き+10・交渉+10 EXP）',
+      { label: '📚 参加する（行動力-15・-¥5,000）', quiz: 'oyanokai', log: '大家の会に顔を出した',
+        apply: s => { s.actionPower -= 15; s.cash -= 5000; return s; } },
+      { label: '顔を出すだけ（行動力-15・-¥5,000）', beginnerHidden: true, log: '大家仲間から生の情報を仕入れた（目利き+10・交渉+10 EXP）',
         apply: s => { s.actionPower -= 15; s.cash -= 5000; s.skills.appraisal.exp += 10; s.skills.negotiation.exp += 10; return s; } },
       { label: '今回は見送る', log: '家で収支表とにらめっこした', apply: s => s } ] },
 
@@ -1512,14 +1823,21 @@ export function doWork(state, rng = Math.random) {
   return { state: s, earned };
 }
 
-export function createInitialState({ attr, goalType, goalAmount, goalYears, seedCash, age }) {
+export function createInitialState({ attr, goalType, goalAmount, goalYears, seedCash, age, difficulty }) {
   const emp = attr === 'employee';
+  // v8: 難易度による下駄は「ウィザードで選んだ値」に対して掛ける。プリセットの縮小（goalScale）と
+  // 期限の延長（yearsBonus）はウィザード側の提示値で済ませてあるので、ここでは掛けない。
+  const diffKey = DIFFICULTY[difficulty] ? difficulty : 'normal';
+  const d = DIFFICULTY[diffKey];
   const clampedAge = Math.max(18, Math.min(CONFIG.maxAge - 1, Math.round(age ?? 30)));
-  const clampedSeed = Math.max(CONFIG.seedMin, Math.min(CONFIG.seedMax, Math.round(seedCash)));
+  const clampedSeed = Math.max(CONFIG.seedMin, Math.min(CONFIG.seedMax, Math.round(seedCash * d.seedMult)));
   const clampedYears = Math.max(1, Math.min(goalYears, maxYearsForAge(clampedAge)));
   return {
-    cash: clampedSeed, month: 0, attr, age: clampedAge,
-    creditScore: emp ? CONFIG.creditEmployee : CONFIG.creditSelf,
+    // v8: startAge は age と一緒に動かない「開始時点の年齢」。バランスシートで
+    // 「現在33歳（開始30歳）」と何年ぶん歳を取ったかを見せるために保持する。
+    cash: clampedSeed, month: 0, attr, age: clampedAge, startAge: clampedAge,
+    difficulty: diffKey,
+    creditScore: (emp ? CONFIG.creditEmployee : CONFIG.creditSelf) + d.creditBonus,
     baseActionPower: emp ? 100 : 120, actionPower: emp ? 100 : 120,
     goal: { type: goalType, amount: goalAmount, years: clampedYears },
     skills: { appraisal: { exp: 0 }, negotiation: { exp: 0 }, selfmgmt: { exp: 0 } },
@@ -1533,6 +1851,9 @@ export function createInitialState({ attr, goalType, goalAmount, goalYears, seed
     isIncorporated: false,
     salesSearch: { spent: 0, threshold: null },
     nextPropertyId: 1,
+    learnedTerms: [],   // v8: 用語クイズで正解した用語キー（用語集の習得マーク用）
+    buffs: [],          // v8: 一時的な有利効果（現状は「耳より情報」＝次の指値+10pt のみ）
+    rewindLeft: d.rewind,   // v8: 初心者モードのお守り。先月へ戻せる残り回数
   };
 }
 
@@ -1698,9 +2019,79 @@ function autoManageMonth(s, p, logs) {
   }
 }
 
+// v8: 危険域のペナルティを1物件ぶん適用する。advanceMonth から毎月呼ぶ。
+// 「痛いが理不尽ではない」ことを重視し、どの段階でも通知とログで理由が読めるようにしてある。
+function applyDangerBandPenalties(s, p, logs, rng) {
+  const nm = p.name || p.label;
+  const sb = structBandOf(p);
+  const cb = careBandOf(p);
+
+  // 🏚 危険（10%未満）: 傷んだ建物から住人が離れていく
+  if (sb === 'danger' && rng() < STRUCT_DANGER_VACATE_CHANCE) {
+    const occupied = p.units.filter(u => u.occupied);
+    if (occupied.length) {
+      const u = occupied[Math.floor(rng() * occupied.length)];
+      u.occupied = false; u.vacantMonths = 0; u.tenantMonths = 0; u.needsRestore = true;
+      logs.push(`${nm} の劣化に耐えかねて1戸が退去（躯体${Math.round(p.repairState)}%）`);
+    }
+  }
+
+  // 🏚 使用不能（0%）: 全戸退去のうえ募集停止。大規模修繕の完了でしか解除できない。
+  if (sb === 'dead' && !p.condemned) {
+    p.condemned = true;
+    const lost = p.units.filter(u => u.occupied).length;
+    p.units.forEach(u => {
+      if (u.occupied) { u.occupied = false; u.vacantMonths = 0; u.tenantMonths = 0; }
+    });
+    pushNotification(s, 'condemned', p.id, nm,
+      `${nm} が使用不能になりました（躯体0%）。全${lost}戸が退去し、大規模修繕が完了するまで募集できません`);
+    logs.push(`🛑 ${nm} が使用不能に。全${lost}戸が退去し、募集を停止した`);
+  }
+  if (sb !== 'dead' && p.condemned) p.condemned = false;   // 修繕で躯体が戻れば自動解除
+
+  // 🧹 危険（20%未満）: 荒れた共用部にクレームが来る
+  if (cb === 'danger' && rng() < CARE_DANGER_CLAIM_CHANCE) {
+    s.actionPower -= CARE_DANGER_CLAIM_AP;
+    const claim = CARE_CLAIMS[Math.floor(rng() * CARE_CLAIMS.length)];
+    logs.push(`${nm} で入居者クレーム「${claim}」対応に追われた（行動力-${CARE_DANGER_CLAIM_AP}）`);
+  }
+
+  // 🧹 管理崩壊（0%）: 毎月確実に1戸ずつ抜けていき、評判も落ちる
+  if (cb === 'dead') {
+    const occupied = p.units.filter(u => u.occupied);
+    if (occupied.length) {
+      const u = occupied[Math.floor(rng() * occupied.length)];
+      u.occupied = false; u.vacantMonths = 0; u.tenantMonths = 0; u.needsRestore = true;
+      logs.push(`${nm} は管理崩壊状態。愛想を尽かした1戸が退去した`);
+    }
+    s.creditScore = Math.max(0, (s.creditScore ?? 0) - 1);
+  }
+
+  // 帯が悪化した月だけ通知する。同じ帯に留まっているあいだは黙り、回復すれば再アームされる。
+  const worst = worstBandOf(p);
+  const before = p.notifiedBand || 'ok';
+  if (BAND_RANK[worst] > BAND_RANK[before]) {
+    if (worst === 'warn') {
+      pushNotification(s, 'band_warn', p.id, nm,
+        `${nm} が注意水準です（躯体${Math.round(p.repairState)}% ／ 手入れ${Math.round(p.careState)}%）。早めに直すほど安く済みます`);
+    } else if (worst === 'danger') {
+      pushNotification(s, 'band_danger', p.id, nm,
+        `${nm} が危険水準です（躯体${Math.round(p.repairState)}% ／ 手入れ${Math.round(p.careState)}%）。退去が始まり、銀行の評価も下がります`);
+    }
+  }
+  if (BAND_RANK[worst] !== BAND_RANK[before]) p.notifiedBand = worst;
+}
+
+// クレームの中身。同じ文面が続くと「またこれか」になるので数を持たせる。
+const CARE_CLAIMS = [
+  'ゴミ置き場が荒れている', '草が伸び放題で虫が出る', '共用廊下の電球が切れたまま',
+  '自転車置き場が溢れている', '掲示板が破れて情報が読めない', '階段の手すりがぐらつく',
+];
+
 export function advanceMonth(state, rng = Math.random) {
   let s = structuredClone(state);
   const logs = [];
+  const diff = difficultyOf(s);   // v8: 劣化・イベント頻度・客付けに難易度の係数が乗る
   s.month += 1;
   for (const sale of [...(s.pendingSales || [])].filter(x => x.settleMonth <= s.month)) {
     const r = settleSale(s, sale); s = r.state; logs.push(...r.logs);
@@ -1718,10 +2109,12 @@ export function advanceMonth(state, rng = Math.random) {
     }
     // v6: 経年劣化。🏚躯体は築年帯×構造で、🧹手入れは一律で減る。
     // 小数のまま保持する（整数に丸めながら引くと、築浅RCの -0.08/月 が永久に0のままになる）。
-    p.repairState = Math.max(0, (p.repairState ?? 100) - structuralDecay(p));
-    p.careState = Math.max(0, (p.careState ?? 100) - CARE_DECAY_PER_MONTH);
+    // v8: 初心者モードは劣化が0.7倍。数字を甘くするより「考える時間を与える」ほうが効くため。
+    p.repairState = Math.max(0, (p.repairState ?? 100) - structuralDecay(p) * diff.decayMult);
+    p.careState = Math.max(0, (p.careState ?? 100) - CARE_DECAY_PER_MONTH * diff.decayMult);
     monthlyVacancyRoll(p, rng);
-    naturalFillRoll(p, rng);
+    applyDangerBandPenalties(s, p, logs, rng);   // v8: 危険域のペナルティは客付け判定より先に効かせる
+    naturalFillRoll(p, rng, diff.fillBonus);
     const pl = propertyMonthlyPL(p);
     s.cash += pl.cf;
     if (p.loan) {
@@ -1739,7 +2132,7 @@ export function advanceMonth(state, rng = Math.random) {
     p.history.push({ month: s.month, ...pl });
     if (p.history.length > 24) p.history.shift();
     p.cum.cf += pl.cf; p.cum.months += 1;
-    if (rng() < troubleChanceFor(p)) {   // v6: 築年帯で傾斜（旧: 全物件3%固定）
+    if (rng() < troubleChanceFor(p) * diff.eventMult) {   // v6: 築年帯で傾斜（旧: 全物件3%固定）
       const base = CONFIG.troubleMin + rng() * (CONFIG.troubleMax - CONFIG.troubleMin);
       const c = Math.round(troubleRepairCost(base, skillLevel(s.skills.selfmgmt.exp)));
       s.cash -= c;
@@ -1766,9 +2159,10 @@ export function advanceMonth(state, rng = Math.random) {
         } else {
           // おまかせ契約による自動工事は「自分で手を動かしていない」ので自主管理EXPが入らない
           if (!j.auto) s.skills.selfmgmt.exp += 8;
+          const kindLabel = REPAIR_KINDS[kind].label;
           pushNotification(s, 'repair_done', p.id, nm,
-            `${nm} の日常メンテが完了しました（手入れ100%）${j.auto ? '／管理会社おまかせ' : ''}`);
-          logs.push(`${nm} の日常メンテが完了した（手入れ100%）`);
+            `${nm} の${kindLabel}が完了しました（手入れ100%）${j.auto ? '／管理会社おまかせ' : ''}`);
+          logs.push(`${nm} の${kindLabel}が完了した（手入れ100%）`);
         }
       } else {
         const k = j.monthsTotal - j.monthsLeft;
@@ -1788,14 +2182,7 @@ export function advanceMonth(state, rng = Math.random) {
         logs.push(`${nm} のバリューアップ完了（家賃UP・資産価値上昇）`);
       }
     }
-    // 躯体が20%を割ったら管理会社から修繕依頼（通知は劣化中に一度だけ・回復で再アーム。修繕中は出さない）
-    if (p.repairState < 20 && !p.repairAlerted && !p.repairJob) {
-      const nm = p.name || p.label;
-      pushNotification(s, 'repair_needed', p.id, nm, `${nm} の劣化が深刻です（躯体${Math.round(p.repairState)}%）。管理会社から修繕依頼が届きました`);
-      p.repairAlerted = true;
-    } else if (p.repairState >= 20) {
-      p.repairAlerted = false;
-    }
+    // v8: 「躯体20%割れ」の単発通知は、3段階の帯通知（applyDangerBandPenalties）に統合した。
   }
   if (s.month % 12 === 0) { s.properties.forEach(p => { p.builtAge += 1; }); s.age = (s.age ?? 30) + 1; }
   // v3.7: 生涯実績用に最大月CFを記録（リザルト画面で表示）
@@ -1813,7 +2200,7 @@ export function advanceMonth(state, rng = Math.random) {
   }
   { const r = tickMarket(s, rng); s = r.state; logs.push(...r.logs); }
   let pendingEvent = null;
-  if (rng() < CONFIG.eventChance) {
+  if (rng() < CONFIG.eventChance * diff.eventMult) {
     const es = eligibleEvents(s);
     if (es.length) {
       const ev = es[Math.floor(rng() * es.length)];
@@ -1838,6 +2225,12 @@ export function deserialize(str) { return JSON.parse(str); }
 // v4: 旧セーブを新フィールドへ移行する。ui側のload()から呼ぶ（純関数なのでテストできる）。
 export function migrateSave(state) {
   const s = structuredClone(state);
+  // v8: 旧セーブには無い項目を補う。開始年齢は現在年齢から経過年数を引いて復元する。
+  if (s.startAge === undefined) s.startAge = (s.age ?? 30) - Math.floor((s.month ?? 0) / 12);
+  if (s.difficulty === undefined) s.difficulty = 'normal';
+  if (s.rewindLeft === undefined) s.rewindLeft = difficultyOf(s).rewind;
+  if (!Array.isArray(s.learnedTerms)) s.learnedTerms = [];
+  if (!Array.isArray(s.buffs)) s.buffs = [];
   (s.properties || []).forEach(p => {
     // リフォームローンの単数→配列
     if (!Array.isArray(p.reformLoans)) p.reformLoans = p.reformLoan ? [p.reformLoan] : [];
@@ -1921,8 +2314,9 @@ export function bankRate(bankKey, state) {
   const b = BANKS[bankKey];
   const rel = (state.bankRelations && state.bankRelations[bankKey]) || { paidOff: 0 };
   const negLv = skillLevel(state.skills.negotiation.exp);
-  const cut = (state.creditScore / 100) * 0.005 + negotiationRateCut(negLv) + Math.min(rel.paidOff * 0.001, 0.005);
-  return Math.max(b.baseRate - cut, b.baseRate - 0.007);
+  const cut = (effectiveCredit(state) / 100) * 0.005 + negotiationRateCut(negLv) + Math.min(rel.paidOff * 0.001, 0.005);
+  // v8: 難易度による金利の下駄。交渉・信用による引き下げ幅の上限（-0.7%）とは別枠で乗せる。
+  return Math.max(b.baseRate - cut, b.baseRate - 0.007) + difficultyOf(state).rateAdj;
 }
 
 export function reviewLoan(bankKey, property, price, downRatio, state) {
@@ -1932,7 +2326,11 @@ export function reviewLoan(bankKey, property, price, downRatio, state) {
   const rel = (state.bankRelations && state.bankRelations[bankKey]) || { paidOff: 0 };
   const ltvMax = bankKey === 'chigin' && rel.paidOff >= 3 ? 0.90 : b.ltvMax;
 
-  if (state.creditScore < b.minCredit) reasons.push({ code: 'CREDIT_LOW', msg: `属性・信用度が基準未満（${state.creditScore} < ${b.minCredit}）` });
+  // v8: 危険域の物件を抱えていると、その分だけ実効的な信用度が下がった状態で審査される。
+  const credit = effectiveCredit(state);
+  const penalty = creditPenalty(state);
+  if (credit < b.minCredit) reasons.push({ code: 'CREDIT_LOW',
+    msg: `属性・信用度が基準未満（${credit} < ${b.minCredit}）${penalty ? `※保有物件の管理状態で-${penalty}` : ''}` });
   if (property.junkFlags.length > 0 && !b.wakeOk) reasons.push({ code: 'WAKEARI_NG', msg: '瑕疵・事故物件のため取扱不可' });
   if (b.areaLimit && property.areaKey !== b.areaLimit) reasons.push({ code: 'AREA_NG', msg: `${b.label}の営業エリア外（地方・郊外のみ）` });
   if (price < b.minPrice || loanAmount > b.maxLoan) reasons.push({ code: 'AMOUNT_NG', msg: `融資額が取扱範囲外（${b.label}）` });
@@ -2277,6 +2675,11 @@ export const TERMS = {
     calc: '譲渡税 ＝（売却価格 − 取得費 − 償却済み額）× 税率。個人は保有5年以内39%・5年超20%、法人は一律30%。',
     here: '個人名義は保有5年以内だと税率がほぼ倍になる。法人名義には5年ルールがない。',
     hint: '短期転売を狙うなら法人化を検討する。5年目前なら、あと数ヶ月待つだけで手取りが大きく変わる。' },
+  book_value: { scope: 'real', reading: 'ぼか', group: '税・会計', label: '簿価',
+    def: '帳簿上の物件価格。購入価格から、これまでに償却した建物ぶんを差し引いた残り。',
+    calc: '簿価 ＝ 土地ぶん ＋ 建物ぶん ×（1 − 償却の進み具合）',
+    here: '売却時の課税対象益は「売却価格 − 簿価」で決まる。物件概要に現在の簿価が出ている。',
+    hint: '償却が進むほど簿価は下がり、課税される益は増える。画面の「購入差額（時価−購入価格）」より税金は重くなるのが普通。' },
   houjin_nari: { scope: 'real', reading: 'ほうじんなり', group: '税・会計', label: '法人成り',
     def: '個人でやっていた不動産賃貸業を、会社（法人）を作ってそちらの名義に移すこと。',
     calc: '設立費用200万円。以降は物件の名義が法人なら NOI への課税が30%（個人は償却切れ後40%）。',
@@ -2375,7 +2778,7 @@ export function minRequiredCash(property, state, price = property.price) {
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, settleSale, monthlyVacancyRoll, naturalFillChance, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, restoreCost, startRestore, REPAIR_KINDS, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, DIFFICULTY, difficultyOf, STRUCT_BANDS, CARE_BANDS, BAND_RANK, structBandOf, careBandOf, worstBandOf, STRUCT_VALUE_FACTOR, marketValueOf, CREDIT_HIT_DANGER, CREDIT_HIT_DEAD, CREDIT_HIT_CAP, creditPenalty, effectiveCredit, isCondemned, CONDEMNED_COST_MULT, CONDEMNED_EXTRA_MONTHS, STRUCT_DANGER_VACATE_CHANCE, CARE_DANGER_CLAIM_CHANCE, CARE_DANGER_CLAIM_AP, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, LONG_TERM_MONTHS, heldMonthsOf, isLongTermHold, monthsToLongTerm, capGainTaxRate, capGainOf, capGainTaxOf, loanPayoffOf, saleBreakdown, incorporationSaving, incorporationPaybackYears, settleSale, monthlyVacancyRoll, naturalFillChance, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, DIY_QUALITY, diyQualityOf, restoreCost, startRestore, REPAIR_KINDS, repairKindAvailable, DEEPCLEAN_COST_MULT, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, QUIZ_MIN_Q, QUIZ_MAX_Q, QUIZ_COMBO_MULT, QUIZ_CASH_PER_CORRECT, QUIZ_SASHINE_BONUS, quizComboMult, quizRank, buildQuiz, applyQuizResult, sashineBuffBonus, consumeSashineBuff, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -3478,7 +3881,7 @@ const TUTORIAL_STEPS = [
   // v7.6: ここで「押して確認してみよう」とは言わない。押すと開く画面は暗幕の下に入って読めず、
   // 促しておきながら確認できない状態になる。場所だけ教えて、確認は本編に入ってからにしてもらう。
   { key: 'panel', keep: [], info: true, targets: ['panel-left', 'mobile-status'],
-    text: 'ここに経過年数・現金・月CF・バランスシート。純資産や負債といった財務の状況、法人成りもこの中から。各項目はあとでゆっくりチェックしてみてね。' },
+    text: 'ここに現金・月CF・バランスシート。純資産や負債といった財務の状況、法人成りもこの中から。経過年数と年齢は画面いちばん上に出ている。各項目はあとでゆっくりチェックしてみてね。' },
   { key: 'finish', keep: [], final: true,
     text: 'ひととおり触れた！ここまでの操作はリセットされ、本編は最初から始まる。' },
 ];
@@ -3755,14 +4158,19 @@ window.addEventListener('resize', () => { if (tutIdx >= 0) renderTutStep(); });
 function showSetup() {
   const m = document.getElementById('setup-modal');
   m.classList.remove('hidden');
-  const data = { attr: 'employee', age: 30, seed: 10_000_000, goalType: 'networth', goalAmount: 100_000_000, years: 20,
+  const data = { difficulty: 'beginner', attr: 'employee', age: 30, seed: 10_000_000, goalType: 'networth', goalAmount: 100_000_000, years: 20,
     tutorial: localStorage.getItem('lm_tutorial_done') !== '1' };
-  const PRESETS = {
+  // v8: 初心者モードは目標プリセットを半分にして、最初の成功体験までを近くする。
+  const BASE_PRESETS = {
     networth: [[30_000_000, '3,000万'], [100_000_000, '1億'], [300_000_000, '3億']],
     cashflow: [[300_000, '30万'], [1_000_000, '100万'], [3_000_000, '300万']],
   };
+  const presetsFor = (type) => BASE_PRESETS[type].map(([v, l]) => {
+    const scale = L.DIFFICULTY[data.difficulty].goalScale;
+    return scale === 1 ? [v, l] : [Math.round(v * scale), L.yen(Math.round(v * scale))];
+  });
   let step = 0;
-  const TOTAL = 6;
+  const TOTAL = 7;   // v8: 先頭に難易度選択を足して 6 → 7
   const frame = (title, flavor, inner, opts = {}) => `
     <div class="bg-white rounded-xl p-6 w-full max-w-md space-y-4 max-h-[90vh] overflow-y-auto">
       <div class="flex items-center justify-between text-[11px] text-slate-500">
@@ -3779,16 +4187,36 @@ function showSetup() {
     m.innerHTML = '';
     let inner = '', collect = () => true;
     if (step === 0) {
+      // ゲーム名はタイトル画面が名乗るので、ここでは繰り返さない（ヘッダーからは v8 で外した）。
+      inner = `<div class="grid grid-cols-1 gap-2">
+        <button class="wz-diff border-2 rounded-xl p-3 text-left ${data.difficulty === 'beginner' ? 'border-navy bg-slate-50' : ''}" data-v="beginner">
+          <div class="font-bold">🌱 初心者向け</div>
+          <div class="text-xs text-slate-600">種銭1.5倍・${term('credit_score', '信用度')}+10・金利-0.3%・劣化とトラブルが緩やか。<b>先月へ1回だけ戻せるお守り付き。</b></div>
+          <div class="text-[11px] text-emerald-700 mt-0.5">勉強会では📚用語クイズが出る（正解で経験値と人脈報酬）</div></button>
+        <button class="wz-diff border-2 rounded-xl p-3 text-left ${data.difficulty === 'normal' ? 'border-navy bg-slate-50' : ''}" data-v="normal">
+          <div class="font-bold">🔥 中上級者向け</div>
+          <div class="text-xs text-slate-600">補正なし。躯体も手入れも容赦なく落ち、やり直しは効かない。<b>現実の厳しさで勝負する。</b></div></button></div>`;
+      m.appendChild(el(frame('どう遊ぶ？', 'あとから変えることはできない。', inner)));
+      m.querySelectorAll('.wz-diff').forEach(b => b.addEventListener('click', () => {
+        data.difficulty = b.dataset.v;
+        // プリセットが変わるので、目標額もその難易度の「まん中」に引き直す。期限にも下駄を履かせる。
+        data.goalAmount = presetsFor(data.goalType)[1][0];
+        data.years = 20 + L.DIFFICULTY[data.difficulty].yearsBonus;
+        step = 1; draw();
+      }));
+      m.querySelector('#wz-next')?.addEventListener('click', () => { step = 1; draw(); });
+      return;
+    } else if (step === 1) {
       inner = `<div class="grid grid-cols-1 gap-2">
         <button class="wz-attr border-2 rounded-xl p-3 text-left ${data.attr === 'employee' ? 'border-navy bg-slate-50' : ''}" data-v="employee">
           <div class="font-bold">💼 サラリーマン</div><div class="text-xs text-slate-600">${term('credit_score', '信用度')}60・${term('action_power', '行動力')}100。<b>信用こそ融資の武器だ。</b></div></button>
         <button class="wz-attr border-2 rounded-xl p-3 text-left ${data.attr === 'self' ? 'border-navy bg-slate-50' : ''}" data-v="self">
           <div class="font-bold">🛠️ 自営業</div><div class="text-xs text-slate-600">${term('credit_score', '信用度')}10・${term('action_power', '行動力')}120。<b>自由な時間は最大の資本。</b></div></button></div>`;
       m.appendChild(el(frame('あなたは、何者だ？', '大家への道はここから始まる。', inner)));
-      m.querySelectorAll('.wz-attr').forEach(b => b.addEventListener('click', () => { data.attr = b.dataset.v; step = 1; draw(); }));
-      m.querySelector('#wz-next')?.addEventListener('click', () => { step = 1; draw(); });
+      m.querySelectorAll('.wz-attr').forEach(b => b.addEventListener('click', () => { data.attr = b.dataset.v; step = 2; draw(); }));
+      m.querySelector('#wz-next')?.addEventListener('click', () => { step = 2; draw(); });
       return;
-    } else if (step === 1) {
+    } else if (step === 2) {
       inner = `<div class="text-center text-3xl font-black mb-1"><span id="wz-age-v">${data.age}</span><span class="text-lg">歳</span></div>
         <input id="wz-age" type="range" min="18" max="79" value="${data.age}" class="w-full">
         <div class="text-xs text-slate-500 mt-1">融資は80歳までに完済できる期間しか組めない。若さも、また資本。</div>`;
@@ -3796,19 +4224,25 @@ function showSetup() {
       const ai = m.querySelector('#wz-age');
       ai.addEventListener('input', () => { m.querySelector('#wz-age-v').textContent = ai.value; });
       collect = () => { data.age = Math.max(18, Math.min(79, Number(ai.value) || 30)); return true; };
-    } else if (step === 2) {
+    } else if (step === 3) {
       // 0〜5,000万を50万円刻みのスライダーで（プリセットボタンも併設）
       inner = `<div class="text-center text-2xl font-black mb-1"><span id="wz-seed-v">${L.yen(data.seed)}</span></div>
         <input id="wz-seed" type="range" min="0" max="${L.CONFIG.seedMax}" step="500000" value="${data.seed}" class="w-full">
         <div class="flex gap-1 text-xs mt-1">${[[1_000_000, '100万'], [10_000_000, '1,000万'], [30_000_000, '3,000万']].map(([v, l]) => `<button class="wz-seedp flex-1 border rounded py-1" data-v="${v}">${l}</button>`).join('')}</div>
-        <div class="text-xs text-slate-500 mt-1">これまで貯めた${term('seed_money', '種銭')}（0〜5,000万円）。足りない分は💼働いて稼げばいい。</div>`;
+        <div class="text-xs text-slate-500 mt-1">これまで貯めた${term('seed_money', '種銭')}（0〜5,000万円）。足りない分は💼働いて稼げばいい。</div>
+        ${data.difficulty === 'beginner' ? `<div class="text-[11px] text-emerald-700">🌱 初心者向けなので、実際の開始時はこの1.5倍（<span id="wz-seed-boost">${L.yen(Math.round(data.seed * 1.5))}</span>）で始まります。</div>` : ''}`;
       m.appendChild(el(frame('種銭は、いくらある？', '最初の一歩は種銭づくりから。', inner)));
       const si = m.querySelector('#wz-seed');
-      const upd = () => { data.seed = Number(si.value); m.querySelector('#wz-seed-v').textContent = L.yen(data.seed); };
+      const upd = () => {
+        data.seed = Number(si.value);
+        m.querySelector('#wz-seed-v').textContent = L.yen(data.seed);
+        const boost = m.querySelector('#wz-seed-boost');
+        if (boost) boost.textContent = L.yen(Math.round(data.seed * 1.5));
+      };
       si.addEventListener('input', upd);
       m.querySelectorAll('.wz-seedp').forEach(b => b.addEventListener('click', () => { si.value = b.dataset.v; upd(); }));
       collect = () => { data.seed = Number(si.value); return true; };
-    } else if (step === 3) {
+    } else if (step === 4) {
       inner = `<div class="flex gap-2">
           <label class="flex-1 border-2 rounded-xl p-2 text-sm text-center ${data.goalType === 'networth' ? 'border-navy bg-slate-50 font-bold' : ''}"><input type="radio" name="wz-goaltype" value="networth" ${data.goalType === 'networth' ? 'checked' : ''} class="mr-1">純資産</label>
           <label class="flex-1 border-2 rounded-xl p-2 text-sm text-center ${data.goalType === 'cashflow' ? 'border-navy bg-slate-50 font-bold' : ''}"><input type="radio" name="wz-goaltype" value="cashflow" ${data.goalType === 'cashflow' ? 'checked' : ''} class="mr-1">月間CF</label></div>
@@ -3831,18 +4265,18 @@ function showSetup() {
       gi.addEventListener('input', upd);
       const renderP = () => {
         const box = m.querySelector('#wz-goalp'); box.innerHTML = '';
-        PRESETS[data.goalType].forEach(([v, l]) => {
+        presetsFor(data.goalType).forEach(([v, l]) => {
           const b = el(`<button class="flex-1 border rounded py-1">${l}</button>`);
           b.addEventListener('click', () => { gi.value = v; upd(); });
           box.appendChild(b);
         });
       };
       m.querySelectorAll('input[name="wz-goaltype"]').forEach(r => r.addEventListener('change', e => {
-        data.goalType = e.target.value; data.goalAmount = PRESETS[data.goalType][1][0]; setupSlider(); renderP();
+        data.goalType = e.target.value; data.goalAmount = presetsFor(data.goalType)[1][0]; setupSlider(); renderP();
       }));
       setupSlider(); renderP();
       collect = () => { data.goalAmount = Math.max(1, Number(gi.value)); return true; };
-    } else if (step === 4) {
+    } else if (step === 5) {
       const maxYears = L.maxYearsForAge(data.age);
       if (data.years > maxYears) data.years = maxYears;
       inner = `<div class="text-center text-3xl font-black mb-1"><span id="wz-years-v">${data.years}</span><span class="text-lg">年</span></div>
@@ -3854,10 +4288,14 @@ function showSetup() {
       collect = () => { data.years = Math.max(1, Math.min(maxYears, Number(yi.value) || 1)); return true; };
     } else {
       const attrLabel = data.attr === 'employee' ? '💼サラリーマン' : '🛠️自営業';
+      const d = L.DIFFICULTY[data.difficulty];
+      const startCash = Math.round(data.seed * d.seedMult);
       inner = `<div class="bg-slate-50 rounded-xl p-4 text-sm leading-relaxed">
-          <b>${data.age}歳の${attrLabel}</b>、手元の種銭は<b>${L.yen(data.seed)}</b>。<br>
+          <b>${data.age}歳の${attrLabel}</b>、手元の種銭は<b>${L.yen(startCash)}</b>。<br>
           目標は <b>${data.goalType === 'networth' ? '純資産' : '月間CF'} ${L.yen(data.goalAmount)}</b> を <b>${data.years}年以内</b> に。<br>
           さあ、メガ大家への道を歩みはじめよう。</div>
+        <div class="text-xs ${data.difficulty === 'beginner' ? 'text-emerald-700' : 'text-red-600'} font-bold">
+          ${data.difficulty === 'beginner' ? '🌱 初心者向け（補正あり・巻き戻し1回）' : '🔥 中上級者向け（補正なし・やり直し不可）'}</div>
         <label class="flex items-center gap-2 text-sm"><input id="wz-tut" type="checkbox" ${data.tutorial ? 'checked' : ''} class="w-4 h-4">🧑‍🏫 先輩大家のチュートリアルを見る（初めての方におすすめ）</label>`;
       m.appendChild(el(frame('あなたの物語', '', inner)));
       collect = () => { data.tutorial = m.querySelector('#wz-tut').checked; return true; };
@@ -3867,7 +4305,9 @@ function showSetup() {
       if (!collect()) return;
       if (step < TOTAL - 1) { step += 1; draw(); return; }
       state = L.createInitialState({ attr: data.attr, age: data.age, goalType: data.goalType,
-        goalAmount: data.goalAmount, goalYears: data.years, seedCash: data.seed });
+        goalAmount: data.goalAmount, goalYears: data.years, seedCash: data.seed, difficulty: data.difficulty });
+      // v8: 初心者は用語ヘルプを既定でON（点線をなぞれば意味が読める状態から始める）
+      if (data.difficulty === 'beginner') setTermsOff(false);
       m.classList.add('hidden'); m.innerHTML = ''; save(); resetMapView(); render();
       if (data.tutorial) startTutorial();
     });
@@ -3899,7 +4339,7 @@ function load(){
 // 初期位置へ戻すのは「翌月へ進む」ときだけで、そのときも瞬間移動ではなく animateResetView() で
 // ゆっくり回って戻る（v3.5では毎回のrender()でリセットしていたが、動きすぎるという指摘を受けて変更）。
 function render(){
-  setCityState(state); renderPanelLeft(); renderPanelRight(); renderMobileBars(); checkEnd(); checkNewBadges(); save(); showExpFloats();
+  setCityState(state); renderHeaderClock(); renderDangerBanner(); renderPanelLeft(); renderPanelRight(); renderMobileBars(); checkEnd(); checkNewBadges(); save(); showExpFloats();
   document.getElementById('btn-result')?.classList.toggle('hidden', !state?.freePlay);   // v3.7: クリア後はいつでもリザルトへ
   if (tutIdx >= 0) renderTutStep();   // v3.7: チュートリアル中は吹き出しを追従させる
 }
@@ -3998,6 +4438,44 @@ function gainExp(skill, base){ state.skills[skill].exp += Math.round(base * (sta
 // ホーム画面の「詳細を表示」開閉状態。render()を跨いで記憶する（毎回閉じ直されないように）。
 let bsDetailOpen = false;
 
+// v8: 経過年数と年齢はヘッダーに常設する。左パネルはスマホでは表示されないため、
+// そこにしか無いと「いま何年目か」がスマホから完全に見えなくなっていた。
+function elapsedText(s) { return `${Math.floor(s.month / 12)}年${s.month % 12}ヶ月`; }
+// 開始年齢。旧セーブには startAge が無いので、現在年齢から経過年数を引いて復元する。
+function startAgeOf(s) { return s.startAge ?? ((s.age ?? 0) - Math.floor(s.month / 12)); }
+
+// v8: 初心者モードの赤バナー。通知に気づかないまま家賃がゼロになる事故を防ぐため、
+// 危険帯以上の物件があるあいだは地図の上に出しっぱなしにする（中上級では出さない）。
+function renderDangerBanner() {
+  const box = document.getElementById('danger-banner');
+  if (!box) return;
+  const on = state && state.difficulty === 'beginner';
+  const bad = on ? state.properties.filter(p => L.BAND_RANK[L.worstBandOf(p)] >= L.BAND_RANK.danger) : [];
+  box.classList.toggle('hidden', bad.length === 0);
+  if (!bad.length) return;
+  const dead = bad.filter(p => L.worstBandOf(p) === 'dead');
+  const head = dead.length
+    ? `🛑 ${dead.length}件が募集停止中（家賃が入っていません）`
+    : `🚨 ${bad.length}件が危険水準です`;
+  box.innerHTML = `<div class="rounded-lg px-3 py-2 text-xs font-bold shadow-lg text-center ${dead.length ? 'bg-red-600 text-white' : 'bg-amber-500 text-white'}">
+    ${head}<div class="font-normal text-[11px] mt-0.5">${bad.slice(0, 3).map(p => p.name || p.label).join('・')}${bad.length > 3 ? ` ほか${bad.length - 3}件` : ''}／🏠所有 から修繕を</div></div>`;
+}
+
+function renderHeaderClock() {
+  const box = document.getElementById('hud-clock');
+  if (!box) return;
+  box.classList.toggle('hidden', !state);
+  if (!state) return;
+  box.querySelector('#hud-elapsed').textContent = elapsedText(state);
+  box.querySelector('#hud-age').textContent = state.age ?? '-';
+}
+
+// バランスシートの先頭に置く1行。PC左パネルとスマホの資産モーダルで共用する。
+function bsElapsedRow() {
+  return `<div class="text-[11px] hud-sub border-b hud-divide pb-1 mb-1">
+    経過 <b>${elapsedText(state)}</b> ／ 現在 <b>${state.age ?? '-'}歳</b>（開始 ${startAgeOf(state)}歳）</div>`;
+}
+
 function renderPanelLeft() {
   const c = document.getElementById('panel-left'); c.innerHTML = '';
   const g = state.goal;
@@ -4007,10 +4485,6 @@ function renderPanelLeft() {
   const mcf = L.monthlyCF(state);
   c.appendChild(el(`
     <div class="hud-panel pointer-events-auto rounded-xl shadow-lg p-3 text-xs space-y-3">
-      <div class="flex justify-between items-center text-xs font-bold">
-        <div>📆 ${Math.floor(state.month / 12)}年${state.month % 12}ヶ月</div>
-        <div>${state.age ?? '-'}歳</div>
-      </div>
       <div class="grid grid-cols-2 gap-2">
         <button class="kpi-btn hud-tile rounded-lg p-2 text-left" data-kpi="cash">
           <div class="text-[11px] font-bold hud-sub">💰 現金</div>
@@ -4035,6 +4509,7 @@ function renderPanelLeft() {
       </div>
       <button id="btn-bs-toggle" class="w-full text-[11px] font-bold hud-accent underline">${bsDetailOpen ? '▲ バランスシートを閉じる' : '▶ バランスシート詳細'}</button>
       <div id="bs-detail" class="space-y-1 text-xs hud-divide pt-2 ${bsDetailOpen ? '' : 'hidden'}">
+        ${bsElapsedRow()}
         <div class="flex justify-between"><span class="hud-sub">純資産</span><b class="hud-money">${L.yen(L.netWorth(state))}</b></div>
         <div class="flex justify-between"><span class="hud-sub">総資産</span><b>${L.yen(L.totalAssetsV2(state))}</b></div>
         <div class="flex justify-between"><span class="hud-sub">総負債</span><b class="hud-bad">${L.yen(L.totalDebt(state))}</b></div>
@@ -4044,6 +4519,33 @@ function renderPanelLeft() {
   `));
   c.querySelectorAll('.kpi-btn').forEach(b => b.addEventListener('click', () => openKpiModal(b.dataset.kpi)));
   c.querySelector('#btn-bs-toggle').addEventListener('click', () => { bsDetailOpen = !bsDetailOpen; renderPanelLeft(); });
+}
+
+// v8.1: 法人化の損得を数字で出す。箇条書きの「こう変わります」だけでは、
+// いま設立すべきなのか、まだ早いのかが判断できなかった。
+// 課税はデッドクロス後にしか発生しないので、償却が残っているうちは節税額0＝「まだ早い」が正しい答えになる。
+function incorporationPitch() {
+  const saving = L.incorporationSaving(state);
+  const payback = L.incorporationPaybackYears(state);
+  const soonest = state.properties.length
+    ? Math.min(...state.properties.filter(p => p.owner !== 'corp').map(p => p.deprRemaining ?? 0))
+    : null;
+  if (saving <= 0) {
+    return `<div class="rounded-lg bg-slate-50 p-2 text-[11px] text-slate-600 mb-2">
+      <b>いま設立しても節税額は ¥0 です。</b>
+      ${state.properties.length === 0
+        ? '物件を買ってからでよいでしょう。'
+        : `NOIへの課税は${term('dead_cross', 'デッドクロス')}（${term('depreciation', '減価償却')}切れ）後にしか発生しません。`
+          + `いちばん早い物件で<b>あと${soonest}ヶ月</b>です。`}
+      <div class="mt-1">売却時の${term('capital_gains_tax', '譲渡税')}を短期39%→30%にしたい場合は、早めの設立にも意味があります。</div>
+    </div>`;
+  }
+  const years = payback == null ? null : Math.round(payback * 10) / 10;
+  return `<div class="rounded-lg bg-emerald-50 p-2 text-[11px] text-emerald-900 mb-2">
+    <div><b>いまの保有物件がすべて法人名義だった場合、年間 ${L.yen(saving)} の節税</b>になります。</div>
+    <div class="mt-0.5">設立費用 ${L.yen(L.CONFIG.corporateSetupCost)} の回収まで<b>約${years}年</b>。</div>
+    <div class="mt-1 text-emerald-800">※ 既存物件は設立後に1件ずつ移転が必要です（ローン完済済みのみ・移転時に譲渡税と取得コストがかかります）。</div>
+  </div>`;
 }
 
 // v3.5: 売却センターの一括査定モード状態（モーダルをHUDから開き直すとリセット）
@@ -4058,7 +4560,10 @@ function openKpiModal(which, keepBulk = false) {
   let title = '', body = '';
   if (which === 'cash') {
     title = '💰 資産スナップショット';
-    body = `<table class="w-full text-sm">
+    // v8: スマホではこのモーダルがバランスシートそのものなので、先頭に経過年数と年齢を出す。
+    body = `<div class="text-[11px] text-slate-500 border-b pb-1 mb-2">
+      経過 <b>${elapsedText(state)}</b> ／ 現在 <b>${state.age ?? '-'}歳</b>（開始 ${startAgeOf(state)}歳）</div>
+    <table class="w-full text-sm">
       <tr><td>手元現金</td><td class="text-right font-bold">${L.yen(state.cash)}</td></tr>
       <tr class="border-t"><td>総資産（現金＋物件時価）</td><td class="text-right">${L.yen(L.totalAssetsV2(state))}</td></tr>
       <tr><td>総負債（残債）</td><td class="text-right text-red-600">-${L.yen(L.totalDebt(state))}</td></tr>
@@ -4067,6 +4572,7 @@ function openKpiModal(which, keepBulk = false) {
     ${!state.isIncorporated ? `<div class="mt-4 pt-4 border-t">
       <h3 class="font-bold text-sm mb-1">🏢 法人化</h3>
       <p class="text-[11px] text-slate-500 mb-2">設立費用 ${L.yen(L.CONFIG.corporateSetupCost)}。以降、NOIへの課税が法人税率（${L.CONFIG.corporateTaxRate * 100}%）に固定されます。</p>
+      ${incorporationPitch()}
       <button id="btn-incorporate" class="w-full bg-navy text-white rounded py-2 text-sm ${state.cash < L.CONFIG.corporateSetupCost ? 'opacity-40' : ''}" ${state.cash < L.CONFIG.corporateSetupCost ? 'disabled' : ''}>法人を設立する</button>
     </div>` : '<div class="mt-4 pt-4 border-t text-sm font-bold text-navy">🏢 法人化済み</div>'}`;
   } else if (which === 'props') {
@@ -4080,15 +4586,23 @@ function openKpiModal(which, keepBulk = false) {
         <button id="kpi-bulk-toggle" class="border rounded px-2 py-1 font-bold ${bulkMode ? 'bg-navy text-white' : 'text-navy'}">${bulkMode ? '✕ まとめて査定を終了' : '☑ まとめて査定'}</button>
       </div>
       ${bulkMode ? '<div class="text-[11px] text-slate-500 mb-1">査定したい物件にチェック → 下の「査定する」（1件につき行動力-5）</div>' : ''}` : '';
-    body = state.properties.length ? `${header}<div class="space-y-1">${state.properties.map(p => {
+    // v8: 手当てが要る物件ほど上に出す。件数が増えると危険な物件がスクロールの下に埋もれるため。
+    const byRisk = [...state.properties].sort((a, b) =>
+      L.BAND_RANK[L.worstBandOf(b)] - L.BAND_RANK[L.worstBandOf(a)]);
+    body = state.properties.length ? `${header}<div class="space-y-1">${byRisk.map(p => {
       const occ = p.units.length ? Math.round(p.units.filter(u => u.occupied).length / p.units.length * 100) : 0;
       const listing = (state.listings || []).find(l => l.propertyId === p.id);
       const badges = [
         p.owner === 'corp' ? '<span class="bg-navy text-white rounded px-1">🏢法人</span>' : '<span class="bg-slate-200 text-slate-700 rounded px-1">👤個人</span>',
         listing ? `<span class="bg-amber-500 text-white rounded px-1">📢売出中${listing.listedMonths + 1}ヶ月目</span>` : '',
         p.repairJob ? `<span class="bg-amber-100 text-amber-700 rounded px-1">🔨${L.REPAIR_KINDS[p.repairJob.kind || 'large'].label}中 残り${p.repairJob.monthsLeft}ヶ月</span>` : '',
-        (!p.repairJob && p.repairState < 20) ? '<span class="bg-red-100 text-red-700 rounded px-1">⚠️躯体が限界</span>' : '',
-        (!p.repairJob && (p.careState ?? 100) < 40) ? '<span class="bg-amber-100 text-amber-700 rounded px-1">🧹要メンテ</span>' : '',
+        // v8: 帯に応じて段階表示。使用不能・管理崩壊は工事中でも隠さない（募集停止が続いているため）
+        L.structBandOf(p) === 'dead' ? '<span class="bg-red-600 text-white rounded px-1 font-bold">🛑使用不能</span>'
+          : (!p.repairJob && L.structBandOf(p) === 'danger') ? '<span class="bg-red-100 text-red-700 rounded px-1">🚨躯体が危険</span>'
+          : (!p.repairJob && L.structBandOf(p) === 'warn') ? '<span class="bg-amber-100 text-amber-700 rounded px-1">⚠️躯体が注意</span>' : '',
+        L.careBandOf(p) === 'dead' ? '<span class="bg-red-600 text-white rounded px-1 font-bold">🛑管理崩壊</span>'
+          : (!p.repairJob && L.careBandOf(p) === 'danger') ? '<span class="bg-red-100 text-red-700 rounded px-1">🚨手入れが危険</span>'
+          : (!p.repairJob && L.careBandOf(p) === 'warn') ? '<span class="bg-amber-100 text-amber-700 rounded px-1">🧹要メンテ</span>' : '',
         p.autoManage ? '<span class="bg-emerald-100 text-emerald-700 rounded px-1">🏢おまかせ中</span>' : '',
         // v4: 原状回復が済んでいない部屋は募集できない＝空室損が続くので一覧で目立たせる
         p.units.filter(u => u.needsRestore).length
@@ -4436,11 +4950,14 @@ function openGlossaryModal() {
   const m = document.getElementById('detail-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  // v8: 用語クイズで正解した語には ✅習得済み が付く。集める楽しさを足すための印。
+  const learned = new Set(state?.learnedTerms || []);
   const section = (g) => {
-    const rows = Object.entries(L.TERMS).filter(([, t]) => t.group === g).map(([, t]) => `
+    const rows = Object.entries(L.TERMS).filter(([, t]) => t.group === g).map(([key, t]) => `
       <div class="border-b last:border-0 py-2">
         <div class="font-bold text-sm">${t.label}${t.reading ? `<span class="text-[11px] font-normal text-slate-500">（${t.reading}）</span>` : ''}
-          <span class="align-middle text-[10px] font-normal rounded px-1.5 py-0.5 ${t.scope === 'game' ? 'bg-amber-100 text-amber-800' : 'bg-slate-200 text-slate-700'}">${scopeLabel(t)}</span></div>
+          <span class="align-middle text-[10px] font-normal rounded px-1.5 py-0.5 ${t.scope === 'game' ? 'bg-amber-100 text-amber-800' : 'bg-slate-200 text-slate-700'}">${scopeLabel(t)}</span>
+          ${learned.has(key) ? '<span class="align-middle text-[10px] font-bold rounded px-1.5 py-0.5 bg-emerald-100 text-emerald-700">✅ 習得済み</span>' : ''}</div>
         <div class="text-xs text-slate-700 mt-0.5">${t.def}</div>
         <div class="text-xs text-navy bg-slate-50 rounded px-2 py-1 mt-1">🧮 ${t.calc}</div>
         <div class="text-xs text-slate-600 mt-1">${t.here}</div>
@@ -4452,6 +4969,11 @@ function openGlossaryModal() {
     <div class="p-3 border-b shrink-0 flex justify-between items-center">
       <h2 class="font-bold">📖 用語集（${Object.keys(L.TERMS).length}語）</h2>
       <button id="gl-close" class="text-slate-400 text-xl leading-none">✕</button></div>
+    <div class="px-3 pt-2 shrink-0">
+      <div class="flex justify-between text-[11px] font-bold text-navy"><span>📚 習得の進み</span><span>${learned.size} / ${Object.keys(L.TERMS).length}</span></div>
+      <div class="w-full bg-slate-200 rounded-full h-2 mt-1 overflow-hidden"><div class="bg-navy h-2" style="width:${Math.round(learned.size / Object.keys(L.TERMS).length * 100)}%"></div></div>
+      <div class="text-[10px] text-slate-500 mt-1">勉強会・大家の会の📚用語クイズで正解すると習得済みになります。</div>
+    </div>
     <div class="p-3 overflow-y-auto min-h-0 flex-1">
       <div class="text-[11px] text-slate-500 mb-2">ゲーム中は、点線の下線が引かれた用語を押すと同じ説明が吹き出しで出ます。</div>
       ${L.TERM_GROUPS.map(section).join('')}</div></div>`);
@@ -4468,29 +4990,60 @@ function structureLabel(p) {
 // v6: ゲージは2本。🏚躯体は大規模修繕でしか戻らず、🧹手入れは日常メンテで100%まで戻る。
 // 内部は小数で持っているので、表示のたびに丸める。
 // 色は 緑(60%以上)→黄(20〜59%)→赤(20%未満)。
-function repairGauge(pct, width = 'w-24') {
+// v8: 色と警告文は帯（ok/warn/danger/dead）から引く。躯体と手入れで閾値が違うので、
+// どちらのゲージかは呼び出し側が band を渡して決める（ここで数値から推測しない）。
+const BAND_BAR = { ok: 'bg-emerald', warn: 'bg-yellow-400', danger: 'bg-red-500', dead: 'bg-red-600 lm-blink' };
+const BAND_NOTE = {
+  ok: '', warn: '<span class="text-amber-600 text-[11px] font-bold ml-1">⚠️注意</span>',
+  danger: '<span class="text-red-600 text-[11px] font-bold ml-1">🚨危険</span>',
+  dead: '<span class="text-red-600 text-[11px] font-bold ml-1">🛑限界</span>',
+};
+function repairGauge(pct, width = 'w-24', band = null) {
   const v = Math.max(0, Math.min(100, Math.round(pct ?? 100)));
-  const color = v >= 60 ? 'bg-emerald' : v >= 20 ? 'bg-yellow-400' : 'bg-red-500';
-  const warn = v < 20 ? '<span class="text-red-600 text-[11px] font-bold ml-1">⚠️管理会社から修繕依頼</span>' : '';
+  const b = band || (v >= 60 ? 'ok' : v >= 20 ? 'warn' : 'danger');
   return `<span class="inline-flex items-center gap-1 align-middle">
-    <span class="inline-block ${width} bg-slate-200 rounded h-2 overflow-hidden"><span class="${color} block h-2" style="width:${v}%"></span></span>
-    <b>${v}%</b>${warn}</span>`;
+    <span class="inline-block ${width} bg-slate-200 rounded h-2 overflow-hidden"><span class="${BAND_BAR[b]} block h-2" style="width:${v}%"></span></span>
+    <b>${v}%</b>${BAND_NOTE[b]}</span>`;
 }
 
 // 躯体と手入れを2行で並べて出す。どちらの工事が要るのかが一目で分かるようにする。
 function twoGauges(p, opts = {}) {
   const care = p.careState ?? p.repairState ?? 100;
   return `<div class="space-y-1">
+    ${bandAlertBox(p)}
     <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">
-      <span class="shrink-0 mr-2">🏚 ${term('repair_state', '躯体')}</span>${repairGauge(p.repairState, 'w-20')}
+      <span class="shrink-0 mr-2">🏚 ${term('repair_state', '躯体')}</span>${repairGauge(p.repairState, 'w-20', L.structBandOf(p))}
       ${p.repairJob && (p.repairJob.kind || 'large') === 'large' ? `<span class="text-amber-600 font-bold ml-1">🔨修繕中 残り${p.repairJob.monthsLeft}ヶ月</span>` : ''}
     </div>
     <div class="flex items-center justify-between text-xs p-2 bg-slate-50 rounded-lg">
-      <span class="shrink-0 mr-2">🧹 ${term('care_state', '手入れ')}</span>${repairGauge(care, 'w-20')}
-      ${p.repairJob && p.repairJob.kind === 'maint' ? `<span class="text-amber-600 font-bold ml-1">🔨メンテ中${p.repairJob.auto ? '（おまかせ）' : ''}</span>` : ''}
+      <span class="shrink-0 mr-2">🧹 ${term('care_state', '手入れ')}</span>${repairGauge(care, 'w-20', L.careBandOf(p))}
+      ${p.repairJob && p.repairJob.kind !== 'large' ? `<span class="text-amber-600 font-bold ml-1">🔨メンテ中${p.repairJob.auto ? '（おまかせ）' : ''}</span>` : ''}
     </div>
     ${opts.hint ? '<div class="text-[11px] text-slate-500 px-1">躯体は大規模修繕でのみ回復します。清掃・草刈りの日常メンテで戻るのは手入れだけです。</div>' : ''}
   </div>`;
+}
+
+// v8: いま何が起きているのかと、どうすれば抜け出せるのかを必ず併記する。
+// 「気づいたら家賃が入っていない」を避けるため、ペナルティは常に理由とセットで見せる。
+function bandAlertBox(p) {
+  const sb = L.structBandOf(p), cb = L.careBandOf(p);
+  const rows = [];
+  if (sb === 'dead') rows.push(['🛑 使用不能',
+    `全戸が退去し、募集を停止しています。大規模修繕（費用${L.CONDEMNED_COST_MULT}倍・工期+${L.CONDEMNED_EXTRA_MONTHS}ヶ月）を完了すると解除されます。`]);
+  else if (sb === 'danger') rows.push(['🚨 躯体が危険水準',
+    '毎月2割の確率で1戸が退去し、銀行の評価も下がっています。躯体0%になると全戸退去・募集停止です。']);
+  else if (sb === 'warn') rows.push(['⚠️ 躯体が注意水準',
+    '突発修繕が起きやすく、資産価値も目減りしています。早めに直すほど安く済みます。']);
+  if (cb === 'dead') rows.push(['🛑 管理崩壊',
+    '毎月1戸ずつ退去し、信用度も下がり続けます。日常メンテでは戻せません。「特別清掃」（通常の2倍）が必要です。']);
+  else if (cb === 'danger') rows.push(['🚨 手入れが危険水準',
+    'クレーム対応で行動力を持っていかれます。手入れ0%になると連鎖退去が始まります。']);
+  else if (cb === 'warn') rows.push(['⚠️ 手入れが注意水準',
+    '退去が増え、内見も決まりにくくなっています。日常メンテで100%まで戻せます。']);
+  if (!rows.length) return '';
+  const dead = sb === 'dead' || cb === 'dead';
+  return `<div class="rounded-lg p-2 text-[11px] space-y-1 ${dead ? 'bg-red-100 text-red-800' : 'bg-amber-50 text-amber-800'}">
+    ${rows.map(([t, d]) => `<div><b>${t}</b>　${d}</div>`).join('')}</div>`;
 }
 
 function noiTable(p) {
@@ -4515,6 +5068,35 @@ function minCashLine(p) {
   </div>`;
 }
 
+// v8.1: 保有期間と譲渡税。ここが見えていないと「いつ売るか」が運任せになる。
+// 「購入差額」だけを見ていると税額を小さく見誤るので、簿価と課税対象益も並べて出す。
+function holdingTaxBox(p) {
+  const months = L.heldMonthsOf(state, p);
+  const bd = L.saleBreakdown(state, p, p.timeValue);
+  const corp = p.owner === 'corp';
+  const badge = corp
+    ? '<span class="bg-navy text-white rounded px-1.5 py-0.5 font-bold">🏢法人・一律30%</span>'
+    : bd.longTerm
+      ? '<span class="bg-emerald-600 text-white rounded px-1.5 py-0.5 font-bold">長期20%</span>'
+      : '<span class="bg-red-500 text-white rounded px-1.5 py-0.5 font-bold">短期39%</span>';
+  // 長期化までのカウントダウン。ここが「あと少し待つ」判断の核になる。
+  // ただし益が出ていないときは税額も0なので、待つ意味がない＝出さない。
+  const saving = Math.round(bd.gain * (L.CONFIG.capGainTaxShort - L.CONFIG.capGainTaxLong));
+  const toLong = saving > 0 ? L.monthsToLongTerm(state, p) : 0;
+  return `<div class="rounded-lg p-2 text-xs space-y-1 ${bd.longTerm || corp ? 'bg-emerald-50' : 'bg-amber-50'}">
+    <div class="flex items-center justify-between">
+      <span class="font-bold">保有 ${Math.floor(months / 12)}年${months % 12}ヶ月</span>${badge}</div>
+    ${toLong > 0 ? `<div class="text-amber-800 font-bold">⏳ あと${toLong}ヶ月で長期20%になる（いまの時価なら譲渡税 ${L.yen(saving)} の差）</div>` : ''}
+    <table class="w-full">
+      <tr><td class="text-slate-600">購入価格</td><td class="text-right">${L.yen(p.boughtPrice ?? p.price)}</td></tr>
+      <tr><td class="text-slate-600">${term('book_value', '簿価')}（${term('depreciation', '減価償却')}後）</td><td class="text-right">${L.yen(bd.book)}</td></tr>
+      <tr class="border-t"><td class="text-slate-600">いま時価で売った場合の課税対象益</td><td class="text-right font-bold">${L.yen(bd.gain)}</td></tr>
+      <tr><td class="text-slate-600">${term('capital_gains_tax', '譲渡税')}（${Math.round(bd.rate * 100)}%）</td><td class="text-right text-red-600">-${L.yen(bd.tax)}</td></tr>
+    </table>
+    <div class="text-[11px] text-slate-500">償却が進むほど簿価が下がり、課税される益は「購入差額」より大きくなります。</div>
+  </div>`;
+}
+
 function overviewTab(p, from) {
   const svg = renderBuildingSVG(p, 'w-24 h-24 mb-2');
   if (from === 'owned') {
@@ -4529,6 +5111,7 @@ function overviewTab(p, from) {
         <div class="bg-slate-50 rounded-lg p-2">現在の${term('time_value', '時価')}<div class="font-bold">${L.yen(p.timeValue)}</div></div>
         <div class="bg-slate-50 rounded-lg p-2">購入差額<div class="font-bold ${gain >= 0 ? 'text-emerald-600' : 'text-red-600'}">${gain >= 0 ? '+' : ''}${L.yen(gain)}</div></div>
       </div>
+      ${holdingTaxBox(p)}
       ${twoGauges(p, { hint: true })}
       ${(p.valueUpLevel || p.valueUpJob) ? `<div class="flex items-center justify-between text-xs p-2 bg-indigo-50 rounded-lg"><span>✨ バリューアップ ${p.valueUpLevel ? `Lv${p.valueUpLevel}` : ''}</span>${p.valueUpJob ? `<span class="text-indigo-600 font-bold">工事中 残り${p.valueUpJob.monthsLeft}ヶ月</span>` : '<span class="text-slate-500">家賃UP済み</span>'}</div>` : ''}
       <div class="text-xs text-slate-600">${structureLabel(p)}・築${p.builtAge}年・${p.units.length}戸／${term('depr_remaining', '残存償却')} ${p.deprRemaining}ヶ月</div>
@@ -4610,15 +5193,24 @@ function bankReviewList(rs) {
     : `<div class="border rounded p-2 bg-slate-50"><b>✕ ${r.label}</b><div class="text-xs text-red-600">${linkTerms(r.reasons.map(x => x.msg).join('／'))}</div></div>`).join('')}</div>`;
 }
 
+// v8: 募集が建物ごと止まっている状態は、費用・行動力を払う前に理由を出して止める。
+const FILL_BLOCKED = {
+  condemned: '躯体0%で使用不能です。大規模修繕が完了するまで募集できません。',
+  careCollapsed: '管理崩壊の状態です。「特別清掃」で手入れを戻すまで募集できません。',
+  needsRestore: 'この部屋は原状回復が済んでいません。',
+};
+
 function wireFillButtons(body, p, from) {
   body.querySelectorAll('.fill-ad').forEach(b => b.addEventListener('click', () => {
     const r = L.fillVacancy(state, p.id, Number(b.dataset.i), 'ad', Math.random);
+    if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
     state = r.state; pushLog(r.success ? '広告が効いて入居が決まった！' : '広告を出したが今月は決まらず…');
     save(); render(); openDetail(p.id, from);
   }));
   body.querySelectorAll('.fill-self').forEach(b => b.addEventListener('click', () => {
     if (state.actionPower < 30) { alert('行動力が足りません'); return; }
     const r = L.fillVacancy(state, p.id, Number(b.dataset.i), 'self', Math.random);
+    if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
     state = r.state; pushLog(r.success ? '自主客付けに成功！（自主管理+10 EXP）' : '内見はあったが決まらず…（自主管理+10 EXP）');
     save(); render(); openDetail(p.id, from);
   }));
@@ -4641,6 +5233,7 @@ function openPurchase(propId, back) {
     ${p.sellerUrgency ? `<div class="text-xs"><span class="bg-rose-100 text-rose-700 rounded px-1.5 py-0.5 font-bold">🏃 売り急ぎ</span> <span class="text-slate-600">${p.sellerUrgency.reason}そうだ</span></div>` : ''}
     <button id="of-detail" class="w-full text-xs text-navy underline">📋 ${term('rentroll', 'レントロール')}・収支・融資の詳細を見る</button>
     <button id="of-full" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white rounded py-2 text-sm font-bold">満額 ${L.yen(p.price)}（必ず通る）</button>
+    ${L.sashineBuffBonus(state) > 0 ? `<div class="text-[11px] bg-amber-100 text-amber-800 rounded px-2 py-1 font-bold">✨ 耳より情報：この指値だけ成功率 +${Math.round(L.sashineBuffBonus(state) * 100)}pt（使うと消えます）</div>` : ''}
     <div class="pt-1 border-t ${blocked ? 'opacity-50' : ''}">
       <div class="text-sm">${term('sashine', '指値')} <b id="of-cutpct">5%</b>引き → <b id="of-cutprice">${L.yen(Math.round(p.price * 0.95))}</b></div>
       <input id="of-slider" type="range" min="1" max="99" step="1" value="5" class="w-full" ${blocked ? 'disabled' : ''}>
@@ -4837,7 +5430,7 @@ function showPayment(propId, price, close) {
       ${state.isIncorporated ? `<div class="flex gap-2 text-sm items-center"><span class="font-bold shrink-0">名義:</span>
         <label class="flex-1 border rounded p-1.5 text-center cursor-pointer ${buyOwner === 'personal' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="personal" ${buyOwner === 'personal' ? 'checked' : ''} class="mr-1">👤 個人</label>
         <label class="flex-1 border rounded p-1.5 text-center cursor-pointer ${buyOwner === 'corp' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="corp" ${buyOwner === 'corp' ? 'checked' : ''} class="mr-1">🏢 法人</label></div>` : ''}
-      <button id="pay-cash" class="w-full border rounded py-2 text-sm ${state.cash < cashNeed ? 'opacity-40' : ''}" ${state.cash < cashNeed ? 'disabled' : ''}>現金一括（必要 ${L.yen(cashNeed)}）</button>
+      <button id="pay-cash" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white rounded py-2 text-sm font-bold ${state.cash < cashNeed ? 'opacity-40' : ''}" ${state.cash < cashNeed ? 'disabled' : ''}>現金一括（必要 ${L.yen(cashNeed)}）</button>
       <div class="text-sm font-bold pt-2 border-t">融資（4行同時審査）</div>
       <div class="text-sm">${term('own_cash', '頭金')} <b id="pay-down-pct">${Math.round(downRatio * 100)}%</b>＝<span id="pay-down-amt" class="font-bold">${L.yen(Math.round(price * downRatio))}</span>
         <span class="text-[11px] text-slate-500">（${term('closing_cost', '諸費用')}込み必要現金 <span id="pay-down-need">${L.yen(Math.round(price * downRatio) + Math.round(price * L.CONFIG.closingCostRate))}</span>）</span></div>
@@ -4847,10 +5440,13 @@ function showPayment(propId, price, close) {
       <button id="pay-cancel" class="w-full text-slate-500 text-sm">買付を取り下げる（ペナルティなし）</button></div>`);
     m.appendChild(box);
     const banksDiv = box.querySelector('#pay-banks');
+    // v8: 承認された銀行はカード全体を紺で塗って文字を白に反転する。否決は淡いグレーのまま沈める。
+    // 「紺＝借りられる／灰＝借りられない」の明暗差だけで、読まずに判別できる状態を狙っている。
     banksDiv.innerHTML = rs.map(r => r.approved
-      ? `<div class="border rounded p-2 mb-1"><div class="flex justify-between items-center"><b>◯ ${r.label}</b>
-          <button class="pay-bank bg-navy text-white rounded px-2 py-1 text-sm" data-k="${r.bankKey}">借りる</button></div>
-          <div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div></div>`
+      ? `<div class="border rounded p-2 mb-1 bg-navy text-white"><div class="flex justify-between items-center gap-2">
+          <b class="flex items-center gap-1.5"><span class="inline-flex items-center justify-center w-4 h-4 rounded-full bg-white text-navy text-[10px] font-black shrink-0">◯</span>${r.label}</b>
+          <button class="pay-bank bg-white text-navy rounded px-2 py-1 text-sm font-bold shrink-0" data-k="${r.bankKey}">借りる</button></div>
+          <div class="text-xs text-white/80">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div></div>`
       : `<div class="border rounded p-2 mb-1 bg-slate-50"><b>✕ ${r.label}</b>
           <div class="text-xs text-red-600">${linkTerms(r.reasons.map(x => x.msg).join('／'))}</div></div>`).join('');
     const range = box.querySelector('#pay-down-range');
@@ -4888,11 +5484,11 @@ function openCorpTransfer(propId) {
   const m = document.getElementById('sell-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
+  // v8.1: 税率と課税対象益は売却フローと同じ saleBreakdown から取る（数字がズレないように）
   const price = p.timeValue;
-  const book = L.bookValueV2(p);
-  const gain = Math.max(0, price - book);
-  const heldYears = (state.month - (p.boughtMonth ?? state.month)) / 12;
-  const capTax = Math.round(gain * (heldYears <= 5 ? L.CONFIG.capGainTaxShort : L.CONFIG.capGainTaxLong));
+  const bd = L.saleBreakdown(state, p, price);
+  const heldYears = L.heldMonthsOf(state, p) / 12;
+  const capTax = bd.tax;
   const acqCost = Math.round(price * L.CONFIG.corpTransferCostRate);
   const total = capTax + acqCost;
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
@@ -4948,6 +5544,27 @@ function openSell(propId) {
   });
 }
 
+// v8.1: 「この価格で売ったら手元にいくら残るか」。価格決定と買付承諾の両方で同じ内訳を見せる。
+// 売却価格そのものより、税と残債を引いた手取りの方が判断材料として重要。
+function netProceedsBox(p, price) {
+  const bd = L.saleBreakdown(state, p, price);
+  // 益が出ていなければ税額も0で、待っても手取りは変わらない。カウントダウンはノイズになるので出さない。
+  const waitGain = Math.round(bd.gain * (L.CONFIG.capGainTaxShort - L.CONFIG.capGainTaxLong));
+  const toLong = waitGain > 0 ? L.monthsToLongTerm(state, p) : 0;
+  const rateLabel = p.owner === 'corp' ? '🏢法人 一律30%'
+    : `👤個人 ${bd.longTerm ? '長期' : '短期'}${Math.round(bd.rate * 100)}%`;
+  return `<div class="rounded-lg bg-slate-50 p-2 text-xs space-y-0.5">
+    <table class="w-full">
+      <tr><td class="text-slate-600">売却価格</td><td class="text-right font-bold">${L.yen(bd.price)}</td></tr>
+      <tr><td class="text-slate-600">${term('capital_gains_tax', '譲渡税')}（${rateLabel}）</td><td class="text-right text-red-600">-${L.yen(bd.tax)}</td></tr>
+      <tr><td class="text-slate-600">残債の精算</td><td class="text-right text-red-600">${bd.payoff ? `-${L.yen(bd.payoff)}` : '—'}</td></tr>
+      <tr class="border-t font-bold"><td>手取り</td><td class="text-right ${bd.net >= 0 ? 'text-emerald-700' : 'text-red-600'}">${L.yen(bd.net)}</td></tr>
+    </table>
+    ${toLong > 0 ? `<div class="text-amber-800 font-bold">⏳ あと${toLong}ヶ月待つと長期20%。いまの価格なら手取りが ${L.yen(waitGain)} 増える計算</div>` : ''}
+    <div class="text-[10px] text-slate-500">課税対象益 ${L.yen(bd.gain)}（売却価格 − ${term('book_value', '簿価')} ${L.yen(bd.book)}）</div>
+  </div>`;
+}
+
 // v3.5: 売出価格は自由入力。査定はあくまで参考値として表示し、利回りをリアルタイムに見ながら自分で決める。
 // v3.6: backを渡すと「← 戻る」を表示し、売り出し後・戻る押下でひとつ前の画面（売却センター等）へ戻る。
 function drawPricing(m, p, appraisal, close, back) {
@@ -4965,6 +5582,7 @@ function drawPricing(m, p, appraisal, close, back) {
     </div>
     <div class="text-center text-sm text-slate-600">この価格の${term('yield_gross', '表面利回り')} <span id="sl-yield" class="font-bold text-lg text-emerald-700">${yieldOf(appraisal)}</span>%
       <div class="text-[11px] text-slate-500">（満室想定・年間家賃収入 ${L.yen(gpi)} 基準）</div></div>
+    <div id="sl-net">${netProceedsBox(p, appraisal)}</div>
     <div class="text-xs text-slate-500">安くすれば早く売れ、高いほど時間がかかる。訳あり物件を高利回りで仕入れ、通常の利回り水準の価格で売り抜く戦略も。</div>
     <button id="sl-list" class="w-full bg-emerald text-white rounded py-2">この価格で売りに出す</button>
     <button id="sl-cancel2" class="w-full text-slate-500 text-sm">やめる</button></div>`);
@@ -4974,6 +5592,7 @@ function drawPricing(m, p, appraisal, close, back) {
     price = Math.max(10000, Number(range.value));
     box.querySelector('#sl-price-v').textContent = L.yen(price);
     box.querySelector('#sl-yield').textContent = yieldOf(price);
+    box.querySelector('#sl-net').innerHTML = netProceedsBox(p, price);   // v8.1: 手取りも追従させる
   };
   range.addEventListener('input', updatePrice);
   box.querySelectorAll('.sl-preset').forEach(b => b.addEventListener('click', () => {
@@ -5026,6 +5645,7 @@ function showOfferModal(listing) {
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
     <h2 class="font-bold">💌 ${p.name || p.label} に買付が入った！</h2>
     <div class="text-sm">売出 ${L.yen(listing.askingPrice)} に対し <b>${o.type === 'full' ? '満額' : '指値'} ${L.yen(o.price)}</b></div>
+    ${netProceedsBox(p, o.price)}
     <button class="of-act w-full bg-emerald text-white rounded py-2 text-sm" data-a="accept">承諾する（翌月決済）</button>
     ${o.type === 'sashine' ? `<button class="of-act w-full border rounded py-2 text-sm" data-a="counter">カウンター ${L.yen(counterPrice)}（成立確率${Math.round((0.5 + (lv - 1) * 0.05) * 100)}%・不成立なら買付消滅）</button>` : ''}
     <button class="of-act w-full border rounded py-2 text-sm" data-a="reject">断る（掲載継続）</button></div>`);
@@ -5126,31 +5746,40 @@ function workOptions(p, category) {
     });
   });
   // v6: 日常メンテは 🧹手入れ、大規模修繕は 🏚躯体 と、それぞれ別のゲージを直す。
-  const mk = L.REPAIR_KINDS.maint, lg = L.REPAIR_KINDS.large;
+  const lg = L.REPAIR_KINDS.large;
   const care = Math.round(p.careState ?? p.repairState ?? 100);
   const struct = Math.round(p.repairState ?? 100);
+  // v8: 手入れが0（管理崩壊）まで落ちた物件では、日常メンテの代わりに特別清掃だけが出る。
+  // 「0まで放置してから一度で直す」が最安にならないよう、日常メンテは選択肢から消す。
+  const careKind = L.repairKindAvailable(p, 'maint') ? 'maint' : 'deepclean';
+  const ck = L.REPAIR_KINDS[careKind];
   out.push({
-    type: 'maint', label: mk.label, detail: L.repairDetail(p, 'maint'),
+    type: careKind, label: ck.label, detail: L.repairDetail(p, careKind),
     effect: `🧹 手入れ ${care}% → 100%`,
-    cost: L.repairCost(p, 'maint'), diyable: !p.autoManage, diyAp: mk.diyAp,
-    blockedReason: p.autoManage ? 'おまかせ契約中は工事がすべて業者任せになります' : undefined,
+    cost: L.repairCost(p, careKind), diyable: ck.diyable && !p.autoManage, diyAp: ck.diyAp,
+    blockedReason: !ck.diyable ? ck.blockedReason
+      : p.autoManage ? 'おまかせ契約中は工事がすべて業者任せになります' : undefined,
     disabled: care >= 100,
     disabledReason: '手入れは既に100%です',
-    progress: (p.diyProgress && p.diyProgress.kind === 'maint') ? p.diyProgress.done : 0,
+    progress: (p.diyProgress && p.diyProgress.kind === careKind) ? p.diyProgress.done : 0,
   });
   out.push({
     type: 'large', label: lg.label, detail: L.repairDetail(p, 'large'),
-    effect: `🏚 躯体 ${struct}% → 100%・資産価値+8%`,
+    effect: L.isCondemned(p)
+      ? `🏚 躯体 ${struct}% → 100%・資産価値+8%・使用不能を解除`
+      : `🏚 躯体 ${struct}% → 100%・資産価値+8%`,
     cost: L.repairCost(p, 'large'), diyable: false, blockedReason: lg.blockedReason,
     disabled: struct >= 100, disabledReason: '躯体は既に100%です',
   });
   return out;
 }
 
-function runWork(propId, sel, diy, financed) {
-  if (sel.type === 'restore') return L.startRestore(state, propId, sel.unitIndex, { diy, financed });
-  if (sel.type === 'valueup') return L.startValueUp(state, propId, sel.planKey, { diy, financed });
-  return L.startRepair(state, propId, sel.type, { diy, financed });
+// v8: qualityMult はDIYミニゲームの出来ばえ（業者発注では常に1で無関係）。
+function runWork(propId, sel, diy, financed, qualityMult = 1) {
+  const opts = { diy, financed, qualityMult };
+  if (sel.type === 'restore') return L.startRestore(state, propId, sel.unitIndex, opts);
+  if (sel.type === 'valueup') return L.startValueUp(state, propId, sel.planKey, opts);
+  return L.startRepair(state, propId, sel.type, opts);
 }
 
 function openWorkMenu(propId, category, back) {
@@ -5381,12 +6010,59 @@ function diyBackdrop(kind) {
     <line x1="173" y1="52" x2="173" y2="94" stroke="#9bb6c6" stroke-width="2"/><line x1="150" y1="73" x2="196" y2="73" stroke="#9bb6c6" stroke-width="2"/></svg>`;
 }
 // 工事内容 → 背景・対象アイテム・配置。DIY可能な4種のみ（大規模修繕は業者専用で出ない）。
-const DIY_KITS = {
-  maint:   { bg: 'exterior', items: ['web', 'weed', 'grime', 'leaf'] },
-  restore: { bg: 'room',     items: ['wallstain', 'floor', 'pinhole', 'ceiling'] },
-  equip:   { bg: 'room',     items: ['ac', 'light', 'door', 'outlet'] },
-  water:   { bg: 'water',    items: ['kitchen', 'toilet', 'bath', 'faucet'] },
+// v8.1: 道具は「モノ」ではなく「動作」で持つ。
+// v8では スポンジ／ドライバー／レンチ のようなモノを1:1で当てさせていたが、
+// スポンジはキッチンにも風呂にも使えるし、ドライバーとレンチの区別も現場を知らないと付かない。
+// 当て物になってしまい「軽い負荷」ではなく理不尽だったので、動作に置き換えたうえで
+// **必要な動作と回数を箇所に表示する**（当てるゲームをやめ、段取りと手数の遊びにする）。
+const DIY_ACTIONS = {
+  sweep:   ['🧹', '掃く'],
+  wash:    ['💧', '洗う'],
+  paint:   ['🎨', '塗る'],
+  tighten: ['🔧', '締める'],
+  mow:     ['✂️', '刈る'],
+  swap:    ['🔌', '交換'],
 };
+
+// v8: 各キットに「正しい施工順」と「動作の対応」を持たせた。
+// order はミニゲームの正解であると同時に、実際の現場の段取りでもある（遊びながら覚えられる）。
+const DIY_KITS = {
+  maint: {
+    bg: 'exterior', items: ['web', 'weed', 'grime', 'leaf'],
+    order: ['web', 'grime', 'weed', 'leaf'],
+    orderHint: '清掃は上から下へ。高いところの汚れを先に落とす',
+    acts: { web: 'sweep', grime: 'wash', weed: 'mow', leaf: 'sweep' },
+  },
+  restore: {
+    bg: 'room', items: ['wallstain', 'floor', 'pinhole', 'ceiling'],
+    order: ['ceiling', 'pinhole', 'wallstain', 'floor'],
+    orderHint: '内装は天井→壁→床の順。床を先に仕上げると汚れて二度手間になる',
+    acts: { ceiling: 'paint', pinhole: 'paint', wallstain: 'wash', floor: 'wash' },
+  },
+  equip: {
+    bg: 'room', items: ['ac', 'light', 'door', 'outlet'],
+    order: ['outlet', 'light', 'ac', 'door'],
+    orderHint: '電気は配線から仕上げへ。建具（扉）は最後に調整する',
+    acts: { outlet: 'swap', light: 'swap', ac: 'swap', door: 'tighten' },
+  },
+  water: {
+    bg: 'water', items: ['kitchen', 'toilet', 'bath', 'faucet'],
+    order: ['faucet', 'kitchen', 'bath', 'toilet'],
+    orderHint: '水まわりは止水栓から。上流（給水）を止めてから下流へ進む',
+    acts: { faucet: 'tighten', kitchen: 'wash', bath: 'wash', toilet: 'tighten' },
+  },
+};
+
+// v8: DIYの遊び方は毎回ランダム。押す順・タイミング・道具選びの3種で単調さを解消する。
+// どれも「失敗しても詰まない／上手いほど早く終わる」で揃えてある。
+const DIY_MODES = ['order', 'timing', 'tool'];
+const DIY_MODE_LEAD = {
+  order: '正しい順番でタップして直そう！順番を間違えると手戻りになる。',
+  timing: 'タップしてゲージを緑で止めよう！きれいに仕上げるほど早く終わる。',
+  tool:   '道具を持ち替えて、表示された回数だけタップ！何をどれだけやるかは箇所に書いてある。',
+};
+// 各箇所に必要なタップ数。合計8回になるよう固定し、配置だけ毎回変える（session時間を読みやすくする）。
+const DIY_HITS = [1, 2, 2, 3];
 const DIY_POS = [{ l: 27, t: 34 }, { l: 71, t: 30 }, { l: 30, t: 74 }, { l: 73, t: 72 }];
 function diyKitFor(sel) {
   if (sel.type === 'restore') return 'restore';
@@ -5404,44 +6080,200 @@ function openDiySession(propId, sel, category, back) {
   const items = kit.items;
   const n = items.length;
   const before = Math.min(100, Math.round(sel.progress || 0));
-  let fixed = 0;
+  const mode = DIY_MODES[Math.floor(Math.random() * DIY_MODES.length)];
+  const easy = state.difficulty === 'beginner';
+  let fixed = 0, misses = 0, apPenalty = 0;
+  let pickedTool = null;      // tool モードで持っている動作（DIY_ACTIONS のキー）
+  let freeToolMiss = true;    // 持ち替え忘れの1回目はミスにせず、必要な動作を教えるだけにする
+
+  // order モード: 初心者は番号を出しっぱなし。中上級は開始2秒だけ見せて消す。
+  const showNums = mode === 'order';
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-2">
     <div class="flex justify-between items-center"><h2 class="font-bold truncate">🔨 ${sel.label}</h2><button id="diy-close" class="text-slate-400 text-xl shrink-0">✕</button></div>
-    <div class="text-xs text-slate-500">材料費 ${L.yen(Math.round(sel.cost * L.DIY_MATERIAL_RATE))}${before > 0 ? '（支払い済み）' : ''}・行動力-${sel.diyAp}。傷んだ箇所をタップして直そう！</div>
+    <div class="text-xs text-slate-500">材料費 ${L.yen(Math.round(sel.cost * L.DIY_MATERIAL_RATE))}${before > 0 ? '（支払い済み）' : ''}・行動力-${sel.diyAp}。${DIY_MODE_LEAD[mode]}</div>
+    ${mode === 'order' ? `<div class="text-[11px] bg-sky-50 text-sky-800 rounded px-2 py-1">📐 ${kit.orderHint}</div>` : ''}
     <div class="w-full bg-slate-200 rounded-full h-2 overflow-hidden"><div class="bg-emerald-500 h-2 transition-all" style="width:${before}%"></div></div>
     <div class="text-xs text-slate-600 text-center">全体の進捗 ${before}%</div>
+    ${mode === 'tool' ? `<div id="diy-tools" class="flex gap-1 justify-center"></div>` : ''}
     <div id="diy-stage" class="relative mx-auto rounded-lg overflow-hidden" style="width:220px;height:176px;">
       <div class="absolute inset-0">${diyBackdrop(kit.bg)}</div>
     </div>
+    <div id="diy-timing" class="hidden"></div>
     <div class="text-center text-sm font-bold" id="diy-progress">0 / ${n} 直した</div>
+    <div class="text-center text-[11px] h-4" id="diy-note"></div>
     <button id="diy-cancel" class="w-full text-slate-500 text-sm">やめる（この回の作業は行われません）</button></div>`);
   m.appendChild(box);
   const stage = box.querySelector('#diy-stage');
+  const noteEl = box.querySelector('#diy-note');
+  const note = (text, ok) => {
+    noteEl.textContent = text;
+    noteEl.className = `text-center text-[11px] h-4 font-bold ${ok ? 'text-emerald-600' : 'text-red-600'}`;
+  };
+  const shake = (elm) => elm.animate(
+    [{ transform: 'translate(-50%,-50%) rotate(0deg)' }, { transform: 'translate(-52%,-50%) rotate(-6deg)' },
+     { transform: 'translate(-48%,-50%) rotate(6deg)' }, { transform: 'translate(-50%,-50%) rotate(0deg)' }],
+    { duration: 260 });
+
+  // 1箇所の修理を確定させる。3モード共通の後始末（絵の差し替え・進捗・完了判定）。
+  const finishSpot = (spot, key) => {
+    spot.dataset.done = '1';
+    spot.querySelector('svg').innerHTML = DIY_ART[key]('a');
+    spot.animate([{ transform: 'translate(-50%,-50%) scale(0.7)' }, { transform: 'translate(-50%,-50%) scale(1.15)' }, { transform: 'translate(-50%,-50%) scale(1)' }], { duration: 400, easing: 'ease-out' });
+    const num = spot.querySelector('.diy-num'); if (num) num.remove();
+    sfxKnock();
+    fixed++;
+    box.querySelector('#diy-progress').textContent = `${fixed} / ${n} 直した`;
+    if (fixed >= n) {
+      const q = L.diyQualityOf(misses);
+      const rank = misses === 0 ? '✨ 完璧な仕上がり！' : misses <= 1 ? '🔨 まずまずの出来' : '😓 手戻りが多かった…';
+      note(rank, misses <= 1);
+      setTimeout(() => { close(); applyDiy(propId, sel, category, back, q, apPenalty); }, 700);
+    }
+  };
+
+  // --- tool モード: 動作パレット（タップで持ち替え → 箇所をタップ。ドラッグはスマホで誤爆しやすいので使わない）---
+  // 必要な動作は箇所のバッジに書いてあるので「当てる」要素はない。持ち替えと手数の管理だけを遊ばせる。
+  if (mode === 'tool') {
+    const palette = box.querySelector('#diy-tools');
+    // このキットで実際に使う動作だけを、毎回シャッフルして並べる
+    const acts = [...new Set(items.map(k => kit.acts[k]))].sort(() => Math.random() - 0.5);
+    acts.forEach(act => {
+      const [icon, label] = DIY_ACTIONS[act];
+      const b = el(`<button class="diy-tool border-2 rounded-lg px-2 py-1 text-center leading-tight" data-a="${act}">
+        <div class="text-lg">${icon}</div><div class="text-[9px] text-slate-600">${label}</div></button>`);
+      b.addEventListener('click', () => {
+        pickedTool = act;
+        palette.querySelectorAll('.diy-tool').forEach(x => {
+          x.classList.toggle('border-navy', x.dataset.a === act);
+          x.classList.toggle('bg-slate-100', x.dataset.a === act);
+        });
+        note(`${icon} ${label}`, true);
+      });
+      palette.appendChild(b);
+    });
+  }
+
+  // --- timing モード: 往復するマーカーを緑ゾーンで止める ---
+  const runTiming = (onResult) => {
+    const bar = box.querySelector('#diy-timing');
+    const zoneW = easy ? 34 : 20;                       // 緑ゾーンの幅（%）
+    const zoneL = 8 + Math.random() * (84 - zoneW);     // 端に寄りすぎないよう内側に置く
+    bar.className = 'relative w-full h-7 bg-slate-200 rounded-lg overflow-hidden cursor-pointer select-none';
+    bar.innerHTML = `<div class="absolute inset-y-0 bg-emerald-400/70" style="left:${zoneL}%;width:${zoneW}%"></div>
+      <div id="diy-marker" class="absolute inset-y-0 w-1 bg-navy" style="left:0%"></div>
+      <div class="absolute inset-0 flex items-center justify-center text-[11px] font-bold text-navy pointer-events-none">タップで止める</div>`;
+    const marker = bar.querySelector('#diy-marker');
+    const period = easy ? 1500 : 1050;                  // 往復1周にかかる時間（短いほど難しい）
+    const t0 = performance.now();
+    let stopped = false;
+    // 判定位置は「タップした瞬間の実時刻」から計算する。requestAnimationFrame は
+    // タブが非アクティブだと止まるので、描画に判定を依存させると全部ミスになってしまう。
+    const posAt = (t) => {
+      const phase = ((t - t0) % period) / period;       // 0→1
+      return phase < 0.5 ? phase * 2 * 100 : (1 - phase) * 2 * 100;
+    };
+    const tick = () => {
+      if (stopped) return;
+      marker.style.left = `${posAt(performance.now())}%`;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      const pos = posAt(performance.now());
+      bar.classList.add('hidden');
+      bar.replaceWith(bar.cloneNode(true));             // リスナーごと差し替えて多重発火を防ぐ
+      const center = zoneL + zoneW / 2;
+      const inZone = pos >= zoneL && pos <= zoneL + zoneW;
+      const perfect = inZone && Math.abs(pos - center) <= zoneW * 0.2;
+      onResult(perfect ? 'perfect' : inZone ? 'good' : 'miss');
+    };
+    bar.addEventListener('click', stop);
+  };
+
+  // tool モードだけ、箇所ごとに必要タップ数を割り振る（配置は毎回シャッフル）
+  const hits = mode === 'tool' ? [...DIY_HITS].sort(() => Math.random() - 0.5) : null;
   items.forEach((key, i) => {
     const pos = DIY_POS[i % DIY_POS.length];
-    const spot = el(`<button class="diy-spot absolute" style="left:${pos.l}%;top:${pos.t}%;transform:translate(-50%,-50%);width:60px;height:60px;padding:0;border:0;background:transparent;cursor:pointer;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.25));">
-      <svg viewBox="0 0 64 64" width="60" height="60" style="border-radius:8px;">${DIY_ART[key]('b')}</svg></button>`);
+    const orderNo = kit.order.indexOf(key) + 1;
+    const act = kit.acts[key];
+    const [actIcon, actLabel] = DIY_ACTIONS[act];
+    const spot = el(`<button class="diy-spot absolute" data-k="${key}" data-a="${act}" style="left:${pos.l}%;top:${pos.t}%;transform:translate(-50%,-50%);width:60px;height:60px;padding:0;border:0;background:transparent;cursor:pointer;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.25));">
+      <svg viewBox="0 0 64 64" width="60" height="60" style="border-radius:8px;">${DIY_ART[key]('b')}</svg>
+      ${showNums ? `<span class="diy-num absolute -top-1 -left-1 bg-navy text-white text-[10px] font-black rounded-full w-4 h-4 flex items-center justify-center">${orderNo}</span>` : ''}
+      ${hits ? `<span class="diy-hit absolute -top-2 -right-2 bg-white border-2 border-navy text-navy text-[10px] font-black rounded-full px-1 py-0.5 leading-none whitespace-nowrap">${actIcon}×<span class="diy-hit-n">${hits[i]}</span></span>` : ''}</button>`);
+    if (hits) spot.dataset.left = String(hits[i]);
     stage.appendChild(spot);
     spot.addEventListener('click', () => {
-      if (spot.dataset.done) return;
-      spot.dataset.done = '1';
-      spot.querySelector('svg').innerHTML = DIY_ART[key]('a');
-      spot.style.transition = 'transform 0.35s';
-      spot.animate([{ transform: 'translate(-50%,-50%) scale(0.7)' }, { transform: 'translate(-50%,-50%) scale(1.15)' }, { transform: 'translate(-50%,-50%) scale(1)' }], { duration: 400, easing: 'ease-out' });
-      sfxKnock();
-      fixed++;
-      box.querySelector('#diy-progress').textContent = `${fixed} / ${n} 直した`;
-      if (fixed >= n) setTimeout(() => { close(); applyDiy(propId, sel, category, back); }, 520);
+      if (spot.dataset.done || spot.dataset.busy) return;
+
+      if (mode === 'order') {
+        if (kit.order[fixed] !== key) {
+          misses++; shake(spot);
+          note(`まだ早い！ ${kit.orderHint}`, false);
+          return;
+        }
+        note('段取りどおり！', true);
+        finishSpot(spot, key);
+
+      } else if (mode === 'tool') {
+        if (!pickedTool) { note(`先に ${actIcon} ${actLabel} を持とう`, false); shake(spot); return; }
+        if (pickedTool !== act) {
+          // 必要な動作は箇所に書いてあるので、これは持ち替え忘れ。1回目は無料で気づかせる。
+          shake(spot);
+          if (freeToolMiss) {
+            freeToolMiss = false;
+            note(`ここは ${actIcon} ${actLabel}（上から持ち替えよう）`, false);
+          } else {
+            misses++; apPenalty += 2;
+            note(`ここは ${actIcon} ${actLabel}（行動力-2 累計-${apPenalty}）`, false);
+          }
+          return;
+        }
+        const left = Number(spot.dataset.left) - 1;
+        spot.dataset.left = String(left);
+        sfxKnock();
+        spot.animate([{ transform: 'translate(-50%,-50%) scale(1)' }, { transform: 'translate(-50%,-50%) scale(0.88)' }, { transform: 'translate(-50%,-50%) scale(1)' }], { duration: 180 });
+        if (left > 0) {
+          spot.querySelector('.diy-hit-n').textContent = String(left);
+          note(`${actLabel}（あと${left}回）`, true);
+          return;
+        }
+        spot.querySelector('.diy-hit')?.remove();
+        note(`${actLabel} 完了！`, true);
+        finishSpot(spot, key);
+
+      } else {
+        spot.dataset.busy = '1';
+        runTiming(result => {
+          spot.dataset.busy = '';
+          if (result === 'miss') {
+            misses++; shake(spot);
+            note('手元が狂った…もう一度', false);
+            return;
+          }
+          note(result === 'perfect' ? '✨ Perfect！' : '👍 Good', true);
+          finishSpot(spot, key);
+        });
+      }
     });
   });
+
+  // 中上級では順番のヒントを2秒で消す（覚えゲーにせず、毎回の判断にする）
+  if (showNums && !easy) {
+    setTimeout(() => box.querySelectorAll('.diy-num').forEach(x => x.remove()), 2000);
+  }
   box.querySelector('#diy-close').addEventListener('click', close);
   box.querySelector('#diy-cancel').addEventListener('click', close);
 }
 
-function applyDiy(propId, sel, category, back) {
-  const r = runWork(propId, sel, true, false);
+function applyDiy(propId, sel, category, back, qualityMult = 1, apPenalty = 0) {
+  const r = runWork(propId, sel, true, false, qualityMult);
   if (!r.started) { alert('作業できませんでした'); return; }
   state = r.state;
+  // v8: 道具を間違えたぶんの手間。ミニゲームの結果をここで一括して state に反映する。
+  if (apPenalty) state.actionPower -= apPenalty;
   const p = state.properties.find(x => x.id === propId);
   if (r.done) {
     pushLog(`${p.name || p.label} の${sel.label}をDIYで完了した`);
@@ -6099,6 +6931,33 @@ function popCashTile(tile) {
 // 演出が丸ごと空振りしてしまう（実機検証で発見）。
 const VIEW_RESET_MS = 1400;
 
+// === v8: 巻き戻し（初心者モードのお守り）===
+// 月送りの直前の state を1世代だけメモリに持ち、「先月へ戻る」で復元する。
+// 保存しないのは意図的。セーブを膨らませたくないのと、リロードしてまで使い回す機能ではないため。
+let rewindSnapshot = null;
+
+function maybeOfferRewind() {
+  const box = document.getElementById('rewind-bar');
+  if (!box) return;
+  const can = rewindSnapshot && state.rewindLeft > 0;
+  box.classList.toggle('hidden', !can);
+  if (!can) return;
+  box.innerHTML = '';
+  const btn = el(`<button class="bg-white text-navy border-2 border-navy rounded-full px-4 py-2 text-xs font-bold shadow-lg pointer-events-auto">
+    🕰️ 先月に戻る（残り${state.rewindLeft}回）</button>`);
+  btn.addEventListener('click', () => {
+    if (!rewindSnapshot) return;
+    if (!confirm('先月のはじめに戻りますか？\n\nこの1ヶ月の収支・イベント・工事の進行はすべて無かったことになります。\n巻き戻しはこのゲームで1回だけです。')) return;
+    state = L.deserialize(rewindSnapshot);
+    state.rewindLeft = Math.max(0, (state.rewindLeft ?? 0) - 1);
+    rewindSnapshot = null;
+    pushLog('🕰️ 先月へ巻き戻した');
+    save(); render();
+    box.classList.add('hidden');
+  });
+  box.appendChild(btn);
+}
+
 function onNextMonth() {
   // v7.4: チュートリアルの「翌月へ進む」では本物の月送り（イベント・空室判定・収支）は走らせない。
   // どのみち捨てる状態なので、伝えたいこと＝「月が変わると行動力が全回復する」だけを見せる。
@@ -6113,20 +6972,40 @@ function onNextMonth() {
   animateResetView(VIEW_RESET_MS);   // v5: 翌月のときだけ、地球儀がゆっくり回って初期位置へ戻る
   if (state.properties.length) setTimeout(playCoinCollectAnimation, VIEW_RESET_MS);
   const nextMonth = state.month + 1;
+  // v8.1: 決済演出で「短期で売ったのか、長期まで待てたのか」を見せるため、
+  // 物件がまだ残っているこの時点で内訳を控えておく（advanceMonth 後には物件が消えている）。
   const settling = (state.pendingSales || []).filter(x => x.settleMonth <= nextMonth)
-    .map(x => { const pp = state.properties.find(p => p.id === x.propertyId); return { sale: x, label: pp ? (pp.name || pp.label) : '物件' }; });
+    .map(x => {
+      const pp = state.properties.find(p => p.id === x.propertyId);
+      return { sale: x, label: pp ? (pp.name || pp.label) : '物件',
+        bd: pp ? L.saleBreakdown(state, pp, x.price) : null,
+        corp: pp ? pp.owner === 'corp' : false };
+    });
   const priorNotifIds = new Set((state.notifications || []).map(n => n.id));
+  // v8: 巻き戻し用のスナップショットは月送りの直前に1世代だけ取る。localStorage には保存しない
+  // （セーブが倍に膨らむのを避ける）。リロードで消えるが、お守りとしてはセッション内で足りる。
+  rewindSnapshot = (state.rewindLeft > 0) ? L.serialize(state) : null;
   const r = L.advanceMonth(state, Math.random);
   state = r.state;
   (r.logs || []).forEach(pushLog);
   save(); render();
+  maybeOfferRewind();
   const freshNotifs = (state.notifications || []).filter(n => !priorNotifIds.has(n.id));
   freshNotifs.forEach((n, i) => setTimeout(() => showNotifToast(n), 500 + i * 900));
   // v3.6: 売却成立も買付・購入と同じ判子スタンプ演出に統一
-  settling.forEach((s, i) => setTimeout(() => playStampFx({
-    stamp: '売却成立', title: '売り抜けた！', sub: `${s.label} ／ ${L.yen(s.sale.price)}`,
-    emojis: ['💰', '📈', '✨', '💴', '🎉', '✨'],
-  }), i * 2700));
+  // v8.1: どの税率で売ったかを必ず添える。ここで印象づけないと、5年ルールは最後まで学習されない。
+  settling.forEach((s, i) => setTimeout(() => {
+    const bd = s.bd;
+    const stamp = !bd ? '売却成立' : s.corp ? '法人30%' : bd.longTerm ? '長期20%' : '短期39%';
+    const title = !bd ? '売り抜けた！' : s.corp ? '法人名義で売却！' : bd.longTerm ? '長期まで待った！' : '短期での売却…';
+    const sub = bd
+      ? `${s.label} ／ ${L.yen(bd.price)}　譲渡税 -${L.yen(bd.tax)}${bd.payoff ? ` ／ 残債 -${L.yen(bd.payoff)}` : ''}<br>手取り <b>${L.yen(bd.net)}</b>`
+        + (!s.corp && !bd.longTerm && bd.tax > 0
+          ? `<br><span style="color:#fca5a5">長期まで待てば ${L.yen(Math.round(bd.gain * (L.CONFIG.capGainTaxShort - L.CONFIG.capGainTaxLong)))} 手取りが増えていた</span>`
+          : '')
+      : `${s.label} ／ ${L.yen(s.sale.price)}`;
+    playStampFx({ stamp, title, sub, emojis: ['💰', '📈', '✨', '💴', '🎉', '✨'] });
+  }, i * 2700));
   if (r.pendingEvent) { showEvent(r.pendingEvent); return; }
   const withOffer = (state.listings || []).find(l => l.offer);
   if (withOffer) { showOfferModal(withOffer); return; }
@@ -6153,8 +7032,11 @@ function showEvent(pending) {
   // 見出しは発生時に確定済み（セミナーのお題など）。古いセーブには無いので関数側で解決する。
   const title = pending.title || L.eventTitle(ev);
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3"><h2 class="font-bold">${title}</h2>${where}</div>`);
-  ev.choices.forEach(ch => {
-    const b = el(`<button class="w-full border rounded py-2 text-sm">${ch.label}</button>`);
+  // v8: 初心者モードでは「クイズを避けて経験値だけもらう」逃げ道（beginnerHidden）を出さない。
+  // 学習のための仕掛けなので、選べてしまうと結局使われないため。
+  const beginner = state.difficulty === 'beginner';
+  ev.choices.filter(ch => !(beginner && ch.beginnerHidden)).forEach(ch => {
+    const b = el(`<button class="w-full border rounded py-2 text-sm ${ch.quiz ? 'border-navy bg-slate-50 font-bold' : ''}">${ch.label}</button>`);
     b.addEventListener('click', () => {
       state = ch.apply(structuredClone(state), pending.targetId, pending.unitIndex);
       // 何号室の話だったかをログにも残す（あとから履歴を見て思い出せるように）
@@ -6162,6 +7044,8 @@ function showEvent(pending) {
       pushLog(nm ? `${nm}${ui != null ? ` ${ui + 1}号室` : ''}: ${ch.log}` : ch.log);
       m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = '';
       save(); render();
+      // クイズ付きの選択肢はここで会場へ切り替わる。買付・クリア判定はクイズ終了後に回す。
+      if (ch.quiz) { openQuiz(ch.quiz, () => { const w = (state.listings || []).find(l => l.offer); if (w) showOfferModal(w); else checkEnd(); }); return; }
       const withOffer = (state.listings || []).find(l => l.offer);
       if (withOffer) { showOfferModal(withOffer); return; }
       checkEnd();
@@ -6169,6 +7053,178 @@ function showEvent(pending) {
     box.appendChild(b);
   });
   m.appendChild(box);
+}
+
+// === v8: 用語クイズ（勉強会・大家の会）===
+// 用語集50語を「読む辞書」から「遊んで覚えるコレクション」に変えるための仕掛け。
+// クイズ番組の体裁にして、正解が気持ちいい・間違いがその場で学びに変わる形にしてある。
+
+// 会場の背景。勉強会＝ホワイトボードの部屋／大家の会＝居酒屋。図形だけで描く（画像を持たない）。
+const QUIZ_VENUE = {
+  seminar: {
+    host: '🎤', title: '勉強会', sub: '講師の質問に答えよう',
+    bg: `<rect width="320" height="120" fill="#eef2f7"/>
+         <rect x="30" y="14" width="260" height="78" rx="4" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+         <path d="M50 34h120 M50 48h180 M50 62h90" stroke="#cbd5e1" stroke-width="4" stroke-linecap="round"/>
+         <rect x="132" y="92" width="56" height="28" fill="#b08968"/>
+         <rect x="120" y="90" width="80" height="6" rx="2" fill="#8d6e52"/>`,
+  },
+  oyanokai: {
+    host: '🍻', title: '大家の会', sub: '先輩大家の無茶ぶりに答えよう',
+    bg: `<rect width="320" height="120" fill="#3b2418"/>
+         <rect y="86" width="320" height="34" fill="#6b4a2f"/>
+         <circle cx="60" cy="30" r="17" fill="#e8564a"/><circle cx="60" cy="30" r="13" fill="#f4a259"/>
+         <circle cx="260" cy="30" r="17" fill="#e8564a"/><circle cx="260" cy="30" r="13" fill="#f4a259"/>
+         <rect x="118" y="18" width="84" height="24" rx="3" fill="#d9c8a9"/>
+         <path d="M126 30h68" stroke="#7a5b3a" stroke-width="3"/>
+         <rect x="96" y="66" width="18" height="22" rx="2" fill="#f7e2a1"/>
+         <rect x="206" y="66" width="18" height="22" rx="2" fill="#f7e2a1"/>`,
+  },
+};
+
+function openQuiz(venueKey, done) {
+  const venue = QUIZ_VENUE[venueKey];
+  const hard = state.difficulty !== 'beginner';
+  const seconds = L.DIFFICULTY[state.difficulty]?.quizSeconds ?? 12;
+  const qs = L.buildQuiz(Math.random, { hard });
+  const m = document.getElementById('event-modal');
+  m.classList.remove('hidden'); m.classList.add('flex');
+
+  let idx = 0, streak = 0, comboBest = 0;
+  const correctKeys = [], wrongKeys = [];
+  let timer = null;
+
+  const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+  const finish = () => {
+    stopTimer();
+    const r = L.applyQuizResult(state, { correctKeys, total: qs.length, comboBest,
+      cashReward: venueKey === 'oyanokai' });
+    state = r.state;
+    const cash = venueKey === 'oyanokai' ? L.QUIZ_CASH_PER_CORRECT * correctKeys.length : 0;
+    pushLog(`📚 ${venue.title}の用語クイズ ${correctKeys.length}/${qs.length}正解・ランク${r.rank}`
+      + `（目利き+${Math.round(5 * correctKeys.length * r.mult)}・交渉+${3 * correctKeys.length} EXP`
+      + `${cash ? `・${L.yen(cash)}` : ''}）`);
+    save(); render();
+    drawResult(r, cash);
+  };
+
+  // 1問ぶんの描画。制限時間バーは CSS transition で減らす（1秒ごとの再描画より軽い）。
+  const drawQuestion = () => {
+    stopTimer();
+    const q = qs[idx];
+    m.innerHTML = '';
+    const box = el(`<div class="bg-white rounded-xl w-full max-w-md overflow-hidden">
+      <div class="relative">
+        <svg viewBox="0 0 320 120" class="w-full block" preserveAspectRatio="none" style="height:110px">${venue.bg}</svg>
+        <div class="absolute inset-0 flex items-center justify-between px-3">
+          <div class="text-4xl">${venue.host}</div>
+          <div class="text-right">
+            <div class="text-[11px] font-bold ${venueKey === 'oyanokai' ? 'text-amber-200' : 'text-slate-500'}">📚 ${venue.title}・用語クイズ</div>
+            <div class="text-lg font-black ${venueKey === 'oyanokai' ? 'text-white' : 'text-navy'}">第${idx + 1}問 / ${qs.length}</div>
+          </div>
+        </div>
+        ${streak >= 2 ? `<div class="absolute -bottom-2 left-3 bg-red-500 text-white text-xs font-black rounded-full px-2 py-0.5 shadow-lg" id="qz-combo">🔥 ${streak} COMBO ×${L.quizComboMult(streak).toFixed(1)}</div>` : ''}
+      </div>
+      <div class="h-1.5 bg-slate-200"><div id="qz-time" class="h-1.5 bg-emerald-500" style="width:100%;transition:width ${seconds}s linear"></div></div>
+      <div class="p-4 space-y-3">
+        <div class="text-sm leading-relaxed font-bold">${q.type === 'ox' ? q.text : `つぎの説明が指す用語は？<div class="font-normal mt-1">${q.text}</div>`}</div>
+        <div id="qz-choices" class="space-y-2"></div>
+        <div id="qz-feedback" class="text-sm font-bold text-center h-5"></div>
+      </div></div>`);
+    m.appendChild(box);
+    // transition を効かせるため、次フレームで幅を0にする
+    requestAnimationFrame(() => { const t = box.querySelector('#qz-time'); if (t) t.style.width = '0%'; });
+
+    const choices = box.querySelector('#qz-choices');
+    const answer = (given) => {
+      stopTimer();
+      const ok = given === q.answer;
+      if (ok) {
+        correctKeys.push(q.key); streak++; comboBest = Math.max(comboBest, streak);
+        sfxFanfare();
+      } else {
+        wrongKeys.push(q.key); streak = 0;
+        sfxFail();
+      }
+      choices.querySelectorAll('button').forEach(b => { b.disabled = true; b.classList.add('opacity-60'); });
+      const fb = box.querySelector('#qz-feedback');
+      fb.textContent = ok ? '⭕ 正解！' : given === null ? `⌛ 時間切れ…（正解: ${L.TERMS[q.key].label}）` : `❌ 不正解…（正解: ${L.TERMS[q.key].label}）`;
+      fb.className = `text-sm font-bold text-center h-5 ${ok ? 'text-emerald-600' : 'text-red-600'}`;
+      box.style.animation = ok ? '' : 'qzShake 0.4s';
+      if (ok) quizSparkle(box);
+      setTimeout(() => { idx++; if (idx >= qs.length) finish(); else drawQuestion(); }, 1200);
+    };
+
+    if (q.type === 'ox') {
+      [[true, '⭕ ○（正しい）'], [false, '❌ ×（間違い）']].forEach(([v, label]) => {
+        const b = el(`<button class="w-full border-2 rounded-lg py-3 text-base font-bold hover:bg-slate-50">${label}</button>`);
+        b.addEventListener('click', () => answer(v));
+        choices.appendChild(b);
+      });
+    } else {
+      q.options.forEach(o => {
+        const b = el(`<button class="w-full border-2 rounded-lg py-2.5 text-sm font-bold hover:bg-slate-50">${o.label}</button>`);
+        b.addEventListener('click', () => answer(o.key));
+        choices.appendChild(b);
+      });
+    }
+    // 制限時間。切れたら不正解扱いで先へ進む（止まらないことを優先する）。
+    const deadline = Date.now() + seconds * 1000;
+    timer = setInterval(() => { if (Date.now() >= deadline) answer(null); }, 150);
+  };
+
+  // 結果画面。ランクの判子＋「今日の学び」で間違えた用語をその場で解説する。
+  const drawResult = (r, cash) => {
+    const correct = correctKeys.length;
+    const RANK_COLOR = { S: '#f59e0b', A: '#10b981', B: '#3b82f6', C: '#94a3b8' };
+    m.innerHTML = '';
+    const learned = (state.learnedTerms || []).length;
+    const box = el(`<div class="bg-white rounded-xl w-full max-w-md max-h-[90vh] overflow-y-auto">
+      <div class="p-5 text-center space-y-2">
+        <div class="text-xs font-bold text-slate-500">📚 ${venue.title}・結果発表</div>
+        <div class="mx-auto w-28 h-28 rounded-full bg-white flex items-center justify-center shadow-lg"
+             style="border:8px solid ${RANK_COLOR[r.rank]};animation: qzStamp 0.55s cubic-bezier(.2,1.4,.4,1) forwards;">
+          <span class="text-5xl font-black" style="color:${RANK_COLOR[r.rank]}">${r.rank}</span></div>
+        <div class="text-2xl font-black">${correct} / ${qs.length} 正解</div>
+        ${comboBest >= 2 ? `<div class="text-sm font-bold text-red-500">🔥 最高${comboBest}コンボ（EXP ×${r.mult.toFixed(1)}）</div>` : ''}
+        <div class="text-sm space-y-0.5 pt-1">
+          <div>🎓 目利き <b class="text-emerald-600">+${Math.round(5 * correct * r.mult)} EXP</b>
+               ／ 交渉 <b class="text-emerald-600">+${3 * correct} EXP</b></div>
+          ${cash ? `<div>🤝 人脈からの情報料 <b class="text-emerald-600">+${L.yen(cash)}</b></div>` : ''}
+          ${correct === qs.length ? '<div class="text-amber-600 font-bold">✨ 全問正解！「耳より情報」を手に入れた（次の指値だけ成功率+10pt）</div>' : ''}
+        </div>
+        <div class="text-[11px] text-slate-500 pt-1">📖 用語の習得 ${learned} / ${Object.keys(L.TERMS).length}</div>
+        <div class="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
+          <div class="bg-navy h-2" style="width:${Math.round(learned / Object.keys(L.TERMS).length * 100)}%"></div></div>
+      </div>
+      ${wrongKeys.length ? `<div class="border-t bg-slate-50 p-4 space-y-2">
+        <div class="font-bold text-sm">📖 今日の学び</div>
+        ${wrongKeys.map(k => `<div class="bg-white rounded-lg p-2 text-xs">
+          <div class="font-bold text-navy">${L.TERMS[k].label}</div>
+          <div class="text-slate-700 mt-0.5">${L.TERMS[k].def}</div>
+          ${L.TERMS[k].hint ? `<div class="text-slate-500 mt-0.5">💡 ${L.TERMS[k].hint}</div>` : ''}</div>`).join('')}
+      </div>` : ''}
+      <div class="p-4"><button id="qz-done" class="w-full bg-navy text-white rounded-lg py-2.5 font-bold">閉じる</button></div></div>`);
+    m.appendChild(box);
+    if (r.rank === 'S') { sfxFanfare(); quizSparkle(box); }
+    box.querySelector('#qz-done').addEventListener('click', () => {
+      m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = '';
+      save(); render();
+      if (done) done();
+    });
+  };
+
+  drawQuestion();
+}
+
+// 正解時の紙吹雪。既存の演出と同じトーン（軽く・短く・操作を邪魔しない）。
+function quizSparkle(host) {
+  ['✨', '🎉', '✨', '💡', '🎊'].forEach((c, i) => {
+    const sp = el(`<div class="absolute text-2xl pointer-events-none" style="left:${12 + i * 18}%;top:40%;animation: qzFloat 1.1s ease-out ${i * 0.07}s forwards;opacity:0;z-index:5;">${c}</div>`);
+    host.style.position = host.style.position || 'relative';
+    host.appendChild(sp);
+    setTimeout(() => sp.remove(), 1300);
+  });
 }
 
 // === v3.7: フィナーレ＆リザルト ===
