@@ -346,10 +346,11 @@ export function structuralDecay(property) {
 export const DIFFICULTY = {
   beginner: { label: '初心者向け', seedMult: 1.5, creditBonus: 10, rateAdj: -0.003, decayMult: 0.7,
               eventMult: 0.6, fillBonus: 0.10, rewind: 1, quizForced: true,
-              diyEasy: true, goalScale: 0.5, yearsBonus: 5, quizSeconds: 18 },
+              diyEasy: true, goalScale: 0.5, yearsBonus: 5, quizSeconds: 54 },
   normal:   { label: '中上級者向け', seedMult: 1.0, creditBonus: 0, rateAdj: 0, decayMult: 1.0,
               eventMult: 1.0, fillBonus: 0, rewind: 0, quizForced: false,
-              diyEasy: false, goalScale: 1.0, yearsBonus: 0, quizSeconds: 12 },
+              // v8.4: 用語を読んで考える時間としては短すぎたので3倍にした（12→36 / 18→54）
+              diyEasy: false, goalScale: 1.0, yearsBonus: 0, quizSeconds: 36 },
 };
 // state を持たない純関数（generateProperty 等）からも呼ぶので、undefined でも落ちないようにする。
 export function difficultyOf(state) { return DIFFICULTY[state?.difficulty] || DIFFICULTY.normal; }
@@ -594,12 +595,23 @@ export function offerSuccessChance(property, cutRate, negotiationLv) {
   return Math.max(0.02, Math.min(0.95, p));
 }
 
+// v8.3: 一度断られた物件は、売主が折れるまで買付そのものを受け付けない。
+// v8.2までは満額だけ素通りできたため、「鬼指値で外しても満額で買い直せばいい」となり、
+// 指値にリスクが無かった。断られたら売主の態度が固まる、という当たり前の反応にする。
+// 解除されるのは ①売主が値下げした（tickMarketでrefusedOfferを解除）
+//                ②6ヶ月以上売れ残った（staleFlag）の2つだけ。
+export function offerBlockedReason(property) {
+  if (!property) return null;
+  if (property.refusedOffer && !property.staleFlag) return 'refused';
+  return null;
+}
+
 export function makeOffer(state, propertyId, cutRate, rng = Math.random) {
   const s = structuredClone(state);
   const p = s.market.find(x => x.id === propertyId);
-  if (!p) return { state: s, accepted: false, price: 0 };
-  // 再指値は原則不可（満額は常に成立）。ただし売れ残り(staleFlag)は再指値可。値下げ時はtickMarketでフラグ解除。
-  if (p.refusedOffer && cutRate > 0 && !p.staleFlag) return { state: s, accepted: false, price: 0 };
+  if (!p) return { state: s, accepted: false, price: 0, blocked: true, reason: 'notFound' };
+  const blocked = offerBlockedReason(p);
+  if (blocked) return { state: s, accepted: false, price: 0, blocked: true, reason: blocked };
   s.actionPower -= 10;
   const lv = skillLevel(s.skills.negotiation.exp);
   const beyondLine = cutRate > maxBrokerCut(p, lv);
@@ -811,6 +823,48 @@ export function loanPayoffOf(property) {
   }
   return payoff + reformLoansRemaining(property);
 }
+// === v8.4: 売却諸費用 ===
+// v8.3までは「売却価格 − 譲渡税 − 残債」だけで手取りを出していたが、実際は売主にも実費がかかる。
+// 手取りが数%変わるので、利益が薄い物件では売る／売らないの判断そのものがひっくり返る。
+// 所有権移転登記（名義変更）は**買主負担**が慣習なので売主側では計上しない
+// （このゲームでも購入時の諸費用7% = CONFIG.closingCostRate に含まれている）。
+
+// 仲介手数料（速算法・消費税10%込み）。実際の宅建業法の上限式。
+export const CONSUMPTION_TAX = 0.10;
+export function brokerFee(price) {
+  let base;
+  if (price <= 2_000_000) base = price * 0.05;
+  else if (price <= 4_000_000) base = price * 0.04 + 20_000;
+  else base = price * 0.03 + 60_000;
+  return Math.round(base * (1 + CONSUMPTION_TAX));
+}
+
+// 印紙税（不動産売買契約書・軽減税率）。契約金額の階段で決まる。
+export const STAMP_DUTY_TABLE = [
+  [1_000_000, 500], [5_000_000, 1_000], [10_000_000, 5_000], [50_000_000, 10_000],
+  [100_000_000, 30_000], [500_000_000, 60_000], [1_000_000_000, 160_000],
+];
+export function stampDuty(price) {
+  for (const [limit, duty] of STAMP_DUTY_TABLE) if (price <= limit) return duty;
+  return 320_000;
+}
+
+// 抵当権抹消費用。ローンが残っている物件を売るときだけ発生する。
+// 登録免許税（不動産1個1,000円・土地+建物で2,000円）＋司法書士報酬の実勢。
+export const MORTGAGE_RELEASE_FEE = 20_000;
+export function mortgageReleaseFee(property) {
+  const hasLoan = !!property.loan || (property.reformLoans || []).length > 0;
+  return hasLoan ? MORTGAGE_RELEASE_FEE : 0;
+}
+
+// 売主が負担する諸費用の内訳。
+export function saleCosts(property, price) {
+  const broker = brokerFee(price);
+  const stamp = stampDuty(price);
+  const release = mortgageReleaseFee(property);
+  return { broker, stamp, release, total: broker + stamp + release };
+}
+
 // 売却の手取り一式。価格決定・買付承諾・決済演出のすべてがこれを使う。
 export function saleBreakdown(state, property, price) {
   const book = bookValueV2(property);
@@ -818,7 +872,9 @@ export function saleBreakdown(state, property, price) {
   const rate = capGainTaxRate(state, property);
   const tax = Math.round(gain * rate);
   const payoff = loanPayoffOf(property);
-  return { price, book, gain, rate, tax, payoff, net: price - tax - payoff,
+  const costs = saleCosts(property, price);
+  return { price, book, gain, rate, tax, payoff, costs,
+    net: price - tax - payoff - costs.total,
     longTerm: property.owner === 'corp' || isLongTermHold(state, property) };
 }
 
@@ -847,12 +903,12 @@ export function settleSale(state, sale) {
   const logs = [];
   // 表示（売却前の試算）と同じ関数で精算する。数字がズレると信用を失うので必ず共通化する。
   const bd = saleBreakdown(s, p, sale.price);
-  const { gain, tax: capTax, payoff } = bd;
-  s.cash += sale.price - capTax - payoff;
+  const { gain, tax: capTax, payoff, costs } = bd;
+  s.cash += bd.net;   // 売却価格 − 譲渡税 − 残債 − 諸費用（仲介手数料・印紙税・抵当権抹消）
   if (p.loan) { const rel = s.bankRelations?.[p.loan.bankKey]; if (rel) rel.paidOff += 1; }
   const taxLabel = p.owner === 'corp' ? '法人30%'
     : `${bd.longTerm ? '長期' : '短期'}${Math.round(bd.rate * 100)}%`;
-  logs.push(`${p.label} を ${yen(sale.price)} で売却（${taxLabel} 譲渡税 ${yen(capTax)}・残債精算 ${yen(payoff)}・手取り ${yen(bd.net)}）`);
+  logs.push(`${p.label} を ${yen(sale.price)} で売却（${taxLabel} 譲渡税 ${yen(capTax)}・諸費用 ${yen(costs.total)}・残債精算 ${yen(payoff)}・手取り ${yen(bd.net)}）`);
   s.stats = s.stats || { buys: 0, sales: 0, profitSales: 0, junkFlips: 0, hadLoan: false };
   s.stats.sales += 1;
   if (gain > 0) s.stats.profitSales += 1;
@@ -888,38 +944,92 @@ export function naturalFillChance(property) {
   return 0.15 + 0.10 * Math.max(0, Math.min(100, property.careState ?? 100)) / 100;
 }
 
+// === v8.4: 広告料（AD）===
+// v8.3までは「広告を出す＝その月に必ず（70%で）決まる」だったので、空室は現金で即解決できた。
+// 実際のADは客付け業者へのインセンティブで、出せば決まりやすくはなるが決め打ちはできない。
+// 1〜3ヶ月分から選び、**決まるまで毎月の客付け率を底上げし続ける**形にした。
+// 3ヶ月分の方が明らかに早いが、1ヶ月分でも初月に決まることはある。
+export const AD_PLANS = {
+  1: { months: 1, bonus: 0.15, label: 'AD 1ヶ月分' },
+  2: { months: 2, bonus: 0.30, label: 'AD 2ヶ月分' },
+  3: { months: 3, bonus: 0.45, label: 'AD 3ヶ月分' },
+};
+export const AD_MAX_CHANCE = 0.90;        // どれだけ積んでも「確実」にはしない
+export const SELF_FILL_AP = 30;           // 自主客付け1回の行動力
+export const SELF_FILL_BASE = 0.25;       // 自主客付けの上乗せ（基礎）
+export const SELF_FILL_PER_LV = 0.05;     // 自主管理レベルごとの上乗せ
+
+export function adCost(unit, adMonths) {
+  const plan = AD_PLANS[adMonths];
+  return plan ? unit.rent * plan.months : 0;
+}
+// その部屋に効いているADの上乗せ。決まるまで続く。
+export function adBonusOf(unit) {
+  const plan = unit?.ad ? AD_PLANS[unit.ad.months] : null;
+  return plan ? plan.bonus : 0;
+}
+// 部屋ごとの最終的な客付け率。物件の手入れ＋ADの上乗せ＋難易度の下駄。
+export function unitFillChance(property, unit, bonus = 0) {
+  const base = naturalFillChance(property);
+  if (base <= 0) return 0;                // 使用不能・管理崩壊では何をしても決まらない
+  return Math.min(AD_MAX_CHANCE, base + adBonusOf(unit) + bonus);
+}
+
+// 入居が決まったときの後始末。ADは役目を終えるのでここで外す。
+function moveIn(unit) {
+  unit.occupied = true; unit.vacantMonths = 0; unit.tenantMonths = 0;
+  unit.ad = null;
+}
+
 // v8: bonus は難易度による下駄（初心者+10pt）。募集そのものが止まっている物件には効かせない。
 export function naturalFillRoll(property, rng = Math.random, bonus = 0) {
   let filled = 0;
-  const base = naturalFillChance(property);
-  const chance = base > 0 ? base + bonus : 0;
   property.units.forEach(u => {
     if (!u.occupied) {
       if (u.needsRestore) { u.vacantMonths += 1; return; }   // v4: 原状回復前は埋まらない
       // v6: 手入れが行き届いた物件ほど自然に埋まる（草ぼうぼうの物件は内見で決まらない）
-      if (rng() < chance) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; filled += 1; }
+      // v8.4: ADを出している部屋はここに上乗せが乗る（決まるまで毎月効く）
+      if (rng() < unitFillChance(property, u, bonus)) { moveIn(u); filled += 1; }
       else u.vacantMonths += 1;
     }
   });
   return { property, filled };
 }
 
-export function fillVacancy(state, propertyId, unitIndex, method, rng = Math.random) {
+// method: 'ad'（広告料を出す・adMonths で 1〜3 を指定）／'self'（自主客付け・行動力を使う）
+// どちらも「その場で1回抽選し、外れても次月以降に持ち越す」。自主客付けは行動力の続く限り何度でも可。
+export function fillVacancy(state, propertyId, unitIndex, method, rng = Math.random, opts = {}) {
   const s = structuredClone(state);
   const p = s.properties.find(x => x.id === propertyId);
-  const u = p.units[unitIndex];
+  const u = p?.units?.[unitIndex];
   if (!u || u.occupied) return { state: s, success: false };
   // v4: 原状回復が済むまでは募集できない。費用・行動力を消費する前に弾く。
   if (u.needsRestore) return { state: s, success: false, reason: 'needsRestore' };
   // v8: 使用不能・管理崩壊の建物は、部屋が直っていても募集そのものが通らない。
   if (isCondemned(p)) return { state: s, success: false, reason: 'condemned' };
   if (careBandOf(p) === 'dead') return { state: s, success: false, reason: 'careCollapsed' };
-  let chance;
-  if (method === 'ad') { s.cash -= u.rent; chance = 0.70; }
-  else { s.actionPower -= 30; const lv = skillLevel(s.skills.selfmgmt.exp); chance = 0.40 + (lv - 1) * 0.10; s.skills.selfmgmt.exp += 10; }
+
+  let chance, cost = 0;
+  if (method === 'ad') {
+    const adMonths = Number(opts.adMonths ?? 1);
+    if (!AD_PLANS[adMonths]) return { state: s, success: false, reason: 'badPlan' };
+    cost = adCost(u, adMonths);
+    if (s.cash < cost) return { state: s, success: false, reason: 'noCash', cost };
+    s.cash -= cost;
+    // 出したADは「決まるまで」効き続ける。強い方で上書きし、弱いプランへの下げは行わない。
+    if (!u.ad || u.ad.months < adMonths) u.ad = { months: adMonths, since: s.month };
+    chance = unitFillChance(p, u);
+  } else {
+    if (s.actionPower < SELF_FILL_AP) return { state: s, success: false, reason: 'noActionPower' };
+    s.actionPower -= SELF_FILL_AP;
+    const lv = skillLevel(s.skills.selfmgmt.exp);
+    s.skills.selfmgmt.exp += 10;
+    chance = Math.min(AD_MAX_CHANCE,
+      unitFillChance(p, u) + SELF_FILL_BASE + (lv - 1) * SELF_FILL_PER_LV);
+  }
   const success = rng() < chance;
-  if (success) { u.occupied = true; u.vacantMonths = 0; u.tenantMonths = 0; }
-  return { state: s, success };
+  if (success) moveIn(u);
+  return { state: s, success, chance, cost, method };
 }
 
 // === v4: 現状回復（部屋ごと・退去起点）===
@@ -2190,10 +2300,14 @@ export function advanceMonth(state, rng = Math.random) {
   const mcfNow = monthlyCF(s);
   if (mcfNow > (s.stats.maxMonthlyCF ?? 0)) s.stats.maxMonthlyCF = mcfNow;
   // v3: 月次給与の自動加算は廃止（種銭は doWork で稼ぐ）
-  for (const l of s.listings || []) {
+  // v8.2: 決済で物件が消えた直後なので、掲載を掃除してから回す。
+  // ここで未定義の物件を触ると advanceMonth ごと例外で止まり、月が進まず行動力も戻らなくなる。
+  s.listings = pruneListings(s).listings;
+  for (const l of s.listings) {
     l.listedMonths += 1;
     if (!l.offer) {
       const p = s.properties.find(x => x.id === l.propertyId);
+      if (!p) continue;   // 念のための二重防御（pruneListings で除かれているはず）
       const o = rollBuyOffer(l, p, rng);
       if (o) { l.offer = { ...o, month: s.month }; logs.push(`${p.label} に買付！（${o.type === 'full' ? '満額' : '指値'} ${yen(o.price)}）`); }
     }
@@ -2231,6 +2345,12 @@ export function migrateSave(state) {
   if (s.rewindLeft === undefined) s.rewindLeft = difficultyOf(s).rewind;
   if (!Array.isArray(s.learnedTerms)) s.learnedTerms = [];
   if (!Array.isArray(s.buffs)) s.buffs = [];
+  // v8.2: すでに壊れているセーブを読み込み時に直す。
+  // このバグに当たった人は「翌月が押せない」状態でセーブが残っているので、
+  // 読み込むだけで復帰できるようにしておく（作り直しを強いない）。
+  s.properties = s.properties || [];
+  s.pendingSales = s.pendingSales || [];
+  s.listings = pruneListings(s).listings;
   (s.properties || []).forEach(p => {
     // リフォームローンの単数→配列
     if (!Array.isArray(p.reformLoans)) p.reformLoans = p.reformLoan ? [p.reformLoan] : [];
@@ -2240,6 +2360,7 @@ export function migrateSave(state) {
     if (p.autoManage === undefined) p.autoManage = false;
     // 原状回復（部屋ごと）。既存の空室は「原状回復済み」扱いにし、いきなり客付け不可にしない。
     (p.units || []).forEach(u => {
+      if (u.ad === undefined) u.ad = null;   // v8.4: 広告料（決まるまで効く）
       if (u.needsRestore === undefined) u.needsRestore = false;
       if (u.tenantMonths === undefined) u.tenantMonths = u.occupied ? 12 : 0;
       if (u.restoreJob === undefined) u.restoreJob = null;
@@ -2421,8 +2542,31 @@ export function requestAppraisal(state, propertyId, rng = Math.random) {
 export function listForSale(state, propertyId, askingPrice, appraisal = null) {
   const s = structuredClone(state);
   s.listings = s.listings || [];
+  // v8.2: 決済待ちの物件を再掲載させない（「行動力が戻らない」バグの根本原因）。
+  // 買付を承諾すると掲載は消えるが、物件は決済月まで所有一覧に残る。その隙に売り出せてしまうと、
+  // 翌月 settleSale が物件を消した直後に掲載ループが未定義を触り、advanceMonth が例外で止まる。
+  if ((s.pendingSales || []).some(x => x.propertyId === propertyId)) {
+    return { state: s, listed: false, reason: 'pendingSale' };
+  }
+  if ((s.listings || []).some(l => l.propertyId === propertyId)) {
+    return { state: s, listed: false, reason: 'alreadyListed' };
+  }
+  if (!s.properties.some(p => p.id === propertyId)) {
+    return { state: s, listed: false, reason: 'notOwned' };
+  }
   s.listings.push({ propertyId, askingPrice, appraisal, listedMonths: 0, offer: null });
-  return { state: s };
+  return { state: s, listed: true };
+}
+
+// v8.2: 掲載の整合を取り直す。所有していない物件・決済待ちの物件の掲載は捨てる。
+// 根本原因は listForSale 側で塞いだが、advanceMonth は「1件でも壊れたデータがあると
+// 月送りごと止まる」構造なので、そこへ入る前に必ず通す保険をかけておく。
+export function pruneListings(state) {
+  const before = (state.listings || []).length;
+  const listings = (state.listings || []).filter(l =>
+    state.properties.some(p => p.id === l.propertyId)
+    && !(state.pendingSales || []).some(x => x.propertyId === l.propertyId));
+  return { listings, removed: before - listings.length };
 }
 
 export function updateListing(state, propertyId, newPrice) {
@@ -2675,6 +2819,21 @@ export const TERMS = {
     calc: '譲渡税 ＝（売却価格 − 取得費 − 償却済み額）× 税率。個人は保有5年以内39%・5年超20%、法人は一律30%。',
     here: '個人名義は保有5年以内だと税率がほぼ倍になる。法人名義には5年ルールがない。',
     hint: '短期転売を狙うなら法人化を検討する。5年目前なら、あと数ヶ月待つだけで手取りが大きく変わる。' },
+  chukai_tesuryo: { scope: 'real', reading: 'ちゅうかいてすうりょう', group: '売買', label: '仲介手数料',
+    def: '売買を仲介した不動産会社に払う報酬。売主・買主がそれぞれ自分の側の分を払う。',
+    calc: '上限は「売買価格×3%＋6万円」＋消費税10%（400万円超の場合）。宅建業法で決まっている。',
+    here: '売却時の手取り計算に必ず入る。1億円で売れば約300万円かかる。',
+    hint: '売却価格に比例するので、売値が上がるほど額も増える。手取りを見るときは必ず引いてから考える。' },
+  inshizei: { scope: 'real', reading: 'いんしぜい', group: '売買', label: '印紙税',
+    def: '売買契約書に貼る収入印紙の代金。契約金額の段階で決まる。',
+    calc: '1,000万円超5,000万円以下で1万円、5,000万円超1億円以下で3万円（軽減税率）。',
+    here: '売却時に売主が負担する。金額は小さいが必ずかかる。',
+    hint: '仲介手数料と違って定額の階段。高額物件でも数万円で収まる。' },
+  teitoken_masshou: { scope: 'real', reading: 'ていとうけんまっしょう', group: '売買', label: '抵当権抹消',
+    def: 'ローンを完済したときに、登記簿から銀行の担保権を消す手続き。',
+    calc: '登録免許税（不動産1個1,000円）＋司法書士報酬。このゲームでは一律2万円。',
+    here: 'ローンが残っている物件を売るときだけ発生する。現金購入の物件では0円。',
+    hint: '所有権移転登記（名義変更）の費用は買主負担が慣習なので、売主側では計上しない。' },
   book_value: { scope: 'real', reading: 'ぼか', group: '税・会計', label: '簿価',
     def: '帳簿上の物件価格。購入価格から、これまでに償却した建物ぶんを差し引いた残り。',
     calc: '簿価 ＝ 土地ぶん ＋ 建物ぶん ×（1 − 償却の進み具合）',
@@ -2717,6 +2876,11 @@ export const TERMS = {
     calc: '各室の家賃を合計したものが月の満室想定家賃になる。',
     here: '詳細画面の「レントロール」タブ。どの部屋が空いていて、いくら取れているかが分かる。',
     hint: '同じ建物なのに家賃差が大きい部屋は、値上げか値下げの余地がある。' },
+  ad: { scope: 'real', group: '管理', label: 'AD',
+    def: '広告料。入居者を決めてくれた仲介業者へ、大家が上乗せで払う成功報酬。',
+    calc: 'AD ＝ 家賃の1〜3ヶ月分。このゲームでは1ヶ月分で客付け率+15pt、2ヶ月分で+30pt、3ヶ月分で+45pt（上限90%）。',
+    here: '空室の部屋から出せる。**決まるまで毎月効き続ける**ので、出した月に決まらなくても無駄にはならない。',
+    hint: '払えば必ず決まるものではない。3ヶ月分でも外れることはあるし、1ヶ月分が初月で決まることもある。空室損（家賃×空室月数）と見比べて、どこまで積むかを決める。' },
   kyakuduke: { scope: 'real', reading: 'きゃくづけ', group: '管理', label: '客付け',
     def: '空室に入居者を決めること。',
     calc: '広告を出す＝家賃1ヶ月分で成功率70%。自分で動く＝行動力30で成功率 40%＋（自主管理Lv−1）×10%。',
@@ -2778,7 +2942,7 @@ export function minRequiredCash(property, state, price = property.price) {
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, DIFFICULTY, difficultyOf, STRUCT_BANDS, CARE_BANDS, BAND_RANK, structBandOf, careBandOf, worstBandOf, STRUCT_VALUE_FACTOR, marketValueOf, CREDIT_HIT_DANGER, CREDIT_HIT_DEAD, CREDIT_HIT_CAP, creditPenalty, effectiveCredit, isCondemned, CONDEMNED_COST_MULT, CONDEMNED_EXTRA_MONTHS, STRUCT_DANGER_VACATE_CHANCE, CARE_DANGER_CLAIM_CHANCE, CARE_DANGER_CLAIM_AP, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, LONG_TERM_MONTHS, heldMonthsOf, isLongTermHold, monthsToLongTerm, capGainTaxRate, capGainOf, capGainTaxOf, loanPayoffOf, saleBreakdown, incorporationSaving, incorporationPaybackYears, settleSale, monthlyVacancyRoll, naturalFillChance, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, DIY_QUALITY, diyQualityOf, restoreCost, startRestore, REPAIR_KINDS, repairKindAvailable, DEEPCLEAN_COST_MULT, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, QUIZ_MIN_Q, QUIZ_MAX_Q, QUIZ_COMBO_MULT, QUIZ_CASH_PER_CORRECT, QUIZ_SASHINE_BONUS, quizComboMult, quizRank, buildQuiz, applyQuizResult, sashineBuffBonus, consumeSashineBuff, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, DIFFICULTY, difficultyOf, STRUCT_BANDS, CARE_BANDS, BAND_RANK, structBandOf, careBandOf, worstBandOf, STRUCT_VALUE_FACTOR, marketValueOf, CREDIT_HIT_DANGER, CREDIT_HIT_DEAD, CREDIT_HIT_CAP, creditPenalty, effectiveCredit, isCondemned, CONDEMNED_COST_MULT, CONDEMNED_EXTRA_MONTHS, STRUCT_DANGER_VACATE_CHANCE, CARE_DANGER_CLAIM_CHANCE, CARE_DANGER_CLAIM_AP, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, offerBlockedReason, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, LONG_TERM_MONTHS, heldMonthsOf, isLongTermHold, monthsToLongTerm, capGainTaxRate, capGainOf, capGainTaxOf, loanPayoffOf, CONSUMPTION_TAX, brokerFee, STAMP_DUTY_TABLE, stampDuty, MORTGAGE_RELEASE_FEE, mortgageReleaseFee, saleCosts, saleBreakdown, incorporationSaving, incorporationPaybackYears, settleSale, monthlyVacancyRoll, naturalFillChance, AD_PLANS, AD_MAX_CHANCE, SELF_FILL_AP, SELF_FILL_BASE, SELF_FILL_PER_LV, adCost, adBonusOf, unitFillChance, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, DIY_QUALITY, diyQualityOf, restoreCost, startRestore, REPAIR_KINDS, repairKindAvailable, DEEPCLEAN_COST_MULT, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, QUIZ_MIN_Q, QUIZ_MAX_Q, QUIZ_COMBO_MULT, QUIZ_CASH_PER_CORRECT, QUIZ_SASHINE_BONUS, quizComboMult, quizRank, buildQuiz, applyQuizResult, sashineBuffBonus, consumeSashineBuff, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, pruneListings, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -4595,6 +4759,9 @@ function openKpiModal(which, keepBulk = false) {
       const badges = [
         p.owner === 'corp' ? '<span class="bg-navy text-white rounded px-1">🏢法人</span>' : '<span class="bg-slate-200 text-slate-700 rounded px-1">👤個人</span>',
         listing ? `<span class="bg-amber-500 text-white rounded px-1">📢売出中${listing.listedMonths + 1}ヶ月目</span>` : '',
+        // v8.2: 承諾済みで決済待ちの物件は、一覧でもそれと分かるようにする
+        (state.pendingSales || []).some(x => x.propertyId === p.id)
+          ? '<span class="bg-emerald-600 text-white rounded px-1 font-bold">✅売却成立・翌月決済</span>' : '',
         p.repairJob ? `<span class="bg-amber-100 text-amber-700 rounded px-1">🔨${L.REPAIR_KINDS[p.repairJob.kind || 'large'].label}中 残り${p.repairJob.monthsLeft}ヶ月</span>` : '',
         // v8: 帯に応じて段階表示。使用不能・管理崩壊は工事中でも隠さない（募集停止が続いているため）
         L.structBandOf(p) === 'dead' ? '<span class="bg-red-600 text-white rounded px-1 font-bold">🛑使用不能</span>'
@@ -5132,6 +5299,9 @@ function overviewTab(p, from) {
     ${twoGauges(p)}
     ${p.junkFlags.length ? `<div class="text-xs text-red-600 font-bold text-center">${term('wakeari', '訳あり')}: ${p.junkFlags.join('・')}</div>` : ''}
     ${p.sellerUrgency ? `<div class="text-xs text-rose-600 font-bold text-center">🏃 売り急ぎ: ${p.sellerUrgency.reason}そうだ</div>` : ''}
+    ${L.offerBlockedReason(p) ? `<div class="rounded-lg bg-red-50 text-red-800 p-2 text-xs">
+      <b>🚫 買付不可</b>　一度断られたため、売主が態度を固めています。満額でも受け付けてもらえません。
+      値下げか、6ヶ月以上の売れ残り（現在${p.listedMonths ?? 0}ヶ月）で交渉が再開します。</div>` : ''}
     <button class="dt-map-jump w-full border rounded-lg py-2 text-xs text-navy font-bold hover:bg-slate-50">📍 地図で場所を見る</button>
     ${noiTable(p)}</div>`;
 }
@@ -5144,13 +5314,56 @@ function rentRollTab(p, from) {
       <td class="text-center">${L.yen(u.rent)}</td>
       <td class="text-center">${u.occupied ? '<span class="text-emerald">入居中</span>'
         : u.needsRestore ? `<span class="text-amber-600 font-bold">${u.restoreJob ? `🔨${term('genjo_kaifuku', '原状回復')}中(残${u.restoreJob.monthsLeft}ヶ月)` : `要${term('genjo_kaifuku', '原状回復')}`}</span>`
-        : `<span class="text-red-600">空室${u.vacantMonths}ヶ月</span>`}</td>
+        : `<span class="text-red-600">空室${u.vacantMonths}ヶ月</span>${u.ad ? `<div class="text-[10px] text-emerald-700 font-bold">📣${term('ad', 'AD')}${u.ad.months}ヶ月分 掲出中</div>` : ''}`}</td>
       <td class="text-right">${!u.occupied && from === 'owned' ? (u.needsRestore
         ? '<span class="text-[11px] text-slate-500">原状回復するまで募集できません</span>'
-        : `<button class="fill-ad text-xs border rounded px-1" data-i="${i}">広告料(家賃1ヶ月)</button>
-        <button class="fill-self text-xs border rounded px-1" data-i="${i}">自主${term('kyakuduke', '客付け')}(-30)</button>`) : ''}</td></tr>`).join('')}
+        : `<div class="flex flex-col items-end gap-0.5">
+            <div class="text-[10px] text-slate-500">今月決まる確率 <b>${Math.round(L.unitFillChance(p, u) * 100)}%</b></div>
+            <button class="fill-ad text-xs border rounded px-1.5 py-0.5" data-i="${i}">📣 ${term('ad', 'AD')}を出す</button>
+            <button class="fill-self text-xs border rounded px-1.5 py-0.5" data-i="${i}">自主${term('kyakuduke', '客付け')}(-${L.SELF_FILL_AP})</button>
+          </div>`) : ''}</td></tr>`).join('')}
   </table>
+  ${from === 'owned' && p.units.some(u => !u.occupied && !u.needsRestore)
+    ? `<div class="mt-2 text-[11px] text-slate-600 bg-slate-50 rounded p-2">📣 ${term('ad', 'AD')}は<b>決まるまで毎月効き続けます</b>。出した月に決まらなくても無駄にはなりません。自主${term('kyakuduke', '客付け')}は行動力の続く限り何度でも挑戦できます。</div>` : ''}
   ${from === 'owned' && p.units.some(u => u.needsRestore) ? '<div class="mt-2 text-xs text-amber-700 bg-amber-50 rounded p-2">退去した部屋は原状回復するまで募集できません。フッターの「🔨修繕」から着手できます。</div>' : ''}`;
+}
+
+// v8.4: ADは1〜3ヶ月分から選ぶ。積むほど決まりやすいが、確定はしない。
+function openAdPicker(p, unitIndex, onPick) {
+  const u = p.units[unitIndex];
+  // 物件詳細（z-50）の上に重ねるので、既存のモーダル枠は使わず専用のオーバーレイを作る。
+  const m = el('<div class="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4"></div>');
+  document.body.appendChild(m);
+  const close = () => m.remove();
+  const base = L.unitFillChance(p, u);
+  const rows = Object.values(L.AD_PLANS).map(plan => {
+    const cost = u.rent * plan.months;
+    // いま出ているADより弱いプランは意味がないので選ばせない
+    const weaker = u.ad && u.ad.months >= plan.months;
+    const after = Math.min(L.AD_MAX_CHANCE, L.naturalFillChance(p) + plan.bonus);
+    const enough = state.cash >= cost;
+    return `<button class="ad-pick w-full border-2 rounded-lg p-2.5 text-left ${(weaker || !enough) ? 'opacity-40' : 'hover:bg-slate-50'}"
+        data-m="${plan.months}" ${(weaker || !enough) ? 'disabled' : ''}>
+      <div class="flex justify-between items-center">
+        <span class="font-bold text-sm">📣 ${plan.label}</span>
+        <span class="font-bold">${L.yen(cost)}</span></div>
+      <div class="text-xs text-slate-600">毎月の決まりやすさ <b>${Math.round(base * 100)}% → ${Math.round(after * 100)}%</b>（決まるまで継続）</div>
+      ${weaker ? '<div class="text-[11px] text-slate-500">すでに同等以上のADを出しています</div>' : ''}
+      ${!enough ? '<div class="text-[11px] text-red-600">現金が足りません</div>' : ''}</button>`;
+  }).join('');
+  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-2">
+    <div class="flex justify-between items-center"><h2 class="font-bold">📣 ${term('ad', 'AD')}（広告料）を出す</h2><button id="ad-x" class="text-slate-400 text-xl leading-none">✕</button></div>
+    <div class="text-xs text-slate-600">${unitIndex + 1}号室（家賃 ${L.yen(u.rent)}）。客付け業者への成功報酬です。
+      <b>積むほど決まりやすくなりますが、確実ではありません。</b></div>
+    <div class="space-y-1.5">${rows}</div>
+    <div class="text-[11px] text-slate-500">出したADは入居が決まるまで効き続けます。空室損（家賃×空室月数）と見比べて決めましょう。</div>
+    <button id="ad-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
+  m.appendChild(box);
+  box.querySelectorAll('.ad-pick').forEach(b => b.addEventListener('click', () => {
+    close(); onPick(Number(b.dataset.m));
+  }));
+  box.querySelector('#ad-cancel').addEventListener('click', close);
+  box.querySelector('#ad-x').addEventListener('click', close);
 }
 
 // v3.10: 建物構成サマリ（例: 1K×6戸・平均22㎡）
@@ -5201,17 +5414,26 @@ const FILL_BLOCKED = {
 };
 
 function wireFillButtons(body, p, from) {
+  // v8.4: ADは1〜3ヶ月分から選ぶ。払っても確定はせず、決まるまで毎月効き続ける。
   body.querySelectorAll('.fill-ad').forEach(b => b.addEventListener('click', () => {
-    const r = L.fillVacancy(state, p.id, Number(b.dataset.i), 'ad', Math.random);
-    if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
-    state = r.state; pushLog(r.success ? '広告が効いて入居が決まった！' : '広告を出したが今月は決まらず…');
-    save(); render(); openDetail(p.id, from);
+    const i = Number(b.dataset.i);
+    openAdPicker(p, i, (adMonths) => {
+      const r = L.fillVacancy(state, p.id, i, 'ad', Math.random, { adMonths });
+      if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
+      if (r.reason === 'noCash') { alert(`現金が足りません（必要 ${L.yen(r.cost)}）`); return; }
+      state = r.state;
+      const nm = `${i + 1}号室`;
+      pushLog(r.success
+        ? `${nm} にAD${adMonths}ヶ月分（${L.yen(r.cost)}）を出し、その月のうちに入居が決まった！`
+        : `${nm} にAD${adMonths}ヶ月分（${L.yen(r.cost)}）を出した（今月は決まらず・掲出は継続中）`);
+      save(); render(); openDetail(p.id, from);
+    });
   }));
   body.querySelectorAll('.fill-self').forEach(b => b.addEventListener('click', () => {
-    if (state.actionPower < 30) { alert('行動力が足りません'); return; }
+    if (state.actionPower < L.SELF_FILL_AP) { alert('行動力が足りません'); return; }
     const r = L.fillVacancy(state, p.id, Number(b.dataset.i), 'self', Math.random);
     if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
-    state = r.state; pushLog(r.success ? '自主客付けに成功！（自主管理+10 EXP）' : '内見はあったが決まらず…（自主管理+10 EXP）');
+    state = r.state; pushLog(r.success ? '自主客付けに成功！（自主管理+10 EXP）' : '内見はあったが決まらず…（自主管理+10 EXP・何度でも挑戦できる）');
     save(); render(); openDetail(p.id, from);
   }));
 }
@@ -5223,7 +5445,8 @@ function openPurchase(propId, back) {
   const m = document.getElementById('purchase-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
-  const blocked = p.refusedOffer && !p.staleFlag;   // 指値を断られた物件（満額は常に可）
+  // v8.3: 一度断られた物件は満額も含めて買付できない（売主が態度を固めた状態）。
+  const blocked = !!L.offerBlockedReason(p);
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-2">
     <div class="flex justify-between items-center gap-2">
       ${back ? '<button id="of-back" class="text-xs text-navy">← 戻る</button>' : '<span></span>'}
@@ -5231,9 +5454,14 @@ function openPurchase(propId, back) {
     <div><h2 class="font-bold">${p.name || p.label} に買付を入れる（行動力-10）</h2><div class="text-[11px] text-slate-500">${p.label}</div></div>
     <div class="text-sm">売出価格: ${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}<b>${L.yen(p.price)}</b>${p.origPrice && p.price < p.origPrice ? ' <span class="text-[11px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}${p.staleFlag ? ' <span class="text-[11px] bg-amber-500 text-white rounded px-1">売れ残り中</span>' : ''}</div>
     ${p.sellerUrgency ? `<div class="text-xs"><span class="bg-rose-100 text-rose-700 rounded px-1.5 py-0.5 font-bold">🏃 売り急ぎ</span> <span class="text-slate-600">${p.sellerUrgency.reason}そうだ</span></div>` : ''}
+    ${blocked ? `<div class="rounded-lg bg-red-50 text-red-800 p-2 text-xs space-y-1">
+      <div class="font-bold">🚫 この物件には買付を入れられません</div>
+      <div>一度断られたため、売主が態度を固めています。<b>満額でも受け付けてもらえません。</b></div>
+      <div class="text-red-700">次のどちらかで交渉が再開できます：<br>・売主が<b>値下げ</b>する<br>・<b>6ヶ月以上売れ残る</b>（現在 ${p.listedMonths ?? 0}ヶ月）</div>
+    </div>` : ''}
     <button id="of-detail" class="w-full text-xs text-navy underline">📋 ${term('rentroll', 'レントロール')}・収支・融資の詳細を見る</button>
-    <button id="of-full" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white rounded py-2 text-sm font-bold">満額 ${L.yen(p.price)}（必ず通る）</button>
-    ${L.sashineBuffBonus(state) > 0 ? `<div class="text-[11px] bg-amber-100 text-amber-800 rounded px-2 py-1 font-bold">✨ 耳より情報：この指値だけ成功率 +${Math.round(L.sashineBuffBonus(state) * 100)}pt（使うと消えます）</div>` : ''}
+    <button id="of-full" class="w-full ${blocked ? 'bg-slate-300 text-slate-500' : 'bg-emerald-600 hover:bg-emerald-700 text-white'} rounded py-2 text-sm font-bold" ${blocked ? 'disabled' : ''}>満額 ${L.yen(p.price)}${blocked ? '（受け付けてもらえない）' : '（必ず通る）'}</button>
+    ${(!blocked && L.sashineBuffBonus(state) > 0) ? `<div class="text-[11px] bg-amber-100 text-amber-800 rounded px-2 py-1 font-bold">✨ 耳より情報：この指値だけ成功率 +${Math.round(L.sashineBuffBonus(state) * 100)}pt（使うと消えます）</div>` : ''}
     <div class="pt-1 border-t ${blocked ? 'opacity-50' : ''}">
       <div class="text-sm">${term('sashine', '指値')} <b id="of-cutpct">5%</b>引き → <b id="of-cutprice">${L.yen(Math.round(p.price * 0.95))}</b></div>
       <input id="of-slider" type="range" min="1" max="99" step="1" value="5" class="w-full" ${blocked ? 'disabled' : ''}>
@@ -5243,7 +5471,6 @@ function openPurchase(propId, back) {
         <span id="of-chance" class="font-bold w-12 text-right"></span></div>
       <div id="of-note" class="text-[11px] mt-1"></div>
       <button id="of-submit" class="w-full bg-navy text-white rounded py-2 text-sm font-bold mt-1" ${blocked ? 'disabled' : ''}>この指値で申し込む（行動力-10）</button>
-      ${blocked ? '<div class="text-[11px] text-red-600 mt-1">指値を断られた物件です（値下げか売れ残りのタイミングで再交渉できます）</div>' : ''}
     </div>
     <button id="of-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
   m.appendChild(box);
@@ -5290,13 +5517,18 @@ function openPurchase(propId, back) {
   const doOffer = (cut) => {
     if (state.actionPower < 10) { alert('行動力が足りません'); return; }
     const r = L.makeOffer(state, propId, cut, Math.random);
+    // v8.3: 断られた物件は logic 側で弾かれる。行動力を使う演出に入る前に止める。
+    if (r.blocked) {
+      alert('この物件には買付を入れられません。\n一度断られているため、売主が値下げするか、6ヶ月以上売れ残るまで交渉を再開できません。');
+      close(); return;
+    }
     state = r.state; save();
     // 買付は一番ドキドキするポイント。結果を即出さず「交渉中…」の溜め演出を挟んでから発表する。
     playOfferSuspense(r.accepted, cut, () => {
       if (!r.accepted) {
         pushLog(r.penalized
-          ? `${p.label} への無謀な指値で評判を落とした…（交渉-15 EXP）`
-          : `${p.label} への指値は断られた…（値下げか売れ残りを待てば再指値できる）`);
+          ? `${p.label} への無謀な指値で評判を落とした…（交渉-15 EXP・売主が態度を固めた）`
+          : `${p.label} への指値は断られた…（値下げか6ヶ月の売れ残りまで買付できない）`);
         render(); close();
         if (r.counterProposal) showCounterProposal(r.counterProposal);
         return;
@@ -5528,6 +5760,24 @@ function openSell(propId) {
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   const listing = (state.listings || []).find(l => l.propertyId === propId);
   if (listing) { drawListingManage(m, p, listing, close); return; }
+  // v8.2: 買付を承諾すると掲載は消えるが物件は決済月まで残る。ここで案内しないと
+  // 「まだ売れていない」と誤解して二重に売り出そうとしてしまう。
+  const pending = (state.pendingSales || []).find(x => x.propertyId === propId);
+  if (pending) {
+    const box2 = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3">
+      <div class="flex justify-between items-start gap-2"><h2 class="font-bold">${p.name || p.label} は売却手続き中</h2><button id="sl-x0" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+      <div class="rounded-lg bg-emerald-50 p-3 text-sm space-y-1">
+        <div>✅ 買付を承諾済みです。<b>${L.yen(pending.price)}</b> で成約しました。</div>
+        <div>📅 <b>翌月に決済</b>され、手取りが入金されます。</div>
+      </div>
+      ${netProceedsBox(p, pending.price, true)}
+      <div class="text-xs text-slate-500">決済までは売出価格の変更も再掲載もできません。</div>
+      <button id="sl-ok" class="w-full bg-navy text-white rounded py-2 text-sm font-bold">閉じる</button></div>`);
+    m.appendChild(box2);
+    box2.querySelector('#sl-ok').addEventListener('click', close);
+    box2.querySelector('#sl-x0').addEventListener('click', close);
+    return;
+  }
   const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-md space-y-3">
     <div class="flex justify-between items-start gap-2"><h2 class="font-bold">${p.name || p.label} の売却</h2><button id="sl-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
     <div class="text-sm">まず不動産屋に査定を依頼しよう（行動力-5）</div>
@@ -5546,17 +5796,21 @@ function openSell(propId) {
 
 // v8.1: 「この価格で売ったら手元にいくら残るか」。価格決定と買付承諾の両方で同じ内訳を見せる。
 // 売却価格そのものより、税と残債を引いた手取りの方が判断材料として重要。
-function netProceedsBox(p, price) {
+// hideWait: すでに成約済み（決済待ち）の画面では「待てば増える」を出さない。もう待てないので。
+function netProceedsBox(p, price, hideWait = false) {
   const bd = L.saleBreakdown(state, p, price);
   // 益が出ていなければ税額も0で、待っても手取りは変わらない。カウントダウンはノイズになるので出さない。
   const waitGain = Math.round(bd.gain * (L.CONFIG.capGainTaxShort - L.CONFIG.capGainTaxLong));
-  const toLong = waitGain > 0 ? L.monthsToLongTerm(state, p) : 0;
+  const toLong = (waitGain > 0 && !hideWait) ? L.monthsToLongTerm(state, p) : 0;
   const rateLabel = p.owner === 'corp' ? '🏢法人 一律30%'
     : `👤個人 ${bd.longTerm ? '長期' : '短期'}${Math.round(bd.rate * 100)}%`;
   return `<div class="rounded-lg bg-slate-50 p-2 text-xs space-y-0.5">
     <table class="w-full">
       <tr><td class="text-slate-600">売却価格</td><td class="text-right font-bold">${L.yen(bd.price)}</td></tr>
       <tr><td class="text-slate-600">${term('capital_gains_tax', '譲渡税')}（${rateLabel}）</td><td class="text-right text-red-600">-${L.yen(bd.tax)}</td></tr>
+      <tr><td class="text-slate-600">${term('chukai_tesuryo', '仲介手数料')}（3%＋6万＋税）</td><td class="text-right text-red-600">-${L.yen(bd.costs.broker)}</td></tr>
+      <tr><td class="text-slate-600">${term('inshizei', '印紙税')}</td><td class="text-right text-red-600">-${L.yen(bd.costs.stamp)}</td></tr>
+      ${bd.costs.release ? `<tr><td class="text-slate-600">${term('teitoken_masshou', '抵当権抹消')}</td><td class="text-right text-red-600">-${L.yen(bd.costs.release)}</td></tr>` : ''}
       <tr><td class="text-slate-600">残債の精算</td><td class="text-right text-red-600">${bd.payoff ? `-${L.yen(bd.payoff)}` : '—'}</td></tr>
       <tr class="border-t font-bold"><td>手取り</td><td class="text-right ${bd.net >= 0 ? 'text-emerald-700' : 'text-red-600'}">${L.yen(bd.net)}</td></tr>
     </table>
@@ -5601,7 +5855,15 @@ function drawPricing(m, p, appraisal, close, back) {
   }));
   box.querySelector('#sl-list').addEventListener('click', () => {
     updatePrice();
-    state = L.listForSale(state, p.id, price, appraisal).state;
+    const r = L.listForSale(state, p.id, price, appraisal);
+    // v8.2: 決済待ち・掲載中・未所有は logic 側で弾かれる。理由を出して黙って落とさない。
+    if (!r.listed) {
+      alert({ pendingSale: 'この物件は買付を承諾済みです。翌月の決済を待ってください。',
+        alreadyListed: 'この物件はすでに売り出し中です。',
+        notOwned: 'この物件はもう所有していません。' }[r.reason] || '売りに出せませんでした');
+      close(); return;
+    }
+    state = r.state;
     pushLog(`${p.label} を ${L.yen(price)} で売りに出した（表面${yieldOf(price)}%）`);
     save(); render(); close();
     back?.();   // v3.6: 売りに出したらひとつ前の画面（売却センター等）へ戻る
@@ -6554,6 +6816,8 @@ function openListingsModal() {
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   const rows = state.market.length ? state.market.map(p => {
     const fav = (state.favorites || []).find(f => f.propertyId === p.id);
+    // v8.3: 断られた物件は買付ボタン自体を無効化する。押してから断られるより、押す前に分かる方がよい。
+    const noOffer = !!L.offerBlockedReason(p);
     return `
     <div class="border rounded p-2 text-xs space-y-1">
       <div class="flex justify-between items-start gap-1">
@@ -6564,10 +6828,11 @@ function openListingsModal() {
       <div>${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}${L.yen(p.price)}${p.origPrice && p.price < p.origPrice ? ' <span class="text-[11px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}・表面利回り${(p.grossYield * 100).toFixed(1)}%${p.staleFlag ? '・<span class="text-amber-600">売れ残り中</span>' : ''}${p.sellerUrgency ? '・<span class="text-rose-600 font-bold">🏃売り急ぎ</span>' : ''}</div>
       ${minCashLine(p)}
       ${fav ? `<div class="text-slate-500">お気に入り登録から${state.month - fav.addedMonth}ヶ月</div>` : ''}
+      ${noOffer ? `<div class="bg-red-50 text-red-700 rounded px-2 py-1 text-[11px] font-bold">🚫 買付不可（一度断られた）｜値下げか売れ残り6ヶ月で再開・現在${p.listedMonths ?? 0}ヶ月</div>` : ''}
       <div class="grid grid-cols-3 gap-1">
         <button class="listing-detail border rounded py-1" data-id="${p.id}">📋 詳細</button>
         <button class="listing-locate border rounded py-1" data-id="${p.id}">📍 地図を見る</button>
-        <button class="listing-buy bg-navy text-white rounded py-1" data-id="${p.id}">買付を検討</button>
+        <button class="listing-buy ${noOffer ? 'bg-slate-300 text-slate-500' : 'bg-navy text-white'} rounded py-1" data-id="${p.id}" ${noOffer ? 'disabled' : ''}>${noOffer ? '買付不可' : '買付を検討'}</button>
       </div>
     </div>`;
   }).join('') : '<div class="text-slate-500 text-sm">まだ見つかった物件はありません。営業してみましょう。</div>';
@@ -6985,7 +7250,30 @@ function onNextMonth() {
   // v8: 巻き戻し用のスナップショットは月送りの直前に1世代だけ取る。localStorage には保存しない
   // （セーブが倍に膨らむのを避ける）。リロードで消えるが、お守りとしてはセッション内で足りる。
   rewindSnapshot = (state.rewindLeft > 0) ? L.serialize(state) : null;
-  const r = L.advanceMonth(state, Math.random);
+  // v8.2: ここが例外で止まると state が更新されず、月も進まず行動力も戻らないまま
+  // 「翌月を押しても何も起きない」詰み状態になる（2026-07-26 の不具合がこれ）。
+  // 個別の原因は塞いだが、月送りは1点でも壊れると全体が止まる場所なので、
+  // 二度と黙って詰まないよう保険をかける。原因はコンソールに残す。
+  let r;
+  try {
+    r = L.advanceMonth(state, Math.random);
+  } catch (err) {
+    console.error('advanceMonth に失敗しました', err);
+    // 掲載や決済待ちの不整合が原因なら、掃除して1回だけやり直す
+    try {
+      const repaired = L.migrateSave(state);
+      r = L.advanceMonth(repaired, Math.random);
+      pushLog('⚠️ データの不整合を自動修復して翌月へ進みました');
+    } catch (err2) {
+      console.error('自動修復にも失敗しました', err2);
+      // それでもダメなら、せめて行動力だけは戻して操作不能を避ける
+      state.actionPower = state.baseActionPower;
+      save(); render();
+      alert('翌月の処理でエラーが発生しました。\n行動力は回復させたので操作は続けられます。\n'
+        + '繰り返す場合はお手数ですが状況をお知らせください。');
+      return;
+    }
+  }
   state = r.state;
   (r.logs || []).forEach(pushLog);
   save(); render();
