@@ -92,6 +92,10 @@
   /* v8: 使用不能・管理崩壊のゲージ。数字を読まなくても「止まっている」ことが分かるよう点滅させる。 */
   .lm-blink { animation: lmBlink 1s ease-in-out infinite; }
   @keyframes lmBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  /* v9-A: エリア解放の演出。v8の教訓（オーバーレイ内の<style>に閉じると要素を消したとき
+     定義ごと消える）に従い、キーフレームはここに常設する。 */
+  @keyframes rgUnlock { 0% { transform: scale(0.4); opacity: 0; } 25% { transform: scale(1.12); opacity: 1; }
+    70% { transform: scale(1); opacity: 1; } 100% { transform: scale(1.02); opacity: 0; } }
 
   /* v8: 初心者モードの危険域バナー。地図の上に重ねるので、地図操作は透過させる。 */
   #danger-banner {
@@ -146,6 +150,11 @@
       <button id="btn-reset" class="text-xs underline">リセット</button>
     </div>
   </header>
+
+  <!-- v9-A: エリアピル。世界のどこを見るかを切り替える唯一の常設UI。
+       地図の上に浮かせると左右パネル（PC）や上部情報バー（スマホ）と当たるため、
+       ヘッダーの直下に独立した帯として置く。解放前は🔒付きで、押すと解放条件が出る。 -->
+  <div id="region-pills" class="bg-navy/95 text-white px-2 pb-1.5 shrink-0 z-10 hidden overflow-x-auto whitespace-nowrap"></div>
 
   <!-- 初期設定モーダル -->
   <div id="setup-modal" class="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-30"></div>
@@ -277,8 +286,11 @@ export function applicableRate(creditScore, negotiationLevel) {
 export function canFinance(creditScore, dscrValue) {
   return creditScore >= CONFIG.minCreditToFinance && dscrValue >= CONFIG.minDscr;
 }
-export function requiredCash({ price, ltv, useLoan }) {
-  const closing = price * CONFIG.closingCostRate;
+// v8.5: 諸費用は項目ごとの実額（purchaseCosts）で出す。property を渡さない古い呼び出しでも
+// 建物割合0.5の標準的な物件として計算できるようにしてある。
+export function requiredCash({ price, ltv, useLoan, property = null }) {
+  const loanAmount = useLoan ? Math.round(price * ltv) : 0;
+  const closing = closingCostOf(property, price, loanAmount);
   return useLoan ? price * (1 - ltv) + closing : price + closing;
 }
 
@@ -401,6 +413,42 @@ export function creditPenalty(state) {
 }
 export function effectiveCredit(state) {
   return Math.max(0, (state.creditScore ?? 0) - creditPenalty(state));
+}
+
+// === v8.7: 資産背景と自己資金の厚みを審査に反映する ===
+// v8.6までの審査は「本人属性（信用度）が銀行の最低値を超えているか」の一発判定で、
+// 現金・純資産・頭金比率が一切考慮されなかった。そのため自営業（信用度10）は
+// **現金1億を持っていても全4行が否決**され、「自己資金を入れれば借りられる」が成立しない。
+// 現金300万のサラリーマンのほうが借りられる、という現実と逆の状態になっていた。
+//
+// 実際の銀行は ①本人属性 ②資産背景 ③その案件の自己資金の厚み の3つを見る。
+// ②③を加点として足すことで、「属性が弱くても資産と頭金でカバーできる」を成立させる。
+// なお金利（bankRate）には効かせない。**通るかどうか**は資産で動かせるが、
+// **いくらで借りられるか**は本人属性と取引実績で決まる、という線引きにしてある。
+export const ASSET_BACKING_MAX = 25;
+export const DOWN_PAYMENT_BONUS_MAX = 25;
+export const DOWN_BONUS_START = 0.20;   // 頭金がこれを超えたぶんだけ加点する
+export const DOWN_BONUS_FULL = 0.80;    // ここで加点が上限に達する
+
+// 資産背景。純資産の規模を対数で効かせる（1000万で+12・1億で+24・3億以上で上限）。
+export function assetBackingBonus(state) {
+  const nw = netWorth(state);
+  if (nw <= 0) return 0;
+  return Math.min(ASSET_BACKING_MAX, Math.round(Math.log10(Math.max(1, nw / 1_000_000)) * 12));
+}
+
+// その案件に入れる自己資金の厚み。頭金20%で0、80%以上で上限。
+export function downPaymentBonus(downRatio) {
+  const r = (downRatio - DOWN_BONUS_START) / (DOWN_BONUS_FULL - DOWN_BONUS_START);
+  return Math.max(0, Math.min(DOWN_PAYMENT_BONUS_MAX, Math.round(r * DOWN_PAYMENT_BONUS_MAX)));
+}
+
+// 審査で使う実効信用度。内訳も返して、UIで「なぜ通った／通らなかった」を見せられるようにする。
+export function creditForReview(state, downRatio = 0) {
+  const base = effectiveCredit(state);
+  const asset = assetBackingBonus(state);
+  const down = downPaymentBonus(downRatio);
+  return { base, asset, down, total: base + asset + down, penalty: creditPenalty(state) };
 }
 
 // 躯体0＝使用不能。全戸退去のうえ募集を止め、大規模修繕を終えるまで家賃がゼロになる。
@@ -531,7 +579,8 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
   const isKubun = genreKey === 'kubun' || genreKey === 'w_kubun';
   const id = __pid();
   const p = {
-    id, genreKey, areaKey, name: propertyName(genreKey, builtAge, id), label: `${g.label}（${a.label}）`,
+    id, genreKey, areaKey, region: opts.region || 'main',   // v9-A: どの陸地にあるか
+    name: propertyName(genreKey, builtAge, id), label: `${g.label}（${a.label}）`,
     builtAge, structure: g.structure, units, layout,
     price, askingPrice: price, origPrice: price, timeValue: Math.round(price * lr(0.95, 1.15)),
     grossYield,
@@ -664,7 +713,10 @@ export function buyPropertyV2(state, propertyId, { method, downRatio = 0, price,
   // v3.5: 名義。法人名義は法人設立済みの場合のみ有効（それ以外は個人）
   p.owner = (owner === 'corp' && s.isIncorporated) ? 'corp' : 'personal';
   const logs = [];
-  const closing = Math.round(price * CONFIG.closingCostRate);
+  // v8.5: 諸費用は項目ごとの実額。融資を使うと抵当権設定登記と融資事務手数料が上乗せされる。
+  const loanAmount = method === 'cash' ? 0 : Math.round(price * (1 - downRatio));
+  const closing = closingCostOf(p, price, loanAmount);
+  p.acquisitionCost = closing;   // 自己資金回収率の計算に使うので実額を残す
   if (method === 'cash') {
     s.cash -= price + closing;
     p.loan = null;
@@ -857,6 +909,48 @@ export function mortgageReleaseFee(property) {
   return hasLoan ? MORTGAGE_RELEASE_FEE : 0;
 }
 
+// === v8.5: 購入時の諸費用 ===
+// v8.4までは「価格の7%」という一本の数字だけで、内訳が見えなかった。
+// 売却側を実在の計算式で出したのに購入側がどんぶり勘定では釣り合わないので、こちらも項目に分ける。
+// 登録免許税と不動産取得税は「固定資産税評価額」が課税標準なので、売買価格の6割を評価額の目安とする。
+export const ASSESSED_VALUE_RATE = 0.60;      // 固定資産税評価額 ÷ 売買価格 の目安
+export const REG_TAX_LAND = 0.015;            // 登録免許税（所有権移転・土地）
+export const REG_TAX_BLDG = 0.020;            // 登録免許税（所有権移転・建物）
+export const REG_TAX_MORTGAGE = 0.004;        // 登録免許税（抵当権設定・借入額に対して）
+export const ACQUISITION_TAX_RATE = 0.03;     // 不動産取得税（評価額に対して）
+// 司法書士報酬・融資事務手数料は実際も物件規模でスライドする。定額にすると
+// 300万円の戸建てで諸費用が15%を超えてしまい、安い物件を買う戦略が成立しなくなる。
+export function scrivenerFee(price) {
+  return Math.round(Math.min(100_000, Math.max(50_000, price * 0.004)) / 1000) * 1000;
+}
+export function loanArrangementFee(loanAmount) {
+  if (loanAmount <= 0) return 0;
+  return Math.round(Math.min(110_000, Math.max(33_000, loanAmount * 0.022)) / 1000) * 1000;
+}
+
+export function assessedValue(price) { return Math.round(price * ASSESSED_VALUE_RATE); }
+
+// 買主が負担する諸費用の内訳。loanAmount が0なら抵当権設定と融資事務手数料はかからない
+//（現金購入のほうが諸費用も安い、という当たり前の差が出る）。
+export function purchaseCosts(property, price, loanAmount = 0) {
+  const assessed = assessedValue(price);
+  const bldgRatio = property?.bldgRatio ?? 0.5;
+  const broker = brokerFee(price);
+  const stamp = stampDuty(price);
+  const regTransfer = Math.round(assessed * (1 - bldgRatio) * REG_TAX_LAND
+                               + assessed * bldgRatio * REG_TAX_BLDG);
+  const acquisition = Math.round(assessed * ACQUISITION_TAX_RATE);
+  const scrivener = scrivenerFee(price);
+  const regMortgage = loanAmount > 0 ? Math.round(loanAmount * REG_TAX_MORTGAGE) : 0;
+  const loanFee = loanArrangementFee(loanAmount);
+  return { broker, stamp, regTransfer, acquisition, scrivener, regMortgage, loanFee,
+    total: broker + stamp + regTransfer + acquisition + scrivener + regMortgage + loanFee };
+}
+// 購入諸費用の合計だけが欲しい場面（必要現金の計算など）で使う薄いラッパ。
+export function closingCostOf(property, price, loanAmount = 0) {
+  return purchaseCosts(property, price, loanAmount).total;
+}
+
 // 売主が負担する諸費用の内訳。
 export function saleCosts(property, price) {
   const broker = brokerFee(price);
@@ -939,9 +1033,44 @@ export function monthlyVacancyRoll(property, rng = Math.random) {
 
 // v6: 自然客付け率。基準20%を手入れの状態で ±5pt 動かす（手入れ100%で25%・0%で15%）。
 // v8: 使用不能（躯体0）と管理崩壊（手入れ0）では、そもそも募集が成立しないのでゼロにする。
-export function naturalFillChance(property) {
+// === v8.6: 物件の魅力度 ===
+// v8.5までは客付け率に効くのが「手入れ」だけで、しかも 15%〜25% の幅しかなかった。
+// どれだけ物件を良くしても月25%が上限＝平均4ヶ月かかるため、ADが実質必須になっていた。
+// バリューアップも躯体も築年数も客付けには無関係で、「良い物件にする」努力が報われない。
+// 魅力度を作って客付け率の主軸に据え、8%〜63% の幅を持たせる。
+// これで「ADを買う」か「物件を良くする」かが本当の選択になる。
+export const APPEAL_WEIGHTS = { care: 30, valueUp: 30, struct: 15, age: 15, layout: 10 };
+export const APPEAL_AGE_LIMIT = 35;    // 築35年で築年スコア0
+export const APPEAL_SQM_MIN = 20;      // 20㎡以下は広さスコア0
+export const APPEAL_SQM_MAX = 45;      // 45㎡以上で満点
+export const FILL_BASE = 0.08;         // 魅力度0でも最低これだけは決まる
+export const FILL_APPEAL_SPAN = 0.55;  // 魅力度100で +55pt → 合計63%
+
+// 内訳。UIで「どこを伸ばせるか」を見せるために配点ごとに返す。
+export function appealBreakdown(property, unit = null) {
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const care = clamp01((property.careState ?? 100) / 100);
+  const struct = clamp01((property.repairState ?? 100) / 100);
+  const vLv = Math.min(VALUE_UP_MAX_LEVEL, property.valueUpLevel || 0);
+  const age = clamp01((APPEAL_AGE_LIMIT - (property.builtAge ?? 0)) / APPEAL_AGE_LIMIT);
+  const sqm = unit?.sizeSqm ?? 30;
+  const layout = clamp01((sqm - APPEAL_SQM_MIN) / (APPEAL_SQM_MAX - APPEAL_SQM_MIN));
+  return {
+    care:    Math.round(APPEAL_WEIGHTS.care * care),
+    valueUp: Math.round(APPEAL_WEIGHTS.valueUp * vLv / VALUE_UP_MAX_LEVEL),
+    struct:  Math.round(APPEAL_WEIGHTS.struct * struct),
+    age:     Math.round(APPEAL_WEIGHTS.age * age),
+    layout:  Math.round(APPEAL_WEIGHTS.layout * layout),
+  };
+}
+export function appealScore(property, unit = null) {
+  const b = appealBreakdown(property, unit);
+  return b.care + b.valueUp + b.struct + b.age + b.layout;
+}
+
+export function naturalFillChance(property, unit = null) {
   if (isCondemned(property) || careBandOf(property) === 'dead') return 0;
-  return 0.15 + 0.10 * Math.max(0, Math.min(100, property.careState ?? 100)) / 100;
+  return FILL_BASE + FILL_APPEAL_SPAN * appealScore(property, unit) / 100;
 }
 
 // === v8.4: 広告料（AD）===
@@ -968,32 +1097,47 @@ export function adBonusOf(unit) {
   const plan = unit?.ad ? AD_PLANS[unit.ad.months] : null;
   return plan ? plan.bonus : 0;
 }
-// 部屋ごとの最終的な客付け率。物件の手入れ＋ADの上乗せ＋難易度の下駄。
+// 部屋ごとの最終的な客付け率。物件の魅力度＋ADの上乗せ＋難易度の下駄。
 export function unitFillChance(property, unit, bonus = 0) {
-  const base = naturalFillChance(property);
+  const base = naturalFillChance(property, unit);
   if (base <= 0) return 0;                // 使用不能・管理崩壊では何をしても決まらない
   return Math.min(AD_MAX_CHANCE, base + adBonusOf(unit) + bonus);
 }
 
 // 入居が決まったときの後始末。ADは役目を終えるのでここで外す。
-function moveIn(unit) {
+// v8.6: ADを使わずに決まった回数を数える。「物件の力だけで決めた」を評価するため。
+function moveIn(unit, state = null) {
+  const withoutAd = !unit.ad;
   unit.occupied = true; unit.vacantMonths = 0; unit.tenantMonths = 0;
   unit.ad = null;
+  unit.vacancyAlerted = false;
+  if (state && withoutAd) {
+    state.stats = state.stats || {};
+    state.stats.adFreeFills = (state.stats.adFreeFills || 0) + 1;
+  }
+  return withoutAd;
 }
 
+// v8.6: 空室が長引いたときに「なぜ決まらないのか」を教える閾値。
+export const LONG_VACANCY_MONTHS = 3;
+export const APPEAL_ALERT_SCORE = 55;   // これ未満なら魅力度が原因だと判断する
+
 // v8: bonus は難易度による下駄（初心者+10pt）。募集そのものが止まっている物件には効かせない。
-export function naturalFillRoll(property, rng = Math.random, bonus = 0) {
-  let filled = 0;
+// state を渡すと「ADなしで決まった回数」を stats に積む（実績バッジ用）。
+export function naturalFillRoll(property, rng = Math.random, bonus = 0, state = null) {
+  let filled = 0, adFree = 0;
   property.units.forEach(u => {
     if (!u.occupied) {
       if (u.needsRestore) { u.vacantMonths += 1; return; }   // v4: 原状回復前は埋まらない
-      // v6: 手入れが行き届いた物件ほど自然に埋まる（草ぼうぼうの物件は内見で決まらない）
+      // v8.6: 魅力度（手入れ・バリューアップ・躯体・築年・広さ）で決まりやすさが変わる
       // v8.4: ADを出している部屋はここに上乗せが乗る（決まるまで毎月効く）
-      if (rng() < unitFillChance(property, u, bonus)) { moveIn(u); filled += 1; }
-      else u.vacantMonths += 1;
+      if (rng() < unitFillChance(property, u, bonus)) {
+        if (moveIn(u, state)) adFree += 1;
+        filled += 1;
+      } else u.vacantMonths += 1;
     }
   });
-  return { property, filled };
+  return { property, filled, adFree };
 }
 
 // method: 'ad'（広告料を出す・adMonths で 1〜3 を指定）／'self'（自主客付け・行動力を使う）
@@ -1028,7 +1172,7 @@ export function fillVacancy(state, propertyId, unitIndex, method, rng = Math.ran
       unitFillChance(p, u) + SELF_FILL_BASE + (lv - 1) * SELF_FILL_PER_LV);
   }
   const success = rng() < chance;
-  if (success) moveIn(u);
+  if (success) moveIn(u, s);
   return { state: s, success, chance, cost, method };
 }
 
@@ -1276,7 +1420,7 @@ export function setAutoManage(state, propertyId, on) {
 // 実施方法（DIY / 業者）も選ぶ REPAIR_KINDS + startRepair に置き換えた。
 
 export function totalDebt(state) {
-  return Math.round(state.properties.reduce((t, p) => t
+  return Math.round((state.properties || []).reduce((t, p) => t
     + (p.loan ? remainingPrincipal(p.loan.principal, p.loan.rate, p.loan.years, p.loan.monthsPaid) : 0)
     + reformLoansRemaining(p), 0));
 }
@@ -1403,9 +1547,15 @@ export function applyValueUp(p, rentMult) {
 
 // v8: 資産額は marketValueOf（躯体の傷みぶんを割り引いた時価）で数える。
 // 放置すれば純資産が目に見えて減り、直せば戻る——ゲージが財務に直結する。
-export function totalAssetsV2(state) { return state.cash + state.properties.reduce((t, p) => t + marketValueOf(p), 0); }
+// v8.7: properties が未初期化の state から呼ばれても落ちないようにする。
+// 審査（reviewLoan）が資産背景を見るようになり、これらが呼ばれる経路が一気に増えたため。
+export function totalAssetsV2(state) {
+  return (state.cash ?? 0) + (state.properties || []).reduce((t, p) => t + marketValueOf(p), 0);
+}
 export function netWorth(state) { return Math.round(totalAssetsV2(state) - totalDebt(state)); }
-export function monthlyCF(state) { return state.properties.reduce((t, p) => t + (p.history.at(-1)?.cf ?? 0), 0); }
+export function monthlyCF(state) {
+  return (state.properties || []).reduce((t, p) => t + (p.history?.at(-1)?.cf ?? 0), 0);
+}
 export function isClearedV2(state) {
   const g = state.goal;
   return g.type === 'networth' ? netWorth(state) >= g.amount : monthlyCF(state) >= g.amount;
@@ -1957,10 +2107,12 @@ export function createInitialState({ attr, goalType, goalAmount, goalYears, seed
     log: ['ゲーム開始。まずは営業で物件を探そう。'],
     stats: { buys: 0, sales: 0, profitSales: 0, junkFlips: 0, hadLoan: false, junkRepairs: 0, maxMonthlyCF: 0 },
     badges: [],
-    favorites: [], notifications: [], nextNotifId: 1,
+    favorites: [], notifications: [], nextNotifId: 1, notifSettings: defaultNotifSettings(),
     isIncorporated: false,
     salesSearch: { spent: 0, threshold: null },
     nextPropertyId: 1,
+    unlockedRegions: ['main'],   // v9-A: 解放済みの陸地。開発区・競売区・海外は条件を満たすと増える
+
     learnedTerms: [],   // v8: 用語クイズで正解した用語キー（用語集の習得マーク用）
     buffs: [],          // v8: 一時的な有利効果（現状は「耳より情報」＝次の指値+10pt のみ）
     rewindLeft: d.rewind,   // v8: 初心者モードのお守り。先月へ戻せる残り回数
@@ -2036,6 +2188,35 @@ export function removeFavorite(state, propertyId) {
   return { state: s };
 }
 
+// v8.8: 通知の種類ごとの表示設定。persist=消えるまで残るトースト／temp=数秒で自動的に消えるトースト／
+// off=トーストを出さない（🔔通知一覧には種類によらず必ず残る。消えるのはポップアップだけ）。
+// 既定値は「事故につながる・物件が消える前触れ」を持続、「知れたら十分」を一時にしている。
+export const NOTIF_KIND_INFO = {
+  condemned:          { label: '🛑 建物が使用不能になった', defaultMode: 'persist' },
+  band_danger:        { label: '🏚 危険水準（躯体・手入れ）', defaultMode: 'persist' },
+  auto_manage_nocash: { label: '💸 おまかせ管理が資金不足で止まった', defaultMode: 'persist' },
+  long_vacancy:       { label: '🏚 長期空室', defaultMode: 'persist' },
+  price_cut:          { label: '💰 お気に入りの値下げ', defaultMode: 'persist' },
+  sold_out:           { label: '🏃 お気に入りの他決', defaultMode: 'persist' },
+  band_warn:          { label: '⚠️ 注意水準（躯体・手入れ）', defaultMode: 'temp' },
+  repair_done:        { label: '🔨 修繕完了', defaultMode: 'temp' },
+  valueup_done:       { label: '✨ バリューアップ完了', defaultMode: 'temp' },
+  region_unlocked:    { label: '🌏 新エリア解放', defaultMode: 'temp' },
+};
+export function defaultNotifSettings() {
+  const o = {};
+  for (const k in NOTIF_KIND_INFO) o[k] = NOTIF_KIND_INFO[k].defaultMode;
+  return o;
+}
+export function notifModeOf(state, kind) {
+  return (state.notifSettings && state.notifSettings[kind]) || NOTIF_KIND_INFO[kind]?.defaultMode || 'persist';
+}
+export function setNotifMode(state, kind, mode) {
+  const s = structuredClone(state);
+  s.notifSettings = { ...defaultNotifSettings(), ...(s.notifSettings || {}), [kind]: mode };
+  return { state: s };
+}
+
 export function markNotificationsRead(state) {
   const s = structuredClone(state);
   s.notifications = (s.notifications || []).map(n => ({ ...n, read: true }));
@@ -2061,7 +2242,11 @@ export const BADGES = {
   skill_master: { icon: '⭐', label: 'スキルLv5到達' },
   debt_free: { icon: '🎉', label: '借入完済' },
   goal_clear: { icon: '🏆', label: '目標達成' },
+  // v8.6: 「ADを出さない」という選択に報酬をつける。物件を良くする動機づけの一部。
+  ad_free: { icon: '✨', label: '広告いらず（AD無しで5戸成約）' },
+  appeal_master: { icon: '🌟', label: '魅力度100の部屋をつくった' },
 };
+export const AD_FREE_BADGE_COUNT = 5;
 
 export function evaluateBadges(state) {
   const stats = state.stats || {};
@@ -2076,6 +2261,9 @@ export function evaluateBadges(state) {
   if (['appraisal', 'negotiation', 'selfmgmt'].some(k => skillLevel(state.skills[k].exp) >= 5)) ids.push('skill_master');
   if (state.properties.length > 0 && totalDebt(state) === 0) ids.push('debt_free');
   if (isClearedV2(state)) ids.push('goal_clear');
+  // v8.6: ADに頼らず決めた実績と、魅力度を振り切った部屋
+  if ((stats.adFreeFills || 0) >= AD_FREE_BADGE_COUNT) ids.push('ad_free');
+  if (state.properties.some(p => p.units.some(u => appealScore(p, u) >= 100))) ids.push('appeal_master');
   return ids;
 }
 
@@ -2198,6 +2386,153 @@ const CARE_CLAIMS = [
   '自転車置き場が溢れている', '掲示板が破れて情報が読めない', '階段の手すりがぐらつく',
 ];
 
+// ===== v9-A: エリア（陸地）と解放条件 =====
+// 地図の陸地はここで定義し、city.mjs は描画のためにこれを読むだけにする。
+// 判定を logic 側の純関数に置くのは、描画（テストしにくい）と条件（テストしたい）を分けるため。
+//
+// ready = そのエリアの中身（物件生成・購入フロー）が実装済みか。A段階では main 以外すべて false で、
+// 条件を満たしても開通しない。中身が入った版で true にするだけで開通する。
+// 「解放されたのに何も無い」という体験を避けつつ、判定と演出を先に作っておくための仕掛け。
+//
+// 座標と半径はユーザーがサンプル（world-sample）で確定した値。単位はラジアン。
+const safeNet = (s) => netWorth({ ...s, properties: s.properties || [] });
+
+// 2026-07-26: 3エリアを正式名称にリネーム（構想メモ[[12_v9構想メモ_新築と未開拓エリア]]の呼称に統一）。
+// 「gate」は入場資格のバッジ文言。中身（新築/競売/海外の実際のプレイ内容）は本書の時点では未着手・
+// 保留中で、ready:false のあいだは解放条件も画面には出さない（ui.mjs 側でモザイク表示にする）。
+export const REGIONS = {
+  main: {
+    key: 'main', label: '本土', icon: '🏙️', ready: true, unlock: null,
+    lat: -0.05, lon: 0, radius: 1.15,
+    desc: '君が大家を始めた土地。中心は都心、外へ行くほど地方になる。',
+  },
+  newbuild: {
+    key: 'newbuild', label: '新築開発エリア', icon: '🏗️', ready: false,
+    gate: '入場条件：土地建築プレイヤー限定',
+    lat: 0.05, lon: 1.81, radius: 0.6, roadTo: 'main',
+    desc: '土地の取得から設計プランニングまで、理想の収益物件をゼロからプロデュースできる開発特区です。',
+    unlock: { mode: 'or', conds: [
+      { key: 'props',    label: '所有物件', need: 3,           fmt: 'count', cur: s => (s.properties || []).length },
+      { key: 'networth', label: '純資産',   need: 30_000_000,  fmt: 'yen',   cur: s => safeNet(s) },
+    ] },
+  },
+  auction: {
+    key: 'auction', label: '競売物件エリア', icon: '⚖️', ready: false,
+    gate: '入場条件：競売プレイヤー限定',
+    lat: 0.05, lon: -1.81, radius: 0.6, roadTo: 'main',
+    desc: '市場価格以下の物件を入札で競り落とし、価値を再構築して高利回りを狙えるエリアです。',
+    unlock: { mode: 'and', conds: [
+      { key: 'junk', label: '訳あり物件の再生', need: 3, fmt: 'count', cur: s => s.stats?.junkRepairs ?? 0 },
+    ] },
+  },
+  overseas: {
+    key: 'overseas', label: '海外投資エリア', icon: '🌏', ready: false, island: true,
+    gate: '入場条件：グローバル投資家限定',
+    lat: 1.18, lon: 3.14, radius: 0.35,
+    desc: '国境を越えた物件購入から通貨の活用まで、グローバルな市場で巨額の資産を動かせるワールド特区です。',
+    unlock: { mode: 'and', conds: [
+      { key: 'corp',     label: '法人の設立', need: 1,            fmt: 'bool', cur: s => (s.isIncorporated ? 1 : 0) },
+      { key: 'networth', label: '純資産',     need: 100_000_000,  fmt: 'yen',  cur: s => safeNet(s) },
+    ] },
+  },
+};
+
+// 見た目のパラメータ（すべて world-sample でユーザーが実際に動かして確定した値）。
+export const SEA_GAP = 0.05;     // 陸と陸のあいだに最低限あける海（角距離）
+export const ROAD_W = 0.09;      // 街道の太さの基準（球の半径Rに対する比）
+export const ZOOM_MIN = 0.66;    // ズーム下限（陸地が増えたので現行0.70から下げる）
+export const LAND_FILL = 2.05;   // 陸地の埋まり具合（海岸線ブロブの本数の倍率）
+export const BLD_RANGE = 0.84;   // 建物を置く範囲（陸地半径に対する比）
+export const ROAD_CURVE = 0.52;  // 街道の蛇行の強さ（0＝直線）
+export const CAPES = 12;         // 岬の数（外へ突き出す地形。入り江は廃止— 海の色で抜くと池にしか見えなかった）
+export const CAPE_SIZE = 1.6;    // 岬1本ごとの長さ・付け根の太さの倍率
+export const ROAD_CLEAR = 0.055; // この幅より街道に近い場所には建物・山を置かない
+export const LAKES = 1;          // 内陸の池の数
+export const HILLS = 15;         // 山（地形記号）の数
+
+// 球面上の角距離。cos(d) = sin φ1 sin φ2 + cos φ1 cos φ2 cos(Δλ)
+export function regionAngularDistance(a, b) {
+  return Math.acos(Math.max(-1, Math.min(1,
+    Math.sin(a.lat) * Math.sin(b.lat) + Math.cos(a.lat) * Math.cos(b.lat) * Math.cos(a.lon - b.lon))));
+}
+
+// 陸地どうしが重なっていないかを全ペアで検算する。
+// v5で未開拓エリアの1つが大陸の内側に入り、黒い影が「焦げ跡」に見えた事故があった。
+// あれは目視でしか気づけなかったので、陸地が4つに増える今回はコードで検算する。
+export function regionOverlaps() {
+  const ms = Object.values(REGIONS), bad = [];
+  for (let i = 0; i < ms.length; i++) for (let j = i + 1; j < ms.length; j++) {
+    const d = regionAngularDistance(ms[i], ms[j]), need = ms[i].radius + ms[j].radius + SEA_GAP;
+    if (d <= need) bad.push({ a: ms[i].key, b: ms[j].key, dist: +d.toFixed(3), need: +need.toFixed(3) });
+  }
+  return bad;
+}
+{
+  const bad = regionOverlaps();
+  if (bad.length && typeof console !== 'undefined') console.warn('[v9] 陸地が重なっています', bad);
+}
+
+export function isRegionUnlocked(state, key) {
+  if (key === 'main') return true;   // 本土は unlockedRegions に無くても常に開いている
+  return (state.unlockedRegions || ['main']).includes(key);
+}
+
+// UIの進捗バーはこの戻り値だけで描ける（条件のロジックをUI側に書かないため）。
+export function regionUnlockProgress(state, key) {
+  const r = REGIONS[key];
+  if (!r) return null;
+  if (!r.unlock) return { key, ready: true, unlocked: true, met: true, mode: 'and', conditions: [] };
+  const conditions = r.unlock.conds.map(c => {
+    const cur = c.cur(state);
+    return { key: c.key, label: c.label, cur, need: c.need, fmt: c.fmt, met: cur >= c.need };
+  });
+  const met = r.unlock.mode === 'or' ? conditions.some(c => c.met) : conditions.every(c => c.met);
+  return { key, ready: r.ready, unlocked: isRegionUnlocked(state, key), met, mode: r.unlock.mode, conditions };
+}
+
+// 新たに条件を満たし、かつ中身が実装済み（ready）なエリアのキーを返す。state は書き換えない。
+export function checkRegionUnlocks(state) {
+  return Object.keys(REGIONS).filter(k => {
+    const r = REGIONS[k];
+    if (!r.unlock || !r.ready) return false;
+    if (isRegionUnlocked(state, k)) return false;
+    return regionUnlockProgress(state, k).met;
+  });
+}
+
+// 一度解放したエリアは、条件を下回っても閉じない。閉じると理不尽なうえ、
+// そのエリアに持っている物件が宙に浮く。配列に入れたら消さない。
+export function unlockRegion(state, key) {
+  if (!REGIONS[key] || key === 'main') return false;
+  state.unlockedRegions = state.unlockedRegions || ['main'];
+  if (state.unlockedRegions.includes(key)) return false;
+  state.unlockedRegions.push(key);
+  return true;
+}
+
+// v8.6: 空室が3ヶ月を超えたら、その原因と打ち手を通知で教える。
+// 「決まらない」だけ見せても何をすればいいか分からない。魅力度の一番低い項目を名指しする。
+function notifyLongVacancy(s, p) {
+  p.units.forEach((u, i) => {
+    if (u.occupied || u.needsRestore) { u.vacancyAlerted = false; return; }
+    if (u.vacantMonths < LONG_VACANCY_MONTHS || u.vacancyAlerted) return;
+    const score = appealScore(p, u);
+    if (score >= APPEAL_ALERT_SCORE) return;   // 魅力は十分。運が悪いだけなので黙っておく
+    u.vacancyAlerted = true;
+    const b = appealBreakdown(p, u);
+    // 満点との差が大きい＝伸びしろが大きい項目を勧める（築年・広さは直せないので除く）
+    const fixable = [
+      { key: 'care', gap: APPEAL_WEIGHTS.care - b.care, hint: '日常メンテで手入れを100%に戻す' },
+      { key: 'valueUp', gap: APPEAL_WEIGHTS.valueUp - b.valueUp, hint: '✨価値UPで設備・内装を新しくする' },
+      { key: 'struct', gap: APPEAL_WEIGHTS.struct - b.struct, hint: '大規模修繕で躯体を直す' },
+    ].sort((x, y) => y.gap - x.gap)[0];
+    const nm = p.name || p.label;
+    pushNotification(s, 'long_vacancy', p.id, nm,
+      `${nm} ${i + 1}号室が${u.vacantMonths}ヶ月空室です。物件の魅力が足りていません（${score}/100）。`
+      + `${fixable.gap > 0 ? `いちばん効くのは「${fixable.hint}」です。` : ''}ADを出すより、直したほうが家賃も資産価値も上がります。`);
+  });
+}
+
 export function advanceMonth(state, rng = Math.random) {
   let s = structuredClone(state);
   const logs = [];
@@ -2224,7 +2559,11 @@ export function advanceMonth(state, rng = Math.random) {
     p.careState = Math.max(0, (p.careState ?? 100) - CARE_DECAY_PER_MONTH * diff.decayMult);
     monthlyVacancyRoll(p, rng);
     applyDangerBandPenalties(s, p, logs, rng);   // v8: 危険域のペナルティは客付け判定より先に効かせる
-    naturalFillRoll(p, rng, diff.fillBonus);
+    const fillRes = naturalFillRoll(p, rng, diff.fillBonus, s);
+    if (fillRes.adFree > 0) {
+      logs.push(`${p.name || p.label} で${fillRes.adFree}戸が決まった（AD無し・物件の力で決まった！）`);
+    }
+    notifyLongVacancy(s, p);   // v8.6: 長引く空室の原因を教える
     const pl = propertyMonthlyPL(p);
     s.cash += pl.cf;
     if (p.loan) {
@@ -2329,8 +2668,18 @@ export function advanceMonth(state, rng = Math.random) {
       recordEventFired(s, ev.id, targetId, unitIndex);   // 同じ部屋・同じ物件で当分は繰り返さない
     }
   }
+  // v9-A: エリアの解放。ready=false のあいだは checkRegionUnlocks が常に空を返すので、
+  // ここは中身（新築・競売・海外）が実装されるまで眠っている。
+  const newlyUnlocked = checkRegionUnlocks(s);
+  for (const key of newlyUnlocked) {
+    unlockRegion(s, key);
+    const r = REGIONS[key];
+    pushNotification(s, 'region_unlocked', null, `${r.icon} ${r.label}`,
+      `${r.icon} ${r.label} が解放された。${r.desc}`);
+    logs.push(`${r.icon} ${r.label} が解放された`);
+  }
   s.actionPower = s.baseActionPower;
-  return { state: s, logs, pendingEvent };
+  return { state: s, logs, pendingEvent, newlyUnlocked };
 }
 
 export function serialize(state) { return JSON.stringify(state); }
@@ -2345,6 +2694,10 @@ export function migrateSave(state) {
   if (s.rewindLeft === undefined) s.rewindLeft = difficultyOf(s).rewind;
   if (!Array.isArray(s.learnedTerms)) s.learnedTerms = [];
   if (!Array.isArray(s.buffs)) s.buffs = [];
+  // v9-A: 陸地。旧セーブは本土だけが開いていて、物件はすべて本土にある。
+  if (!Array.isArray(s.unlockedRegions) || !s.unlockedRegions.length) s.unlockedRegions = ['main'];
+  // v8.8: 通知の表示設定。無い分（旧セーブ・将来追加した種類）は既定値で埋める。ユーザーが選んだ値は保持する。
+  s.notifSettings = { ...defaultNotifSettings(), ...(s.notifSettings || {}) };
   // v8.2: すでに壊れているセーブを読み込み時に直す。
   // このバグに当たった人は「翌月が押せない」状態でセーブが残っているので、
   // 読み込むだけで復帰できるようにしておく（作り直しを強いない）。
@@ -2355,6 +2708,7 @@ export function migrateSave(state) {
     // リフォームローンの単数→配列
     if (!Array.isArray(p.reformLoans)) p.reformLoans = p.reformLoan ? [p.reformLoan] : [];
     delete p.reformLoan;
+    if (p.region === undefined) p.region = 'main';   // v9-A: 旧セーブの物件はすべて本土
     // v6: 修繕度の2ゲージ化。旧セーブは1本しか持たないので、手入れは躯体と同じ値から始める。
     if (p.careState === undefined) p.careState = p.repairState;
     if (p.autoManage === undefined) p.autoManage = false;
@@ -2411,11 +2765,16 @@ export function svgBuildingParts(property) {
   return { shape, dirtLevel, hasCracks, hasWeeds, tilt, wake };
 }
 
+// v8.7: minLoan（最低融資額）を追加。頭金を入れすぎると借入が数十万円になり、
+// 銀行がそんな少額を扱うのは非現実的だった（頭金95%で借入115万が4行とも承認されていた）。
+// 「自己資金を入れるほど通りやすいが、入れすぎると取扱い対象から外れる」という
+// 上下の折り返しを作ることで、頭金の決定が単調な最大化ではなくなる。
+export const MIN_LOAN_AMOUNT = 1_000_000;
 export const BANKS = {
-  kouko:   { key:'kouko',   label:'日本政策金融公庫', baseRate:0.015, termMin:10, termMax:15, ltvMax:0.70, maxLoan:48_000_000, minCredit:20, wakeOk:true,  areaLimit:null,    lifeStrict:false,  minPrice:0 },
-  chigin:  { key:'chigin',  label:'地方銀行',         baseRate:0.018, termMin:10, termMax:30, ltvMax:0.80, maxLoan:Infinity,   minCredit:50, wakeOk:false, areaLimit:null,    lifeStrict:true,   minPrice:10_000_000 },
-  shinkin: { key:'shinkin', label:'信用金庫',         baseRate:0.023, termMin:10, termMax:20, ltvMax:0.80, maxLoan:80_000_000, minCredit:35, wakeOk:false, areaLimit:'local', lifeStrict:'soft', minPrice:0 },
-  nonbank: { key:'nonbank', label:'ノンバンク',       baseRate:0.040, termMin:10, termMax:25, ltvMax:0.90, maxLoan:Infinity,   minCredit:25, wakeOk:true,  areaLimit:null,    lifeStrict:false,  minPrice:0 },
+  kouko:   { key:'kouko',   label:'日本政策金融公庫', baseRate:0.015, termMin:10, termMax:15, ltvMax:0.70, maxLoan:48_000_000, minLoan:MIN_LOAN_AMOUNT, minCredit:20, wakeOk:true,  areaLimit:null,    lifeStrict:false,  minPrice:0 },
+  chigin:  { key:'chigin',  label:'地方銀行',         baseRate:0.018, termMin:10, termMax:30, ltvMax:0.80, maxLoan:Infinity,   minLoan:MIN_LOAN_AMOUNT, minCredit:50, wakeOk:false, areaLimit:null,    lifeStrict:true,   minPrice:10_000_000 },
+  shinkin: { key:'shinkin', label:'信用金庫',         baseRate:0.023, termMin:10, termMax:20, ltvMax:0.80, maxLoan:80_000_000, minLoan:MIN_LOAN_AMOUNT, minCredit:35, wakeOk:false, areaLimit:'local', lifeStrict:'soft', minPrice:0 },
+  nonbank: { key:'nonbank', label:'ノンバンク',       baseRate:0.040, termMin:10, termMax:25, ltvMax:0.90, maxLoan:Infinity,   minLoan:MIN_LOAN_AMOUNT, minCredit:25, wakeOk:true,  areaLimit:null,    lifeStrict:false,  minPrice:0 },
 };
 
 export const STRUCTURE_LIFE = { '木造': 22, 'S': 34, 'RC': 47 };
@@ -2447,14 +2806,20 @@ export function reviewLoan(bankKey, property, price, downRatio, state) {
   const rel = (state.bankRelations && state.bankRelations[bankKey]) || { paidOff: 0 };
   const ltvMax = bankKey === 'chigin' && rel.paidOff >= 3 ? 0.90 : b.ltvMax;
 
+  // v8.7: 審査は「本人属性＋資産背景＋この案件の自己資金の厚み」の合計で見る。
   // v8: 危険域の物件を抱えていると、その分だけ実効的な信用度が下がった状態で審査される。
-  const credit = effectiveCredit(state);
-  const penalty = creditPenalty(state);
-  if (credit < b.minCredit) reasons.push({ code: 'CREDIT_LOW',
-    msg: `属性・信用度が基準未満（${credit} < ${b.minCredit}）${penalty ? `※保有物件の管理状態で-${penalty}` : ''}` });
+  const cr = creditForReview(state, downRatio);
+  if (cr.total < b.minCredit) reasons.push({ code: 'CREDIT_LOW',
+    msg: `総合評価が基準未満（${cr.total} < ${b.minCredit}）`
+      + `［属性${cr.base}${cr.penalty ? `(管理状態-${cr.penalty})` : ''}`
+      + `＋資産背景${cr.asset}＋自己資金${cr.down}］`
+      + `${cr.down < DOWN_PAYMENT_BONUS_MAX ? '／頭金を厚くすると評価が上がります' : ''}` });
   if (property.junkFlags.length > 0 && !b.wakeOk) reasons.push({ code: 'WAKEARI_NG', msg: '瑕疵・事故物件のため取扱不可' });
   if (b.areaLimit && property.areaKey !== b.areaLimit) reasons.push({ code: 'AREA_NG', msg: `${b.label}の営業エリア外（地方・郊外のみ）` });
   if (price < b.minPrice || loanAmount > b.maxLoan) reasons.push({ code: 'AMOUNT_NG', msg: `融資額が取扱範囲外（${b.label}）` });
+  // v8.7: 少額すぎる融資は銀行が扱わない。頭金の入れすぎで借入が数十万円になるのを防ぐ。
+  if (loanAmount < (b.minLoan ?? 0)) reasons.push({ code: 'LOAN_TOO_SMALL',
+    msg: `融資額が少なすぎます（${yen(loanAmount)}／最低 ${yen(b.minLoan)} から）。頭金を減らしてください` });
 
   const remainYears = usefulLifeRemaining(property.structure, property.builtAge);
   let years = b.termMax;
@@ -2482,7 +2847,7 @@ export function reviewLoan(bankKey, property, price, downRatio, state) {
   const d = dscr(noiAnnualV2(property), monthlyPay * 12);
   if (d < CONFIG.minDscr) reasons.push({ code: 'DSCR_LOW', msg: `収支が返済に対して弱い（DSCR ${d.toFixed(2)} < ${CONFIG.minDscr}）` });
 
-  const requiredCash = Math.round(price * downRatio + price * CONFIG.closingCostRate);
+  const requiredCash = Math.round(price * downRatio) + closingCostOf(property, price, loanAmount);
   if (state.cash < requiredCash) reasons.push({ code: 'NO_CASH', msg: `自己資金が足りない（必要 ${yen(requiredCash)} / 手元 ${yen(state.cash)}）` });
 
   const approved = reasons.length === 0;
@@ -2819,6 +3184,26 @@ export const TERMS = {
     calc: '譲渡税 ＝（売却価格 − 取得費 − 償却済み額）× 税率。個人は保有5年以内39%・5年超20%、法人は一律30%。',
     here: '個人名義は保有5年以内だと税率がほぼ倍になる。法人名義には5年ルールがない。',
     hint: '短期転売を狙うなら法人化を検討する。5年目前なら、あと数ヶ月待つだけで手取りが大きく変わる。' },
+  toroku_menkyozei: { scope: 'real', reading: 'とうろくめんきょぜい', group: '売買', label: '登録免許税',
+    def: '登記をするときにかかる税金。所有権の移転や、抵当権の設定でかかる。',
+    calc: '所有権移転＝評価額×1.5%（土地）／2.0%（建物）。抵当権設定＝借入額×0.4%。',
+    here: '購入時の諸費用に入っている。融資を使うと抵当権設定のぶんが上乗せされる。',
+    hint: '現金で買えば抵当権設定登記が要らないぶん、諸費用が安く済む。' },
+  fudosan_shutokuzei: { scope: 'real', reading: 'ふどうさんしゅとくぜい', group: '売買', label: '不動産取得税',
+    def: '不動産を取得したときに一度だけかかる都道府県税。',
+    calc: '評価額 × 3%（住宅・土地の標準税率）。',
+    here: '購入時の諸費用に含めている。実際は取得の数ヶ月後に納税通知が届く。',
+    hint: '売買価格ではなく評価額が基準なので、価格の2%弱に収まることが多い。' },
+  hyoka_gaku: { scope: 'real', reading: 'こていしさんぜいひょうかがく', group: '売買', label: '固定資産税評価額',
+    def: '税金の計算に使われる、市町村が決めた不動産の評価額。売買価格とは別物。',
+    calc: 'このゲームでは売買価格の約60%を評価額の目安としている。',
+    here: '登録免許税・不動産取得税・固都税は、この評価額を基準に計算される。',
+    hint: '売買価格の6〜7割になるのが目安。だから税金は「価格×税率」より安くなる。' },
+  shisan_haikei: { scope: 'real', reading: 'しさんはいけい', group: '融資', label: '資産背景',
+    def: '本人の年収や職業とは別に、どれだけ資産（現金・不動産）を持っているか。銀行が必ず見る項目。',
+    calc: 'このゲームでは純資産の規模で最大+25点。1,000万で+12、1億で+24。',
+    here: '属性が弱くても資産があれば融資は通る。自営業で信用度が低くても、資産と頭金でカバーできる。',
+    hint: '「自己資金をいくら入れるか」も評価に入る（頭金80%で+25が上限）。属性だけで決まるわけではない。' },
   chukai_tesuryo: { scope: 'real', reading: 'ちゅうかいてすうりょう', group: '売買', label: '仲介手数料',
     def: '売買を仲介した不動産会社に払う報酬。売主・買主がそれぞれ自分の側の分を払う。',
     calc: '上限は「売買価格×3%＋6万円」＋消費税10%（400万円超の場合）。宅建業法で決まっている。',
@@ -2881,6 +3266,11 @@ export const TERMS = {
     calc: 'AD ＝ 家賃の1〜3ヶ月分。このゲームでは1ヶ月分で客付け率+15pt、2ヶ月分で+30pt、3ヶ月分で+45pt（上限90%）。',
     here: '空室の部屋から出せる。**決まるまで毎月効き続ける**ので、出した月に決まらなくても無駄にはならない。',
     hint: '払えば必ず決まるものではない。3ヶ月分でも外れることはあるし、1ヶ月分が初月で決まることもある。空室損（家賃×空室月数）と見比べて、どこまで積むかを決める。' },
+  value_up: { scope: 'real', group: '管理', label: 'バリューアップ',
+    def: '設備更新やリノベで物件そのものの価値を上げ、家賃を引き上げる投資。',
+    calc: '設備更新で家賃+6%、水回り刷新で+12%、フルリノベで+20%。1物件につき2回まで。',
+    here: '家賃が上がるだけでなく、**部屋の魅力度が大きく上がって決まりやすくなる**。ADと違って効果が残る。',
+    hint: '空室がなかなか埋まらないなら、ADを積むより先にこちらを検討する。家賃も資産価値も一緒に上がる。' },
   kyakuduke: { scope: 'real', reading: 'きゃくづけ', group: '管理', label: '客付け',
     def: '空室に入居者を決めること。',
     calc: '広告を出す＝家賃1ヶ月分で成功率70%。自分で動く＝行動力30で成功率 40%＋（自主管理Lv−1）×10%。',
@@ -2930,19 +3320,19 @@ export function minRequiredCash(property, state, price = property.price) {
     for (let down = 0.05; down <= 0.95; down += 0.01) {
       const r = reviewLoan(bankKey, property, price, down, state);
       if (r.reasons.some(x => x.code !== 'NO_CASH')) continue;
-      const cash = Math.round(price * down + price * CONFIG.closingCostRate);
+      const cash = Math.round(price * down) + closingCostOf(property, price, Math.round(price * (1 - down)));
       if (!best || cash < best.cash) best = { cash, bankKey, label: BANKS[bankKey].label, downRatio: down, financed: true };
       break;
     }
   }
   // どの銀行も通らなければ現金で買うしかない
-  const cashBuy = Math.round(price * (1 + CONFIG.closingCostRate));
+  const cashBuy = price + closingCostOf(property, price, 0);
   if (!best || cashBuy < best.cash) return { cash: cashBuy, bankKey: null, label: '現金購入', downRatio: 1, financed: false };
   return best;
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, DIFFICULTY, difficultyOf, STRUCT_BANDS, CARE_BANDS, BAND_RANK, structBandOf, careBandOf, worstBandOf, STRUCT_VALUE_FACTOR, marketValueOf, CREDIT_HIT_DANGER, CREDIT_HIT_DEAD, CREDIT_HIT_CAP, creditPenalty, effectiveCredit, isCondemned, CONDEMNED_COST_MULT, CONDEMNED_EXTRA_MONTHS, STRUCT_DANGER_VACATE_CHANCE, CARE_DANGER_CLAIM_CHANCE, CARE_DANGER_CLAIM_AP, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, offerBlockedReason, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, LONG_TERM_MONTHS, heldMonthsOf, isLongTermHold, monthsToLongTerm, capGainTaxRate, capGainOf, capGainTaxOf, loanPayoffOf, CONSUMPTION_TAX, brokerFee, STAMP_DUTY_TABLE, stampDuty, MORTGAGE_RELEASE_FEE, mortgageReleaseFee, saleCosts, saleBreakdown, incorporationSaving, incorporationPaybackYears, settleSale, monthlyVacancyRoll, naturalFillChance, AD_PLANS, AD_MAX_CHANCE, SELF_FILL_AP, SELF_FILL_BASE, SELF_FILL_PER_LV, adCost, adBonusOf, unitFillChance, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, DIY_QUALITY, diyQualityOf, restoreCost, startRestore, REPAIR_KINDS, repairKindAvailable, DEEPCLEAN_COST_MULT, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, QUIZ_MIN_Q, QUIZ_MAX_Q, QUIZ_COMBO_MULT, QUIZ_CASH_PER_CORRECT, QUIZ_SASHINE_BONUS, quizComboMult, quizRank, buildQuiz, applyQuizResult, sashineBuffBonus, consumeSashineBuff, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, markNotificationsRead, markNotificationRead, BADGES, evaluateBadges, resultTitle, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, pruneListings, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, DIFFICULTY, difficultyOf, STRUCT_BANDS, CARE_BANDS, BAND_RANK, structBandOf, careBandOf, worstBandOf, STRUCT_VALUE_FACTOR, marketValueOf, CREDIT_HIT_DANGER, CREDIT_HIT_DEAD, CREDIT_HIT_CAP, creditPenalty, effectiveCredit, ASSET_BACKING_MAX, DOWN_PAYMENT_BONUS_MAX, DOWN_BONUS_START, DOWN_BONUS_FULL, assetBackingBonus, downPaymentBonus, creditForReview, isCondemned, CONDEMNED_COST_MULT, CONDEMNED_EXTRA_MONTHS, STRUCT_DANGER_VACATE_CHANCE, CARE_DANGER_CLAIM_CHANCE, CARE_DANGER_CLAIM_AP, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, offerBlockedReason, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, rollBuyOffer, respondToOffer, LONG_TERM_MONTHS, heldMonthsOf, isLongTermHold, monthsToLongTerm, capGainTaxRate, capGainOf, capGainTaxOf, loanPayoffOf, CONSUMPTION_TAX, brokerFee, STAMP_DUTY_TABLE, stampDuty, MORTGAGE_RELEASE_FEE, mortgageReleaseFee, ASSESSED_VALUE_RATE, REG_TAX_LAND, REG_TAX_BLDG, REG_TAX_MORTGAGE, ACQUISITION_TAX_RATE, scrivenerFee, loanArrangementFee, assessedValue, purchaseCosts, closingCostOf, saleCosts, saleBreakdown, incorporationSaving, incorporationPaybackYears, settleSale, monthlyVacancyRoll, APPEAL_WEIGHTS, APPEAL_AGE_LIMIT, APPEAL_SQM_MIN, APPEAL_SQM_MAX, FILL_BASE, FILL_APPEAL_SPAN, appealBreakdown, appealScore, naturalFillChance, AD_PLANS, AD_MAX_CHANCE, SELF_FILL_AP, SELF_FILL_BASE, SELF_FILL_PER_LV, adCost, adBonusOf, unitFillChance, LONG_VACANCY_MONTHS, APPEAL_ALERT_SCORE, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, DIY_QUALITY, diyQualityOf, restoreCost, startRestore, REPAIR_KINDS, repairKindAvailable, DEEPCLEAN_COST_MULT, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, QUIZ_MIN_Q, QUIZ_MAX_Q, QUIZ_COMBO_MULT, QUIZ_CASH_PER_CORRECT, QUIZ_SASHINE_BONUS, quizComboMult, quizRank, buildQuiz, applyQuizResult, sashineBuffBonus, consumeSashineBuff, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, FAVORITE_LIMIT, addFavorite, removeFavorite, NOTIF_KIND_INFO, defaultNotifSettings, notifModeOf, setNotifMode, markNotificationsRead, markNotificationRead, BADGES, AD_FREE_BADGE_COUNT, evaluateBadges, resultTitle, REGIONS, SEA_GAP, ROAD_W, ZOOM_MIN, LAND_FILL, BLD_RANGE, ROAD_CURVE, CAPES, CAPE_SIZE, ROAD_CLEAR, LAKES, HILLS, regionAngularDistance, regionOverlaps, isRegionUnlocked, regionUnlockProgress, checkRegionUnlocks, unlockRegion, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, MIN_LOAN_AMOUNT, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, marketYield, fairValue, appraise, requestAppraisal, listForSale, pruneListings, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -2967,19 +3357,45 @@ let yaw = HOME.yaw, pitch = HOME.pitch, yawV = 0;
 let dragging = false, lastX = 0, lastY = 0, moved = 0;
 // v3.4: ズーム（ホイール／2本指ピンチ）。0.7倍（引き）〜2.5倍（寄り）。
 let zoom = HOME.zoom;
-const ZOOM_MIN = 0.7, ZOOM_MAX = 2.5;
+// v9-A: 下限は logic 側の L.ZOOM_MIN（0.66）を使う。陸地が4つに増えたので、より引けるようにした。
+// ここで const ZOOM_MIN を宣言すると、インライン化で logic の export と衝突してゲームが起動しなくなる。
+const ZOOM_MAX = 2.5;
 const activePtrs = new Map();
 let pinchDist = 0, pinching = false;
 let rafId = 0, lastFrame = 0;
 let pingItem = null;  // 一覧「地図を見る」からのピン（クリックまで維持）
 let viewAnim = null;  // v5: 翌月ボタンでゆっくり初期位置へ戻す回転アニメ
 
-// 架空の単一大陸。中心=都心コア（高層密集）、外周=郊外・地方（低層・疎）。
-const CONTINENT = { lat: 0.05, lon: 0 };
-const CORE_R = 0.30;   // この半径内＝都心コア
-const MID_R = 0.65;    // この半径内＝中間市街地
-const OUTER_R = 1.05;  // この半径まで陸地（超えると海）。既存ロジックのareaKey(urban/local)を
-                        // 「都心コア寄り／郊外〜地方寄り」の半径帯に対応させる。
+// v9-A: 世界は4つの陸地でできている（本土・開発区・競売区・海外の島）。
+// 座標と半径は logic.mjs の REGIONS が持ち、city.mjs は描くだけにする。
+// 各陸地は本土と同じ同心円構造（中心＝都心コア／外周＝郊外・地方）を、半径に対する比率で持つ。
+// 既存ロジックの areaKey(urban/local) は、陸地ごとの「都心コア寄り／郊外〜地方寄り」の半径帯へ対応させる。
+const REGION_LIST = Object.values(L.REGIONS);
+const CORE_RATIO = 0.286;   // 旧 CORE_R 0.30 ÷ OUTER_R 1.05 と同じ比率
+const MID_RATIO = 0.619;    // 旧 MID_R 0.65 ÷ OUTER_R 1.05
+function regionOf(key) { return L.REGIONS[key] || L.REGIONS.main; }
+function regionUnlocked(r) { return st ? L.isRegionUnlocked(st, r.key) : r.key === 'main'; }
+// 経度1radが張る実際の弧は高緯度ほど短い。割らないと高緯度の島だけ横に潰れて見える。
+function lonScale(lat) { return 1 / Math.max(0.25, Math.cos(lat)); }
+// 中心 c から角距離 rho・方位 brg の点（陸地の輪郭・橋の取り付け位置に使う）
+function pointAt(c, rho, brg) {
+  const lat = Math.asin(Math.sin(c.lat) * Math.cos(rho) + Math.cos(c.lat) * Math.sin(rho) * Math.cos(brg));
+  const lon = c.lon + Math.atan2(Math.sin(brg) * Math.sin(rho) * Math.cos(c.lat),
+    Math.cos(rho) - Math.sin(c.lat) * Math.sin(lat));
+  return { lat, lon };
+}
+// 2点間の大円補間（単位ベクトルのslerp）。橋と航路を球面に沿って引くのに使う。
+function slerpLL(a, b, t) {
+  const va = [Math.cos(a.lat) * Math.sin(a.lon), Math.sin(a.lat), Math.cos(a.lat) * Math.cos(a.lon)];
+  const vb = [Math.cos(b.lat) * Math.sin(b.lon), Math.sin(b.lat), Math.cos(b.lat) * Math.cos(b.lon)];
+  const d = Math.max(-1, Math.min(1, va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]));
+  const o = Math.acos(d);
+  if (o < 1e-6) return { lat: a.lat, lon: a.lon };
+  const s1 = Math.sin((1 - t) * o) / Math.sin(o), s2 = Math.sin(t * o) / Math.sin(o);
+  const v = [va[0] * s1 + vb[0] * s2, va[1] * s1 + vb[1] * s2, va[2] * s1 + vb[2] * s2];
+  const len = Math.hypot(v[0], v[1], v[2]);
+  return { lat: Math.asin(v[1] / len), lon: Math.atan2(v[0], v[2]) };
+}
 
 // v5: 建物の大きさは「球の半径Rに対する比率」で決める。絶対pxで持つと画面サイズによって
 // 見え方（密集度）が変わってしまうため。ユーザーが実サンプルを動かして確定した値。
@@ -3247,76 +3663,201 @@ function buildingOptsFor(p, owned) {
   };
 }
 
-// 大陸の陸地パッチ（雰囲気のみ）: 中心に厚く・外周にいくほど薄く広がる分布
-const CONTINENT_BLOBS = (() => {
-  const rnd = srand(777);
-  return Array.from({ length: 110 }, () => {
-    const ang = rnd() * TAU;
-    const rad = Math.pow(rnd(), 0.55) * OUTER_R * 1.04;
-    return {
-      lat: CONTINENT.lat + Math.sin(ang) * rad,
-      lon: CONTINENT.lon + Math.cos(ang) * rad,
-      rad: 0.10 + rnd() * 0.15,
-      core: rad < CORE_R,
-    };
-  });
+// 陸地の輪郭パッチ（雰囲気のみ）: 中心に厚く・外周にいくほど薄く広がる分布。
+// v9-A: 「中心からの距離 + パッチ半径」が陸地半径を超えないようにする。超えると、中心間距離と
+// 半径の和で見ている離隔チェック（L.regionOverlaps）の前提が崩れ、検算がOKでも海岸線が接触する。
+// v9-A: ブロブの本数は陸地の大きさで割らない。半径もRに比例させているので、数まで面積比で
+// 減らすと小さい陸地だけ隙間だらけになり「島が散らばっている」ように見える（実際にそうなった）。
+// 本数は一定にして大きさだけを比例させると、どの陸地も同じ密度で埋まる。
+//
+// 基本の陸は半径の0.50までに収め、そこから外は「岬」だけが伸びる余地として空けておく。
+// 外周いっぱいまで基本形で埋めると、岬を足しても既存の海岸線に埋もれて凹凸が見えなくなる
+// （world-sample で実際にそうなった）。入り江は廃止——海を色で抜く方式では、海岸に接して
+// いても独立した水たまり＝池にしか見えなかったため。
+const LAND_BLOBS = (() => {
+  const out = {};
+  for (const r of REGION_LIST) {
+    const rnd = hashSeed('land:' + r.key);
+    const ls = lonScale(r.lat);
+    const n = Math.round(88 * L.LAND_FILL);
+    const blobs = Array.from({ length: n }, () => {
+      const ang = rnd() * TAU;
+      const d = Math.sqrt(rnd()) * r.radius * 0.50;
+      return {
+        lat: r.lat + Math.sin(ang) * d, lon: r.lon + Math.cos(ang) * d * ls,
+        rad: r.radius * (0.17 + rnd() * 0.13),
+        dLat: Math.sin(ang) * d, dLon: Math.cos(ang) * d * ls,
+        core: d < r.radius * CORE_RATIO,
+      };
+    });
+    // 岬: 基本の海岸線より外へ、細くなりながらブロブを連ねて突き出す。
+    const nCape = Math.round(L.CAPES);
+    for (let i = 0; i < nCape; i++) {
+      const ang = rnd() * TAU, steps = 4 + Math.floor(rnd() * 3);
+      const reach = r.radius * (0.60 + (0.14 + rnd() * 0.26) * L.CAPE_SIZE);
+      const w0 = r.radius * 0.15 * L.CAPE_SIZE;
+      for (let k = 1; k <= steps; k++) {
+        const rad = Math.max(r.radius * 0.035, w0 * (1 - 0.13 * k));
+        const d = r.radius * 0.48 + (reach - r.radius * 0.48) * (k / steps);
+        if (d + rad > r.radius) break;   // 陸地半径を超えない＝離隔チェックを壊さない
+        const a2 = ang + (rnd() - 0.5) * 0.14;
+        blobs.push({
+          lat: r.lat + Math.sin(a2) * d, lon: r.lon + Math.cos(a2) * d * ls,
+          rad, dLat: Math.sin(a2) * d, dLon: Math.cos(a2) * d * ls, core: false,
+        });
+      }
+    }
+    out[r.key] = blobs;
+  }
+  return out;
 })();
 
-// 未開拓エリア（黒い影の陸地＋🔒）: 球を回すと海だけでは寂しいため、将来アップデートで解禁される
-// ことを匂わせる非インタラクティブな陸影を数か所配置する。
-// v5: 経度は大陸（lon 0・半径1.05）から十分離す。従来 lon 5.55（＝-0.73rad）の1か所が大陸の
-// 内側に入っており、黒い影が緑の地面に重なって「焦げ跡」のように見えていた（実機で確認）。
-// ブロブ半径0.34を足しても大陸に届かない位置に4か所を振り直した。
-const UNEXPLORED_CENTERS = [
-  { lat: 0.42, lon: 2.20 },
-  { lat: -0.50, lon: 3.10 },
-  { lat: -0.20, lon: 4.00 },
-  { lat: 0.15, lon: 4.75 },
-];
-const UNEXPLORED_AREAS = UNEXPLORED_CENTERS.map((c, i) => {
-  const rnd = srand(9001 + i * 137);
-  return {
-    center: c,
-    blobs: Array.from({ length: 12 }, () => {
-      const ang = rnd() * TAU;
-      const rad = Math.pow(rnd(), 0.6) * 0.34;
-      return { lat: c.lat + Math.sin(ang) * rad, lon: c.lon + Math.cos(ang) * rad, rad: 0.08 + rnd() * 0.09 };
-    }),
-  };
-});
-
-// 雰囲気建物のスロット: 中心=高密度・高層、外周=低密度・低層。
-// 引いたときは先頭6割だけ描いて間引く（生成順が半径に対してランダムなので偏らない）。
-const FILLER_SLOTS = (() => {
-  const rnd = srand(4242);
-  const out = [];
-  for (let i = 0; i < 460 && out.length < FILLER_COUNT; i++) {
-    const ang = rnd() * TAU;
-    const rad = rnd() * OUTER_R;
-    const keepProb = rad < CORE_R ? 0.62 : rad < MID_R ? 0.32 : 0.12;
-    if (rnd() > keepProb) continue;
-    const stories = rad < CORE_R ? 4 + Math.floor(rnd() * 6)
-      : rad < MID_R ? 2 + Math.floor(rnd() * 3)
-      : 1 + Math.floor(rnd() * 2);
-    out.push({
-      lat: CONTINENT.lat + Math.sin(ang) * rad,
-      lon: CONTINENT.lon + Math.cos(ang) * rad,
-      stories, seed: 100 + i,
+// 内陸の池。陸を塗ったあとに水の色で抜く。建物・山はこの中に置かない。
+const LAND_WATERS = (() => {
+  const out = {};
+  for (const r of REGION_LIST) {
+    const rnd = hashSeed('water:' + r.key);
+    const ls = lonScale(r.lat);
+    out[r.key] = Array.from({ length: Math.round(L.LAKES) }, () => {
+      const ang = rnd() * TAU, d = (0.10 + rnd() * 0.30) * r.radius;
+      return {
+        lat: r.lat + Math.sin(ang) * d, lon: r.lon + Math.cos(ang) * d * ls,
+        rad: r.radius * (0.06 + rnd() * 0.08),
+        dLat: Math.sin(ang) * d, dLon: Math.cos(ang) * d * ls,
+      };
     });
   }
   return out;
 })();
 
-// urban=都心コア寄り、local=郊外〜地方寄りの半径帯に配置（既存ロジックのareaKeyをそのまま利用）
-function bandFor(areaKey) {
-  return areaKey === 'urban' ? { rMin: 0.04, rMax: CORE_R } : { rMin: MID_R * 0.85, rMax: OUTER_R * 0.95 };
+// その点が実際に陸（ブロブの塗られている範囲・かつ池の外）かどうか。
+// これを見ずに半径だけで配置していたため、ブロブの隙間＝海の上に建物が立っていた。
+function onLandOf(regionKey, dLat, dLon) {
+  const r = regionOf(regionKey), ls = lonScale(r.lat), aLon = dLon / ls;
+  if (!LAND_BLOBS[r.key].some(b => Math.hypot(dLat - b.dLat, aLon - b.dLon / ls) < b.rad * 0.92)) return false;
+  return !LAND_WATERS[r.key].some(w => Math.hypot(dLat - w.dLat, aLon - w.dLon / ls) < w.rad * 1.15);
 }
-function slotFor(areaKey, seed) {
+
+// v9-A: 旧「未開拓エリア（海に浮かぶ黒いシミ4つ）」は廃止し、未解放の陸地そのものを黒く塗る方式にした。
+// 陸地は L.REGIONS が持ち、解放済みかどうかで色が変わるだけになる（別データを持たない）。
+
+// 街道の経路（緯度経度）をキャッシュし、建物・山が道の上に湧かないようにする判定に使う。
+// 描画用の roadPath() は同じ式を通してから project() する（判定と見た目がズレないように）。
+//
+// 大円（＝球面上の最短路）そのままだと定規で引いたようになるので、進行方向の法線に、
+// 両端で0になる包絡線を掛けた揺らぎを足して蛇行させる。両端は必ず0なので接続点はずれない。
+function roadPhases(a, b) {
+  const rnd = hashSeed('road:' + a.key + ':' + b.key);
+  return [rnd() * TAU, rnd() * TAU];
+}
+const ROAD_LL = REGION_LIST.filter(r => r.roadTo).map(r => ({ from: regionOf(r.roadTo), to: r }));
+function roadPathLL(a, b) {
+  const ph = roadPhases(a, b), n = 64;
+  const amp = L.ROAD_CURVE * L.regionAngularDistance(a, b) * 0.22;
+  const base = [];
+  for (let i = 0; i <= n; i++) base.push(slerpLL(a, b, i / n));
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, q = base[i];
+    const nb = base[Math.min(n, i + 1)], pv = base[Math.max(0, i - 1)];
+    const cl = Math.max(0.25, Math.cos(q.lat));
+    const dLat = nb.lat - pv.lat, dLon = (nb.lon - pv.lon) * cl;
+    const len = Math.hypot(dLat, dLon) || 1;
+    const off = amp * Math.sin(Math.PI * t)
+      * (0.62 * Math.sin(t * TAU * 1.3 + ph[0]) + 0.38 * Math.sin(t * TAU * 2.7 + ph[1]));
+    out.push({ lat: q.lat + (-dLon / len) * off, lon: q.lon + (dLat / len) * off / cl });
+  }
+  return out;
+}
+const ROAD_PATHS_LL = ROAD_LL.map(({ from, to }) => roadPathLL(from, to));
+// 点と線分の距離（緯度経度を局所的に平面とみなす。経度は cos(lat) を掛けて弧の長さに直す）
+function distToSeg(lat, lon, p, q) {
+  const cl = Math.max(0.25, Math.cos(lat));
+  const px = (lon - p.lon) * cl, py = lat - p.lat;
+  const vx = (q.lon - p.lon) * cl, vy = q.lat - p.lat;
+  const len2 = vx * vx + vy * vy;
+  const t = len2 ? Math.max(0, Math.min(1, (px * vx + py * vy) / len2)) : 0;
+  return Math.hypot(px - vx * t, py - vy * t);
+}
+function nearRoad(lat, lon, clear) {
+  if (clear <= 0) return false;
+  for (const path of ROAD_PATHS_LL)
+    for (let i = 0; i < path.length - 1; i++)
+      if (distToSeg(lat, lon, path[i], path[i + 1]) < clear) return true;
+  return false;
+}
+
+// 山（地形記号）。外周寄りの陸に置く。建物より先に決めて、建物のほうに避けさせる。
+const LAND_HILLS = (() => {
+  const out = {};
+  for (const r of REGION_LIST) {
+    const rnd = hashSeed('hill:' + r.key);
+    const want = Math.round(L.HILLS);
+    const ls = lonScale(r.lat);
+    const arr = [];
+    for (let i = 0; i < want * 8 && arr.length < want; i++) {
+      const ang = rnd() * TAU, d = (0.42 + rnd() * 0.48) * r.radius;
+      const dLat = Math.sin(ang) * d, dLon = Math.cos(ang) * d * ls;
+      if (!onLandOf(r.key, dLat, dLon)) continue;
+      if (nearRoad(r.lat + dLat, r.lon + dLon, L.ROAD_CLEAR)) continue;   // 道の上に山は生えない
+      arr.push({ lat: r.lat + dLat, lon: r.lon + dLon, dLat, dLon, sz: 0.7 + rnd() * 0.7 });
+    }
+    out[r.key] = arr;
+  }
+  return out;
+})();
+function nearHillOf(regionKey, dLat, dLon) {
+  const r = regionOf(regionKey), ls = lonScale(r.lat);
+  return LAND_HILLS[r.key].some(h => Math.hypot(dLat - h.dLat, (dLon - h.dLon) / ls) < r.radius * 0.055 * h.sz);
+}
+
+// 雰囲気建物のスロット: 中心=高密度・高層、外周=低密度・低層。
+// 引いたときは先頭6割だけ描いて間引く（生成順が半径に対してランダムなので偏らない）。
+// v9-A: 陸地ごとに生成する。棟数は面積比（半径の2乗）で配分するので、小さい陸地は自然に疎になる。
+// 本土は radius 1.20 で want=200・試行460回となり、単一大陸だった頃と同じ本数になる。
+const FILLER_SLOTS = (() => {
+  const out = {};
+  for (const r of REGION_LIST) {
+    const rnd = hashSeed('fill:' + r.key);
+    const want = Math.max(12, Math.round(FILLER_COUNT * Math.pow(r.radius / 1.20, 2)));
+    const ls = lonScale(r.lat);
+    const arr = [];
+    for (let i = 0; i < want * 6 && arr.length < want; i++) {
+      const ang = rnd() * TAU;
+      const d = rnd() * r.radius * L.BLD_RANGE;
+      const t = d / r.radius;                     // 0=中心（都心）〜1=外周（地方）
+      const keepProb = t < CORE_RATIO ? 0.62 : t < MID_RATIO ? 0.32 : 0.12;
+      if (rnd() > keepProb) continue;
+      const dLat = Math.sin(ang) * d, dLon = Math.cos(ang) * d * ls;
+      if (!onLandOf(r.key, dLat, dLon)) continue;   // 海・池の上には建てない
+      if (nearRoad(r.lat + dLat, r.lon + dLon, L.ROAD_CLEAR)) continue;   // 街道の上にも建てない
+      if (nearHillOf(r.key, dLat, dLon)) continue;   // 山の上にも建てない
+      const stories = t < CORE_RATIO ? 4 + Math.floor(rnd() * 6)
+        : t < MID_RATIO ? 2 + Math.floor(rnd() * 3)
+        : 1 + Math.floor(rnd() * 2);
+      arr.push({ lat: r.lat + dLat, lon: r.lon + dLon, stories, seed: 100 + i });
+    }
+    out[r.key] = arr;
+  }
+  return out;
+})();
+
+// urban=都心コア寄り、local=郊外〜地方寄りの半径帯に配置（既存ロジックのareaKeyをそのまま利用）。
+// v9-A: 帯は陸地半径に対する比率で持つので、大きさの違う陸地でも同じ見え方になる。
+function bandFor(r, areaKey) {
+  return areaKey === 'urban'
+    ? { rMin: r.radius * 0.033, rMax: r.radius * CORE_RATIO }
+    // 外周は建物を置く範囲（BLD_RANGE）で頭打ちにする。ここを超えるとブロブの外＝海に出る。
+    : { rMin: r.radius * MID_RATIO * 0.85, rMax: r.radius * L.BLD_RANGE };
+}
+// v9-A: 物件は自分の陸地（p.region）の中に置く。旧セーブは migrateSave で 'main' が補完されている。
+function slotFor(regionKey, areaKey, seed) {
+  const r = regionOf(regionKey);
   const rnd = hashSeed('slot:' + areaKey + ':' + seed);
-  const { rMin, rMax } = bandFor(areaKey);
+  const { rMin, rMax } = bandFor(r, areaKey);
   const ang = rnd() * TAU;
   const rad = rMin + (rMax - rMin) * rnd();
-  return { lat: CONTINENT.lat + Math.sin(ang) * rad, lon: CONTINENT.lon + Math.cos(ang) * rad };
+  return { lat: r.lat + Math.sin(ang) * rad, lon: r.lon + Math.cos(ang) * rad * lonScale(r.lat) };
 }
 
 function project(lat, lon) {
@@ -3355,27 +3896,123 @@ function drawGlobeBase() {
   ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.fill();
 }
 
+// 球面に沿って線を引く（裏側に回った区間は途切れる）。橋・航路の共通処理。
+function strokeGreatCircle(a, b, t0, t1, steps = 26) {
+  ctx.beginPath(); let pen = false;
+  for (let i = 0; i <= steps; i++) {
+    const q = slerpLL(a, b, t0 + (t1 - t0) * (i / steps));
+    const p = project(q.lat, q.lon);
+    if (p.z > 0.03) { if (pen) ctx.lineTo(p.x, p.y); else { ctx.moveTo(p.x, p.y); pen = true; } } else pen = false;
+  }
+  ctx.stroke();
+}
+
+// v9-A: 橋はやめた。この配置（陸どうしがほぼ接している）では架ける隙間が無く、
+// どう描いても「橋」に見えないため。陸の上を通る街道でつなぐ。
+//
+// 経路（緯度経度）は roadPathLL() が持つ（建物・山の回避判定と共有する唯一の実装）。
+// ここでは、その経路を投影して画面座標にするだけ。
+function roadPath(a, b) { return roadPathLL(a, b).map(q => project(q.lat, q.lon)); }
+function strokeRoadPoly(pts) {
+  ctx.beginPath(); let pen = false;
+  for (const p of pts) {
+    if (p.z > 0.03) { if (pen) ctx.lineTo(p.x, p.y); else { ctx.moveTo(p.x, p.y); pen = true; } } else pen = false;
+  }
+  ctx.stroke();
+}
+// 街道は解放状態に関係なく、ロック中の地区まで通して描く。
+// ロックされていることは「土地が黒い」ことだけで示す（道まで消すと世界がつながって見えない）。
+function drawRoad(a, b) {
+  const pts = roadPath(a, b);
+  const w = Math.max(1.4, R * L.ROAD_W * 0.42);
+  ctx.save(); ctx.lineCap = 'round';
+  ctx.strokeStyle = '#c8b58a'; ctx.lineWidth = w; strokeRoadPoly(pts);                       // 路面
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = Math.max(0.7, w * 0.22);
+  ctx.setLineDash([R * 0.014, R * 0.014]); strokeRoadPoly(pts); ctx.setLineDash([]);         // センターライン
+  ctx.restore();
+}
+
+// 島（海外）は陸路で行けない。航路の点線と✈️で示す。
+// 陸続きの街道と違い、こちらは「便が就航している」ことの表現なので、解放されるまで飛ばさない。
+function drawSeaRoute(from, island) {
+  if (!regionUnlocked(island)) return;
+  ctx.save();
+  ctx.setLineDash([R * 0.02, R * 0.022]);
+  ctx.strokeStyle = 'rgba(148,197,255,0.5)';
+  ctx.lineWidth = Math.max(1, R * 0.005);
+  strokeGreatCircle(from, island, 0, 1, 40);
+  ctx.setLineDash([]);
+  const mid = slerpLL(from, island, (performance.now() / 2600) % 1);
+  const pm = project(mid.lat, mid.lon);
+  if (pm.z > 0.05) {
+    ctx.font = `${Math.round(R * 0.055)}px ${EMOJI_FONT}`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillText('✈️', pm.x, pm.y);
+  }
+  ctx.restore();
+}
+
 function drawLandmasses() {
   ctx.save();
   ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.clip();
-  for (const b of CONTINENT_BLOBS) {
-    const p = project(b.lat, b.lon);
-    if (p.z < 0.02) continue;
-    ctx.globalAlpha = Math.min(1, p.z * 4) * 0.95;
-    ctx.fillStyle = b.core ? 'hsl(158, 26%, 21%)' : 'hsl(112, 26%, 20%)';
-    ctx.beginPath(); ctx.arc(p.x, p.y, b.rad * R * (0.35 + 0.65 * p.z), 0, TAU); ctx.fill();
-  }
-  // 未開拓エリア（黒い影の陸地）
-  for (const area of UNEXPLORED_AREAS) {
-    for (const b of area.blobs) {
+
+  // 陸地。まず一回り大きい砂色で塗ってから本体を重ねると、union の外周だけが海岸線として残る。
+  // 輪郭線が1本入るかどうかで「地図に見えるか」が決まる（塗り分けだけでは地図にならない）。
+  //
+  // 縁の太さは半径への掛け算ではなく固定px（球外周のリングと同じ Math.max(1, R*0.004)）にする。
+  // 掛け算だとブロブが大きいほど縁も太くなり、輪郭の太さが場所によってバラバラに見えていた。
+  const edgePx = Math.max(1, R * 0.004);
+  for (const r of REGION_LIST) {
+    const open = regionUnlocked(r);
+    for (const b of LAND_BLOBS[r.key]) {
       const p = project(b.lat, b.lon);
       if (p.z < 0.02) continue;
-      ctx.globalAlpha = Math.min(1, p.z * 4) * 0.85;
-      ctx.fillStyle = 'hsl(220, 25%, 9%)';
+      ctx.globalAlpha = Math.min(1, p.z * 4) * (open ? 0.95 : 0.85);
+      ctx.fillStyle = open ? 'hsl(45, 32%, 52%)' : 'hsl(220, 22%, 14%)';
+      ctx.beginPath(); ctx.arc(p.x, p.y, b.rad * R * (0.35 + 0.65 * p.z) + edgePx, 0, TAU); ctx.fill();
+    }
+    for (const b of LAND_BLOBS[r.key]) {
+      const p = project(b.lat, b.lon);
+      if (p.z < 0.02) continue;
+      ctx.globalAlpha = Math.min(1, p.z * 4) * (open ? 0.95 : 0.85);
+      ctx.fillStyle = !open ? 'hsl(220, 25%, 9%)'
+        : b.core ? 'hsl(158, 26%, 21%)' : 'hsl(112, 26%, 20%)';
       ctx.beginPath(); ctx.arc(p.x, p.y, b.rad * R * (0.35 + 0.65 * p.z), 0, TAU); ctx.fill();
     }
+    ctx.globalAlpha = 1;
+    if (!open) continue;   // 池・山は解放された陸地にだけ描く（未解放は黒い土地のまま）
+
+    // 池: 陸を塗ったあとに水の色で抜く。砂の縁は海岸線と同じ固定px。
+    for (const wt of LAND_WATERS[r.key]) {
+      const p = project(wt.lat, wt.lon);
+      if (p.z < 0.02) continue;
+      const rr = wt.rad * R * (0.35 + 0.65 * p.z);
+      ctx.globalAlpha = Math.min(1, p.z * 4);
+      ctx.fillStyle = 'hsl(45, 32%, 52%)';
+      ctx.beginPath(); ctx.arc(p.x, p.y, rr + edgePx, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'hsl(202, 46%, 26%)';
+      ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // 山（地形記号）。稜線に陽の当たる面を入れると、ただの三角ではなく山に見える。
+    for (const hl of LAND_HILLS[r.key]) {
+      const p = project(hl.lat, hl.lon);
+      if (p.z < 0.06) continue;
+      const u = R * 0.020 * hl.sz * (0.5 + p.z * 0.6);
+      ctx.globalAlpha = Math.min(1, p.z * 3);
+      ctx.fillStyle = 'rgba(120,132,124,0.85)';
+      ctx.beginPath(); ctx.moveTo(p.x - u, p.y + u * 0.55); ctx.lineTo(p.x, p.y - u); ctx.lineTo(p.x + u, p.y + u * 0.55); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'rgba(226,232,240,0.75)';
+      ctx.beginPath(); ctx.moveTo(p.x, p.y - u); ctx.lineTo(p.x + u * 0.34, p.y - u * 0.10); ctx.lineTo(p.x, p.y - u * 0.10); ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
   }
-  ctx.globalAlpha = 1;
+  // 街道と航路は陸地より後に描く（緑の上にかぶせる）
+  for (const r of REGION_LIST) if (r.roadTo) drawRoad(regionOf(r.roadTo), r);
+  drawSeaRoute(L.REGIONS.main, L.REGIONS.overseas);
+
   ctx.strokeStyle = 'rgba(148,163,184,0.09)'; ctx.lineWidth = 1;
   for (let m = 0; m < 8; m++) {
     const lon = m * TAU / 8;
@@ -3388,16 +4025,21 @@ function drawLandmasses() {
   }
   ctx.restore();
 
-  // 未開拓エリアの🔒（将来アップデートで解禁される予感）
+  // 未解放の陸地には🔒とエリア名。タップすると解放条件が見られる。
   ctx.save();
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  for (const area of UNEXPLORED_AREAS) {
-    const p = project(area.center.lat, area.center.lon);
+  for (const r of REGION_LIST) {
+    if (regionUnlocked(r)) continue;
+    const p = project(r.lat, r.lon);
     if (p.z < 0.05) continue;
+    const sc = 0.6 + p.z * 0.6;
     ctx.globalAlpha = Math.min(1, p.z * 2);
     ctx.fillStyle = '#fbbf24';
-    ctx.font = `${Math.round(18 * (0.6 + p.z * 0.6))}px ${EMOJI_FONT}`;
+    ctx.font = `${Math.round(18 * sc)}px ${EMOJI_FONT}`;
     ctx.fillText('🔒', p.x, p.y);
+    ctx.fillStyle = 'rgba(203,213,225,0.9)';
+    ctx.font = `700 ${Math.round(Math.max(10, 12 * sc))}px sans-serif`;
+    ctx.fillText(`${r.icon} ${r.label}`, p.x, p.y + 20 * sc);
   }
   ctx.restore();
 }
@@ -3456,8 +4098,8 @@ function spreadItems(items) {
 function coloredItems() {
   if (!st) return [];
   const items = [];
-  st.properties.forEach(p => { const s = slotFor(p.areaKey, 'o:' + p.id); items.push({ p, lat: s.lat, lon: s.lon, kind: 'owned' }); });
-  st.market.forEach(p => { const s = slotFor(p.areaKey, 'm:' + p.id); items.push({ p, lat: s.lat, lon: s.lon, kind: 'market' }); });
+  st.properties.forEach(p => { const s = slotFor(p.region, p.areaKey, 'o:' + p.id); items.push({ p, lat: s.lat, lon: s.lon, kind: 'owned' }); });
+  st.market.forEach(p => { const s = slotFor(p.region, p.areaKey, 'm:' + p.id); items.push({ p, lat: s.lat, lon: s.lon, kind: 'market' }); });
   return spreadItems(items);
 }
 
@@ -3468,10 +4110,16 @@ function stepViewAnim(now) {
   if (!viewAnim) return;
   const t = Math.min(1, (now - viewAnim.t0) / viewAnim.dur);
   const e = easeInOutCubic(t);
+  // v9-A: 行き先を指定できるようにした（既定は HOME＝本土の都心コア）。
+  const toPitch = viewAnim.toPitch == null ? HOME.pitch : viewAnim.toPitch;
+  const toZoom = viewAnim.toZoom == null ? HOME.zoom : viewAnim.toZoom;
   yaw = viewAnim.fromYaw + viewAnim.dYaw * e;
-  pitch = viewAnim.fromPitch + (HOME.pitch - viewAnim.fromPitch) * e;
-  zoom = viewAnim.fromZoom + (HOME.zoom - viewAnim.fromZoom) * e;
-  if (t >= 1) { viewAnim = null; yaw = HOME.yaw; pitch = HOME.pitch; zoom = HOME.zoom; }
+  pitch = viewAnim.fromPitch + (toPitch - viewAnim.fromPitch) * e;
+  zoom = viewAnim.fromZoom + (toZoom - viewAnim.fromZoom) * e;
+  if (t >= 1) {
+    yaw = viewAnim.fromYaw + viewAnim.dYaw; pitch = toPitch; zoom = toZoom;
+    viewAnim = null;
+  }
 }
 
 function draw(ts) {
@@ -3494,8 +4142,11 @@ function draw(ts) {
 
   // 雰囲気建物（奥から手前へ）。引いたときは本数も間引いて、ごちゃつきを抑える。
   const fUnit = fillerUnit();
-  const cap = zoom < 0.9 ? Math.round(FILLER_SLOTS.length * 0.6) : FILLER_SLOTS.length;
-  FILLER_SLOTS.slice(0, cap)
+  // v9-A: 未解放の陸地には雰囲気建物を描かない（黒い土地のままにする）
+  const fillers = [];
+  for (const r of REGION_LIST) if (regionUnlocked(r)) fillers.push(...FILLER_SLOTS[r.key]);
+  const cap = zoom < 0.9 ? Math.round(fillers.length * 0.6) : fillers.length;
+  fillers.slice(0, cap)
     .map(s => ({ s, p: project(s.lat, s.lon) }))
     .filter(o => o.p.z > 0.05)
     .sort((a, b) => a.p.z - b.p.z)
@@ -3599,13 +4250,14 @@ function hitPin(px, py) {
   return dx * dx + dy * dy < 26 * 26;
 }
 
-// 未開拓エリアの🔒クリック判定。表面に見えている最寄りのロックを返す。
+// 未解放エリアの🔒クリック判定。表面に見えている陸地のキーを返す。
 function hitLock(px, py) {
-  for (const area of UNEXPLORED_AREAS) {
-    const p = project(area.center.lat, area.center.lon);
+  for (const r of REGION_LIST) {
+    if (regionUnlocked(r)) continue;
+    const p = project(r.lat, r.lon);
     if (p.z < 0.05) continue;
     const dx = px - p.x, dy = py - p.y;
-    if (dx * dx + dy * dy < 20 * 20) return area;
+    if (dx * dx + dy * dy < 26 * 26) return r.key;
   }
   return null;
 }
@@ -3634,7 +4286,7 @@ function initCity(cv, callbacks) {
     e.preventDefault();
     viewAnim = null;                              // 手動操作が入ったら自動回転は中断
     const f = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-    zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * f));
+    zoom = Math.max(L.ZOOM_MIN, Math.min(ZOOM_MAX, zoom * f));
   }, { passive: false });
   canvas.addEventListener('pointerdown', e => {
     viewAnim = null;                              // 手動操作が入ったら自動回転は中断
@@ -3664,7 +4316,7 @@ function initCity(cv, callbacks) {
     if (pinching && activePtrs.size >= 2) {
       const pts = [...activePtrs.values()];
       const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-      if (pinchDist > 0) zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * d / pinchDist));
+      if (pinchDist > 0) zoom = Math.max(L.ZOOM_MIN, Math.min(ZOOM_MAX, zoom * d / pinchDist));
       pinchDist = d;
       return;
     }
@@ -3708,8 +4360,9 @@ function initCity(cv, callbacks) {
       if (hitPin(mx, my)) { const id = pingItem.id; pingItem = null; if (cbs.onTapMarketDetail) cbs.onTapMarketDetail(id); return; }
       // どこかをクリックしたらピンは解除（②以降の判定は続ける）
       pingItem = null;
-      // ②🔒未開拓エリア → ティーザー表示
-      if (hitLock(mx, my)) { if (cbs.onTapLock) cbs.onTapLock(); return; }
+      // ②🔒未解放エリア → 解放条件パネル（どのエリアを押したかを渡す）
+      const lockKey = hitLock(mx, my);
+      if (lockKey) { if (cbs.onTapLock) cbs.onTapLock(lockKey); return; }
       // ③物件
       const hit = hitTest(mx, my);
       if (hit) {
@@ -3762,11 +4415,26 @@ function focusOnMarket(propertyId) {
   if (!st) return;
   const p = st.market.find(x => x.id === propertyId);
   if (!p) return;
-  const s = slotFor(p.areaKey, 'm:' + p.id);
+  const s = slotFor(p.region, p.areaKey, 'm:' + p.id);
   viewAnim = null;
   yaw = -s.lon; pitch = Math.max(-0.6, Math.min(0.2, -s.lat * 0.6));
   yawV = 0;
   pingItem = { lat: s.lat, lon: s.lon, id: propertyId, sx: null, sy: null };
+}
+
+// v9-A: エリアピル／🔒タップから呼ぶ。その陸地が正面に来るようゆっくり回す。
+// 島（海外）は距離が遠いので少し長めに回す。
+function focusOnRegion(regionKey, dur) {
+  const r = regionOf(regionKey);
+  const targetYaw = -r.lon;
+  const targetPitch = Math.max(-0.6, Math.min(0.6, r.lat * 0.8));
+  yawV = 0;
+  viewAnim = {
+    t0: performance.now(), dur: dur || (r.island ? 1900 : 1400),
+    fromYaw: yaw, dYaw: normAngle(targetYaw - yaw),
+    fromPitch: pitch, fromZoom: zoom,
+    toPitch: targetPitch, toZoom: HOME.zoom,
+  };
 }
 
 // v3: DIY・業者修繕の演出用。該当の所有物件が正面に来るようカメラを回転させる（ピンは立てない）。
@@ -3774,21 +4442,26 @@ function focusOnOwned(propertyId) {
   if (!st) return;
   const p = st.properties.find(x => x.id === propertyId);
   if (!p) return;
-  const s = slotFor(p.areaKey, 'o:' + p.id);
+  const s = slotFor(p.region, p.areaKey, 'o:' + p.id);
   viewAnim = null;
   yaw = -s.lon; pitch = Math.max(-0.6, Math.min(0.2, -s.lat * 0.6));
   yawV = 0;
 }
 
-// コイン回収アニメ用: 所有建物のビューポート座標一覧
+// コイン回収アニメ用: 所有建物のビューポート座標一覧。
+// v9-A: 陸地が4つになると、裏側の陸地にある物件は投影されず💰が飛ばなくなる。
+// 見えていない物件は「球の縁のうち、その物件の方角に最も近い点」から飛ばす
+// （見えていないがあちらから届いた、と読める）。v5で直した「裏側を向けたまま翌月を押すと
+// 1個も飛ばない」と同じ症状が、別の原因で再発するのを先に潰しておく。
 function cityBuildingScreenPositions() {
   if (!canvas || !st) return [];
   const rect = canvas.getBoundingClientRect();
   return st.properties.map(p => {
-    const s = slotFor(p.areaKey, 'o:' + p.id);
+    const s = slotFor(p.region, p.areaKey, 'o:' + p.id);
     const pr = project(s.lat, s.lon);
-    if (pr.z < 0.04) return null;
-    return { x: rect.left + pr.x, y: rect.top + pr.y };
+    if (pr.z >= 0.04) return { x: rect.left + pr.x, y: rect.top + pr.y };
+    const ang = Math.atan2(pr.y - cy, pr.x - cx);
+    return { x: rect.left + cx + Math.cos(ang) * R * 0.96, y: rect.top + cy + Math.sin(ang) * R * 0.96 };
   }).filter(Boolean);
 }
 
@@ -4503,7 +5176,7 @@ function load(){
 // 初期位置へ戻すのは「翌月へ進む」ときだけで、そのときも瞬間移動ではなく animateResetView() で
 // ゆっくり回って戻る（v3.5では毎回のrender()でリセットしていたが、動きすぎるという指摘を受けて変更）。
 function render(){
-  setCityState(state); renderHeaderClock(); renderDangerBanner(); renderPanelLeft(); renderPanelRight(); renderMobileBars(); checkEnd(); checkNewBadges(); save(); showExpFloats();
+  setCityState(state); renderHeaderClock(); renderRegionPills(); renderDangerBanner(); renderPanelLeft(); renderPanelRight(); renderMobileBars(); checkEnd(); checkNewBadges(); save(); showExpFloats();
   document.getElementById('btn-result')?.classList.toggle('hidden', !state?.freePlay);   // v3.7: クリア後はいつでもリザルトへ
   if (tutIdx >= 0) renderTutStep();   // v3.7: チュートリアル中は吹き出しを追従させる
 }
@@ -5318,9 +5991,8 @@ function rentRollTab(p, from) {
       <td class="text-right">${!u.occupied && from === 'owned' ? (u.needsRestore
         ? '<span class="text-[11px] text-slate-500">原状回復するまで募集できません</span>'
         : `<div class="flex flex-col items-end gap-0.5">
-            <div class="text-[10px] text-slate-500">今月決まる確率 <b>${Math.round(L.unitFillChance(p, u) * 100)}%</b></div>
-            <button class="fill-ad text-xs border rounded px-1.5 py-0.5" data-i="${i}">📣 ${term('ad', 'AD')}を出す</button>
-            <button class="fill-self text-xs border rounded px-1.5 py-0.5" data-i="${i}">自主${term('kyakuduke', '客付け')}(-${L.SELF_FILL_AP})</button>
+            <div class="text-[10px]">${fillTierText(L.unitFillChance(p, u))}</div>
+            <button class="fill-open bg-navy text-white rounded px-3 py-1.5 text-xs font-bold" data-i="${i}">📣 入居者を募集</button>
           </div>`) : ''}</td></tr>`).join('')}
   </table>
   ${from === 'owned' && p.units.some(u => !u.occupied && !u.needsRestore)
@@ -5328,15 +6000,78 @@ function rentRollTab(p, from) {
   ${from === 'owned' && p.units.some(u => u.needsRestore) ? '<div class="mt-2 text-xs text-amber-700 bg-amber-50 rounded p-2">退去した部屋は原状回復するまで募集できません。フッターの「🔨修繕」から着手できます。</div>' : ''}`;
 }
 
+// v8.6: 客付けの見込みは％を出さず、言葉と★で示す。
+// 数字を出すと「何％なら出すべきか」の計算ゲームになってしまい、
+// 物件を良くするより電卓を叩く遊びに寄る。体感で分かる粒度に落とす。
+// 段の切れ目は「AD 1／2／3ヶ月分が必ず別の段に見える」ように置いてある。
+// 同じ星が並ぶと上のプランを選ぶ意味が伝わらない。
+const FILL_TIERS = [
+  { min: 0.68, stars: 5, label: 'すぐ決まりそう',     cls: 'text-emerald-600' },
+  { min: 0.50, stars: 4, label: 'かなり決まりやすい', cls: 'text-emerald-600' },
+  { min: 0.34, stars: 3, label: '決まりやすい',       cls: 'text-emerald-700' },
+  { min: 0.20, stars: 2, label: 'ふつう',             cls: 'text-amber-600' },
+  { min: 0,    stars: 1, label: '決まりにくい',       cls: 'text-red-600' },
+];
+function fillTier(chance) { return FILL_TIERS.find(t => chance >= t.min) || FILL_TIERS[FILL_TIERS.length - 1]; }
+function fillTierText(chance) {
+  const t = fillTier(chance);
+  return `<span class="${t.cls} font-bold">${'★'.repeat(t.stars)}${'☆'.repeat(5 - t.stars)} ${t.label}</span>`;
+}
+
+// v8.6: 魅力度の内訳と「伸びしろ」。ADを買う画面のすぐ上に置くのが肝で、
+// 「広告費を払う」か「物件を良くする」かを同じ画面で比べられるようにする。
+// ADは払い切りで消えるが、修繕やバリューアップは家賃と資産価値になって残る。
+function appealBox(p, u) {
+  const score = L.appealScore(p, u);
+  const b = L.appealBreakdown(p, u);
+  const W = L.APPEAL_WEIGHTS;
+  const bar = (label, got, max, note) => {
+    const pct = Math.round(got / max * 100);
+    return `<div class="flex items-center gap-1.5">
+      <span class="w-24 shrink-0 text-slate-600">${label}</span>
+      <span class="flex-1 bg-slate-200 rounded-full h-1.5 overflow-hidden">
+        <span class="block h-1.5 ${pct >= 80 ? 'bg-emerald-500' : pct >= 40 ? 'bg-amber-400' : 'bg-red-400'}" style="width:${pct}%"></span></span>
+      <span class="w-16 shrink-0 text-right ${got >= max ? 'text-emerald-600 font-bold' : 'text-slate-500'}">${note}</span></div>`;
+  };
+  // 直せるもののうち、伸びしろが大きい順に案内する（築年・広さは変えられない）
+  const advice = [
+    { gap: W.care - b.care, text: `🧹 日常メンテで手入れを戻すと <b>+${W.care - b.care}</b>` },
+    { gap: W.valueUp - b.valueUp, text: `✨ ${term('value_up', '価値UP')}を1段進めると <b>+${Math.round(W.valueUp / L.VALUE_UP_MAX_LEVEL)}</b>（家賃も上がる）` },
+    { gap: W.struct - b.struct, text: `🏚 大規模修繕で躯体を直すと <b>+${W.struct - b.struct}</b>` },
+  ].filter(x => x.gap > 0).sort((a, c) => c.gap - a.gap).slice(0, 2);
+
+  return `<div class="rounded-lg bg-slate-50 p-2 text-[11px] space-y-1">
+    <div class="flex justify-between items-center font-bold text-xs">
+      <span>🌟 この部屋の魅力度</span>
+      <span class="${score >= 80 ? 'text-emerald-600' : score >= 50 ? 'text-amber-600' : 'text-red-600'}">${score} / 100</span></div>
+    ${bar('🧹 手入れ', b.care, W.care, `${b.care}/${W.care}`)}
+    ${bar(`✨ ${term('value_up', '価値UP')}`, b.valueUp, W.valueUp, `${b.valueUp}/${W.valueUp}`)}
+    ${bar('🏚 躯体', b.struct, W.struct, `${b.struct}/${W.struct}`)}
+    ${bar('🏠 築年数', b.age, W.age, `築${p.builtAge}年`)}
+    ${bar('🚪 広さ', b.layout, W.layout, `${u.sizeSqm ?? '—'}㎡`)}
+    ${advice.length ? `<div class="pt-1 mt-1 border-t border-slate-200 space-y-0.5">
+      <div class="font-bold text-slate-700">💡 ADを買う代わりに、こうも上げられます</div>
+      ${advice.map(a => `<div class="text-slate-600">${a.text}</div>`).join('')}
+      <div class="text-[10px] text-slate-500">ADは払ったら消えますが、修繕・${term('value_up', '価値UP')}は家賃と資産価値になって残ります。</div>
+    </div>` : '<div class="pt-1 mt-1 border-t border-slate-200 text-emerald-700 font-bold">✨ 直せるところは直し切っています。ADに頼らなくても決まるはずです。</div>'}
+  </div>`;
+}
+
+// v8.5: 空室の行にある小さなボタン2つ（AD／自主客付け）は指で押しにくかったので、
+// 「📣 入居者を募集」1つにまとめ、押してからこの画面で手段を選ぶ形にした。
 // v8.4: ADは1〜3ヶ月分から選ぶ。積むほど決まりやすいが、確定はしない。
-function openAdPicker(p, unitIndex, onPick) {
+function openRecruitPicker(p, unitIndex, onAd, onSelf) {
   const u = p.units[unitIndex];
   // 物件詳細（z-50）の上に重ねるので、既存のモーダル枠は使わず専用のオーバーレイを作る。
   const m = el('<div class="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4"></div>');
   document.body.appendChild(m);
   const close = () => m.remove();
   const base = L.unitFillChance(p, u);
-  const rows = Object.values(L.AD_PLANS).map(plan => {
+  const lv = L.skillLevel(state.skills.selfmgmt.exp);
+  const selfChance = Math.min(L.AD_MAX_CHANCE, base + L.SELF_FILL_BASE + (lv - 1) * L.SELF_FILL_PER_LV);
+  const canSelf = state.actionPower >= L.SELF_FILL_AP;
+
+  const adRows = Object.values(L.AD_PLANS).map(plan => {
     const cost = u.rent * plan.months;
     // いま出ているADより弱いプランは意味がないので選ばせない
     const weaker = u.ad && u.ad.months >= plan.months;
@@ -5347,23 +6082,45 @@ function openAdPicker(p, unitIndex, onPick) {
       <div class="flex justify-between items-center">
         <span class="font-bold text-sm">📣 ${plan.label}</span>
         <span class="font-bold">${L.yen(cost)}</span></div>
-      <div class="text-xs text-slate-600">毎月の決まりやすさ <b>${Math.round(base * 100)}% → ${Math.round(after * 100)}%</b>（決まるまで継続）</div>
+      <div class="text-xs text-slate-600">${fillTierText(base)} → ${fillTierText(after)}<span class="text-slate-500">（決まるまで継続）</span></div>
       ${weaker ? '<div class="text-[11px] text-slate-500">すでに同等以上のADを出しています</div>' : ''}
       ${!enough ? '<div class="text-[11px] text-red-600">現金が足りません</div>' : ''}</button>`;
   }).join('');
-  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-2">
-    <div class="flex justify-between items-center"><h2 class="font-bold">📣 ${term('ad', 'AD')}（広告料）を出す</h2><button id="ad-x" class="text-slate-400 text-xl leading-none">✕</button></div>
-    <div class="text-xs text-slate-600">${unitIndex + 1}号室（家賃 ${L.yen(u.rent)}）。客付け業者への成功報酬です。
-      <b>積むほど決まりやすくなりますが、確実ではありません。</b></div>
-    <div class="space-y-1.5">${rows}</div>
-    <div class="text-[11px] text-slate-500">出したADは入居が決まるまで効き続けます。空室損（家賃×空室月数）と見比べて決めましょう。</div>
-    <button id="ad-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
+
+  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-3 max-h-[85vh] overflow-y-auto">
+    <div class="flex justify-between items-center">
+      <h2 class="font-bold">📣 ${unitIndex + 1}号室の入居者を募集</h2>
+      <button id="rc-x" class="text-slate-400 text-xl leading-none">✕</button></div>
+    <div class="text-xs text-slate-600">家賃 ${L.yen(u.rent)}・空室${u.vacantMonths}ヶ月。
+      いまの決まりやすさは ${fillTierText(base)} です。${u.ad ? `<span class="text-emerald-700 font-bold">（${term('ad', 'AD')}${u.ad.months}ヶ月分 掲出中）</span>` : ''}</div>
+
+    ${appealBox(p, u)}
+
+    <div>
+      <div class="font-bold text-sm mb-1">💰 ${term('ad', 'AD')}（広告料）を出す</div>
+      <div class="text-[11px] text-slate-500 mb-1.5">客付け業者への成功報酬。<b>決まるまで効き続けます</b>が、確実ではありません。</div>
+      <div class="space-y-1.5">${adRows}</div>
+    </div>
+
+    <div class="pt-2 border-t">
+      <div class="font-bold text-sm mb-1">🏃 自分で${term('kyakuduke', '客付け')}する</div>
+      <div class="text-[11px] text-slate-500 mb-1.5">現金はかからない代わりに行動力を使う。<b>行動力の続く限り何度でも</b>挑戦できます。</div>
+      <button id="rc-self" class="w-full border-2 rounded-lg p-2.5 text-left ${canSelf ? 'hover:bg-slate-50' : 'opacity-40'}" ${canSelf ? '' : 'disabled'}>
+        <div class="flex justify-between items-center">
+          <span class="font-bold text-sm">🏃 自主${term('kyakuduke', '客付け')}</span>
+          <span class="font-bold">${term('action_power', '行動力')} -${L.SELF_FILL_AP}</span></div>
+        <div class="text-xs text-slate-600">この1回の手応え ${fillTierText(selfChance)}<span class="text-slate-500">（自主管理Lv${lv}）</span></div>
+        ${canSelf ? '' : '<div class="text-[11px] text-red-600">行動力が足りません（翌月へ進むと回復します）</div>'}</button>
+    </div>
+
+    <button id="rc-cancel" class="w-full text-slate-500 text-sm">やめる</button></div>`);
   m.appendChild(box);
   box.querySelectorAll('.ad-pick').forEach(b => b.addEventListener('click', () => {
-    close(); onPick(Number(b.dataset.m));
+    close(); onAd(Number(b.dataset.m));
   }));
-  box.querySelector('#ad-cancel').addEventListener('click', close);
-  box.querySelector('#ad-x').addEventListener('click', close);
+  box.querySelector('#rc-self').addEventListener('click', () => { close(); onSelf(); });
+  box.querySelector('#rc-cancel').addEventListener('click', close);
+  box.querySelector('#rc-x').addEventListener('click', close);
 }
 
 // v3.10: 建物構成サマリ（例: 1K×6戸・平均22㎡）
@@ -5376,7 +6133,9 @@ function buildingComposition(p) {
 
 function plTab(p) {
   if (!p.history.length) return '<div class="text-slate-500">購入後、月が進むと収支が記録されます。</div>';
-  const equity = p.boughtPrice ? p.boughtPrice - (p.loan ? p.loan.principal : 0) + Math.round(p.boughtPrice * L.CONFIG.closingCostRate) : 0;
+  // v8.5: 投下自己資金は購入時に実際に払った諸費用で計算する（旧セーブは概算にフォールバック）
+  const acq = p.acquisitionCost ?? Math.round((p.boughtPrice || 0) * L.CONFIG.closingCostRate);
+  const equity = p.boughtPrice ? p.boughtPrice - (p.loan ? p.loan.principal : 0) + acq : 0;
   const ccr = equity > 0 ? (p.cum.cf / equity * 100).toFixed(1) : '-';
   return `<div class="mb-1">累計CF: <b class="${p.cum.cf >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(p.cum.cf)}</b>（${p.cum.months}ヶ月）／ 自己資金回収率 ${ccr}%</div>
     <div class="max-h-60 overflow-y-auto"><table class="w-full text-xs">
@@ -5413,28 +6172,36 @@ const FILL_BLOCKED = {
   needsRestore: 'この部屋は原状回復が済んでいません。',
 };
 
+// v8.5: 空室1件につきボタンは「📣 入居者を募集」の1つだけ。
+// AD（1〜3ヶ月分）と自主客付けの選択は、押した先の画面でまとめて行う。
 function wireFillButtons(body, p, from) {
-  // v8.4: ADは1〜3ヶ月分から選ぶ。払っても確定はせず、決まるまで毎月効き続ける。
-  body.querySelectorAll('.fill-ad').forEach(b => b.addEventListener('click', () => {
+  body.querySelectorAll('.fill-open').forEach(b => b.addEventListener('click', () => {
     const i = Number(b.dataset.i);
-    openAdPicker(p, i, (adMonths) => {
-      const r = L.fillVacancy(state, p.id, i, 'ad', Math.random, { adMonths });
-      if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
-      if (r.reason === 'noCash') { alert(`現金が足りません（必要 ${L.yen(r.cost)}）`); return; }
-      state = r.state;
-      const nm = `${i + 1}号室`;
-      pushLog(r.success
-        ? `${nm} にAD${adMonths}ヶ月分（${L.yen(r.cost)}）を出し、その月のうちに入居が決まった！`
-        : `${nm} にAD${adMonths}ヶ月分（${L.yen(r.cost)}）を出した（今月は決まらず・掲出は継続中）`);
-      save(); render(); openDetail(p.id, from);
-    });
-  }));
-  body.querySelectorAll('.fill-self').forEach(b => b.addEventListener('click', () => {
-    if (state.actionPower < L.SELF_FILL_AP) { alert('行動力が足りません'); return; }
-    const r = L.fillVacancy(state, p.id, Number(b.dataset.i), 'self', Math.random);
-    if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
-    state = r.state; pushLog(r.success ? '自主客付けに成功！（自主管理+10 EXP）' : '内見はあったが決まらず…（自主管理+10 EXP・何度でも挑戦できる）');
-    save(); render(); openDetail(p.id, from);
+    const nm = `${i + 1}号室`;
+    const done = () => { save(); render(); openDetail(p.id, from); };
+    openRecruitPicker(p, i,
+      // ADを出す（払っても確定はせず、決まるまで毎月効き続ける）
+      (adMonths) => {
+        const r = L.fillVacancy(state, p.id, i, 'ad', Math.random, { adMonths });
+        if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
+        if (r.reason === 'noCash') { alert(`現金が足りません（必要 ${L.yen(r.cost)}）`); return; }
+        state = r.state;
+        pushLog(r.success
+          ? `${nm} にAD${adMonths}ヶ月分（${L.yen(r.cost)}）を出し、その月のうちに入居が決まった！`
+          : `${nm} にAD${adMonths}ヶ月分（${L.yen(r.cost)}）を出した（今月は決まらず・掲出は継続中）`);
+        done();
+      },
+      // 自主客付け（行動力の続く限り何度でも）
+      () => {
+        const r = L.fillVacancy(state, p.id, i, 'self', Math.random);
+        if (FILL_BLOCKED[r.reason]) { alert(FILL_BLOCKED[r.reason]); return; }
+        if (r.reason === 'noActionPower') { alert('行動力が足りません'); return; }
+        state = r.state;
+        pushLog(r.success
+          ? `${nm} の自主客付けに成功！（自主管理+10 EXP）`
+          : `${nm} は内見はあったが決まらず…（自主管理+10 EXP・何度でも挑戦できる）`);
+        done();
+      });
   }));
 }
 
@@ -5644,16 +6411,68 @@ function playOfferSuspense(accepted, cut, done) {
   }, suspenseMs);
 }
 
+// v8.5: 購入諸費用の内訳。売却側と同じ粒度で「何にいくら払うのか」を必ず見せる。
+// loanAmount が0（現金購入）のときは抵当権設定と融資事務手数料の行が消える。
+// v8.8: 内訳はプルダウン開閉式に。タイトル行（合計額）は常に見え、押すと内訳が開閉する。
+function purchaseCostBox(p, price, loanAmount, title, id, open) {
+  const c = L.purchaseCosts(p, price, loanAmount);
+  const row = (label, v) => v ? `<tr><td class="text-slate-600">${label}</td><td class="text-right">${L.yen(v)}</td></tr>` : '';
+  return `<div class="rounded-lg bg-slate-50 p-2 text-xs">
+    <button type="button" data-toggle="${id}" class="w-full flex justify-between font-bold mb-1 text-left"><span>${open ? '▲' : '▶'} ${title}</span><span>${L.yen(c.total)}<span class="font-normal text-slate-500">（価格の${(c.total / price * 100).toFixed(1)}%）</span></span></button>
+    <div class="${open ? '' : 'hidden'}">
+    <table class="w-full">
+      ${row(`${term('chukai_tesuryo', '仲介手数料')}（3%＋6万＋税）`, c.broker)}
+      ${row(term('inshizei', '印紙税'), c.stamp)}
+      ${row(`${term('toroku_menkyozei', '登録免許税')}（所有権移転）`, c.regTransfer)}
+      ${row(`${term('toroku_menkyozei', '登録免許税')}（抵当権設定）`, c.regMortgage)}
+      ${row(term('fudosan_shutokuzei', '不動産取得税'), c.acquisition)}
+      ${row('司法書士報酬', c.scrivener)}
+      ${row('融資事務手数料', c.loanFee)}
+    </table>
+    <div class="text-[10px] text-slate-500 mt-1">登録免許税と不動産取得税は${term('hyoka_gaku', '固定資産税評価額')}（価格の約6割）が基準です。${loanAmount > 0 ? '融資を使うと抵当権設定と事務手数料が上乗せされます。' : '現金購入なので抵当権設定と事務手数料はかかりません。'}</div>
+    </div>
+  </div>`;
+}
+
+// v8.7: 銀行が何を見て判断しているかを表に出す。
+// v8.6までは「属性・信用度が基準未満」としか出ず、現金を積んでも変わらないので
+// 打つ手が分からなかった。頭金を厚くすれば評価が上がることを、その場で見せる。
+// v8.8: こちらもプルダウン開閉式（タイトル行の点数は常に見える）。
+function creditSummaryBox(downRatio, open) {
+  const cr = L.creditForReview(state, downRatio);
+  const need = Object.values(L.BANKS).map(b => b.minCredit).sort((a, b) => a - b);
+  const passes = need.filter(n => cr.total >= n).length;
+  return `<div class="rounded-lg bg-slate-50 p-2 text-[11px]">
+    <button type="button" data-toggle="credit" class="w-full flex justify-between font-bold text-left">
+      <span>${open ? '▲' : '▶'} 🏦 銀行から見たあなたの評価</span>
+      <span class="${passes >= 3 ? 'text-emerald-700' : passes >= 1 ? 'text-amber-600' : 'text-red-600'}">${cr.total} 点</span></button>
+    <div class="${open ? '' : 'hidden'}">
+    <div class="text-slate-600 mt-0.5">
+      属性 <b>${cr.base}</b>${cr.penalty ? `<span class="text-red-600">（管理状態 -${cr.penalty}）</span>` : ''}
+      ＋ ${term('shisan_haikei', '資産背景')} <b>${cr.asset}</b>
+      ＋ ${term('own_cash', '自己資金')}の厚み <b>${cr.down}</b></div>
+    ${cr.down < L.DOWN_PAYMENT_BONUS_MAX
+      ? '<div class="text-navy mt-0.5">💡 頭金を厚くすると評価が上がり、通る銀行が増えます（80%で上限）</div>'
+      : '<div class="text-emerald-700 mt-0.5">✅ 自己資金の評価は上限に達しています</div>'}
+    <div class="text-[10px] text-slate-500 mt-0.5">必要な評価: 公庫20／ノンバンク25／信金35／地銀50</div>
+    </div>
+  </div>`;
+}
+
 function showPayment(propId, price, close) {
   const p = state.market.find(x => x.id === propId);
   const m = document.getElementById('purchase-modal');
-  const cashNeed = price + Math.round(price * L.CONFIG.closingCostRate);
+  const cashClosing = L.closingCostOf(p, price, 0);
+  const cashNeed = price + cashClosing;
   let downRatio = 0.2;
   let buyOwner = 'personal';   // v3.5: 法人設立済みなら購入名義を選べる
+  // v8.8: 諸費用・評価の内訳はプルダウン開閉式。押すと開き、もう一度押すと格納する。
+  let openCash = false, openCredit = false, openLoan = false;
   const draw = () => {
     m.innerHTML = '';
     // v3.6: 頭金は0%〜「手持ち現金で払える上限」まで1%刻みで自由に設定できる（3割上限を撤廃）
-    const closing = Math.round(price * L.CONFIG.closingCostRate);
+    // v8.5: 諸費用は借入額でも変わるので、頭金の上限判定はいったん現金購入ベースの額で見る
+    const closing = L.closingCostOf(p, price, Math.round(price * (1 - downRatio)));
     const maxDownPct = Math.max(0, Math.min(100, Math.floor((state.cash - closing) / price * 100)));
     if (downRatio > maxDownPct / 100) downRatio = maxDownPct / 100;
     const rs = L.reviewAllBanks(p, price, downRatio, state);
@@ -5663,11 +6482,14 @@ function showPayment(propId, price, close) {
         <label class="flex-1 border rounded p-1.5 text-center cursor-pointer ${buyOwner === 'personal' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="personal" ${buyOwner === 'personal' ? 'checked' : ''} class="mr-1">👤 個人</label>
         <label class="flex-1 border rounded p-1.5 text-center cursor-pointer ${buyOwner === 'corp' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="corp" ${buyOwner === 'corp' ? 'checked' : ''} class="mr-1">🏢 法人</label></div>` : ''}
       <button id="pay-cash" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white rounded py-2 text-sm font-bold ${state.cash < cashNeed ? 'opacity-40' : ''}" ${state.cash < cashNeed ? 'disabled' : ''}>現金一括（必要 ${L.yen(cashNeed)}）</button>
+      ${purchaseCostBox(p, price, 0, `📋 現金一括の場合の${term('closing_cost', '諸費用')}`, 'cash', openCash)}
       <div class="text-sm font-bold pt-2 border-t">融資（4行同時審査）</div>
+      <div id="pay-credit">${creditSummaryBox(downRatio, openCredit)}</div>
       <div class="text-sm">${term('own_cash', '頭金')} <b id="pay-down-pct">${Math.round(downRatio * 100)}%</b>＝<span id="pay-down-amt" class="font-bold">${L.yen(Math.round(price * downRatio))}</span>
-        <span class="text-[11px] text-slate-500">（${term('closing_cost', '諸費用')}込み必要現金 <span id="pay-down-need">${L.yen(Math.round(price * downRatio) + Math.round(price * L.CONFIG.closingCostRate))}</span>）</span></div>
+        <span class="text-[11px] text-slate-500">（${term('closing_cost', '諸費用')}込み必要現金 <span id="pay-down-need">${L.yen(Math.round(price * downRatio) + closing)}</span>）</span></div>
       <input id="pay-down-range" type="range" min="0" max="${maxDownPct}" step="1" value="${Math.round(downRatio * 100)}" class="w-full">
       <div class="text-[11px] text-slate-500">スライドで自由に設定できます（手持ち現金で払える上限 ${maxDownPct}%）。離すと審査結果が更新されます。</div>
+      <div id="pay-loan-costs">${purchaseCostBox(p, price, Math.round(price * (1 - downRatio)), `📋 この頭金で融資を使う場合の${term('closing_cost', '諸費用')}`, 'loan', openLoan)}</div>
       <div id="pay-banks"></div>
       <button id="pay-cancel" class="w-full text-slate-500 text-sm">買付を取り下げる（ペナルティなし）</button></div>`);
     m.appendChild(box);
@@ -5684,12 +6506,27 @@ function showPayment(propId, price, close) {
     const range = box.querySelector('#pay-down-range');
     range.addEventListener('input', () => {
       const pct = Number(range.value);
+      // v8.5: 頭金を動かすと借入額が変わり、抵当権設定登記・事務手数料も変わる。内訳ごと追従させる。
+      const loanNow = Math.round(price * (1 - pct / 100));
+      const closingNow = L.closingCostOf(p, price, loanNow);
       box.querySelector('#pay-down-pct').textContent = `${pct}%`;
       box.querySelector('#pay-down-amt').textContent = L.yen(Math.round(price * pct / 100));
-      box.querySelector('#pay-down-need').textContent = L.yen(Math.round(price * pct / 100) + closing);
+      box.querySelector('#pay-down-need').textContent = L.yen(Math.round(price * pct / 100) + closingNow);
+      box.querySelector('#pay-loan-costs').innerHTML =
+        purchaseCostBox(p, price, loanNow, `📋 この頭金で融資を使う場合の${term('closing_cost', '諸費用')}`, 'loan', openLoan);
+      box.querySelector('#pay-credit').innerHTML = creditSummaryBox(pct / 100, openCredit);   // v8.7: 評価も追従
     });
     range.addEventListener('change', () => { downRatio = Number(range.value) / 100; draw(); });
     box.querySelectorAll('input[name="buy-owner"]').forEach(rb => rb.addEventListener('change', e => { buyOwner = e.target.value; draw(); }));
+    // v8.8: プルダウン開閉。box に委譲することで #pay-credit / #pay-loan-costs の innerHTML 差し替え後も効く。
+    box.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-toggle]');
+      if (!btn) return;
+      if (btn.dataset.toggle === 'cash') openCash = !openCash;
+      else if (btn.dataset.toggle === 'credit') openCredit = !openCredit;
+      else if (btn.dataset.toggle === 'loan') openLoan = !openLoan;
+      draw();
+    });
     const ownerLabel = () => buyOwner === 'corp' ? '🏢法人名義' : '👤個人名義';
     box.querySelector('#pay-cash').addEventListener('click', () => {
       const r = L.buyPropertyV2(state, propId, { method: 'cash', price, owner: buyOwner });
@@ -6416,16 +7253,20 @@ function openDiySession(propId, sel, category, back) {
   }
 
   // --- timing モード: 往復するマーカーを緑ゾーンで止める ---
-  const runTiming = (onResult) => {
+  // v8.8: 難しすぎたので緑ゾーンを1.5倍に拡大。加えてミスするほどマーカーが遅くなる
+  // 救済を入れた（初速1→0.8→0.6）。3回ミスしたらそれ以上は詰まらせず強制でクリアにする。
+  const TIMING_SPEEDS = [1, 0.8, 0.6];
+  const runTiming = (onResult, missCount = 0) => {
     const bar = box.querySelector('#diy-timing');
-    const zoneW = easy ? 34 : 20;                       // 緑ゾーンの幅（%）
+    const zoneW = (easy ? 34 : 20) * 1.5;               // 緑ゾーンの幅（%）
     const zoneL = 8 + Math.random() * (84 - zoneW);     // 端に寄りすぎないよう内側に置く
     bar.className = 'relative w-full h-7 bg-slate-200 rounded-lg overflow-hidden cursor-pointer select-none';
     bar.innerHTML = `<div class="absolute inset-y-0 bg-emerald-400/70" style="left:${zoneL}%;width:${zoneW}%"></div>
       <div id="diy-marker" class="absolute inset-y-0 w-1 bg-navy" style="left:0%"></div>
       <div class="absolute inset-0 flex items-center justify-center text-[11px] font-bold text-navy pointer-events-none">タップで止める</div>`;
     const marker = bar.querySelector('#diy-marker');
-    const period = easy ? 1500 : 1050;                  // 往復1周にかかる時間（短いほど難しい）
+    const speedMult = TIMING_SPEEDS[Math.min(missCount, TIMING_SPEEDS.length - 1)];
+    const period = (easy ? 1500 : 1050) / speedMult;    // 往復1周にかかる時間（短いほど難しい）
     const t0 = performance.now();
     let stopped = false;
     // 判定位置は「タップした瞬間の実時刻」から計算する。requestAnimationFrame は
@@ -6461,6 +7302,7 @@ function openDiySession(propId, sel, category, back) {
     const orderNo = kit.order.indexOf(key) + 1;
     const act = kit.acts[key];
     const [actIcon, actLabel] = DIY_ACTIONS[act];
+    let timingMisses = 0;   // このスポットのtimingモード連続ミス数（3回で強制クリア）
     const spot = el(`<button class="diy-spot absolute" data-k="${key}" data-a="${act}" style="left:${pos.l}%;top:${pos.t}%;transform:translate(-50%,-50%);width:60px;height:60px;padding:0;border:0;background:transparent;cursor:pointer;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.25));">
       <svg viewBox="0 0 64 64" width="60" height="60" style="border-radius:8px;">${DIY_ART[key]('b')}</svg>
       ${showNums ? `<span class="diy-num absolute -top-1 -left-1 bg-navy text-white text-[10px] font-black rounded-full w-4 h-4 flex items-center justify-center">${orderNo}</span>` : ''}
@@ -6512,12 +7354,18 @@ function openDiySession(propId, sel, category, back) {
           spot.dataset.busy = '';
           if (result === 'miss') {
             misses++; shake(spot);
-            note('手元が狂った…もう一度', false);
+            timingMisses++;
+            if (timingMisses >= 3) {
+              note('手元が狂ったが…力技でなんとか収まった！', true);
+              finishSpot(spot, key);
+              return;
+            }
+            note('手元が狂った…もう一度（次はゆっくりになる）', false);
             return;
           }
           note(result === 'perfect' ? '✨ Perfect！' : '👍 Good', true);
           finishSpot(spot, key);
-        });
+        }, timingMisses);
       }
     });
   });
@@ -6911,6 +7759,20 @@ function openSoldSnapshot(p) {
   box.querySelector('#ss-close').addEventListener('click', close);
 }
 
+// v8.8: 通知の種類ごとの表示設定（持続／一時／非通知）。開閉はバランスシート詳細と同じ「押して開閉」方式。
+let notifSettingsOpen = false;
+function notifSettingsRows() {
+  const mode = (m, label, kind) => {
+    const active = L.notifModeOf(state, kind) === m;
+    return `<button class="notif-mode-btn text-[10px] rounded px-1.5 py-0.5 border ${active ? 'bg-navy text-white border-navy' : 'text-slate-500'}" data-kind="${kind}" data-mode="${m}">${label}</button>`;
+  };
+  return Object.entries(L.NOTIF_KIND_INFO).map(([kind, info]) => `
+    <div class="flex items-center justify-between gap-1 text-[11px] py-1 border-b last:border-0">
+      <span class="flex-1">${info.label}</span>
+      <div class="flex gap-1 shrink-0">${mode('persist', '持続', kind)}${mode('temp', '一時', kind)}${mode('off', '非通知', kind)}</div>
+    </div>`).join('');
+}
+
 // 通知は一覧を開いただけでは既読にならず、✓（詳細へ）か✕（閉じる）を個別に押して初めてチェック済みになる。
 function openNotificationsModal() {
   const m = document.getElementById('notifications-modal');
@@ -6930,10 +7792,19 @@ function openNotificationsModal() {
     </div>`).join('') : '<div class="text-slate-500 text-sm">通知はまだありません</div>';
   const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2">
     <div class="flex justify-between items-center"><h2 class="font-bold">🔔 通知</h2><button id="notifs-close" class="text-slate-400 text-xl">✕</button></div>
+    <button id="notifs-settings-toggle" class="w-full text-[11px] font-bold text-navy underline text-left">${notifSettingsOpen ? '▲ 通知の表示設定を閉じる' : '▶ 通知の表示設定'}</button>
+    ${notifSettingsOpen ? `<div class="border rounded p-2">${notifSettingsRows()}</div>` : ''}
     ${rows}</div>`);
   m.appendChild(box);
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   box.querySelector('#notifs-close').addEventListener('click', close);
+  box.querySelector('#notifs-settings-toggle').addEventListener('click', () => {
+    notifSettingsOpen = !notifSettingsOpen; openNotificationsModal();
+  });
+  box.querySelectorAll('.notif-mode-btn').forEach(b => b.addEventListener('click', () => {
+    state = L.setNotifMode(state, b.dataset.kind, b.dataset.mode).state;
+    save(); openNotificationsModal();
+  }));
   box.querySelectorAll('.notif-dismiss').forEach(b => b.addEventListener('click', () => {
     const id = Number(b.dataset.id);
     state = L.markNotificationRead(state, id).state;
@@ -6961,7 +7832,12 @@ function dismissToast(t) {
   setTimeout(() => t.remove(), 300);
   restackToasts();
 }
+// v8.8: mode='off' はポップアップを出さない（🔔通知一覧には種類によらず残る）。
+// mode='temp' は数秒で自動的に消える。既定・未設定は従来どおり手動で閉じるまで残る（persist）。
+const NOTIF_TEMP_MS = 4000;
 function showNotifToast(n) {
+  const mode = L.notifModeOf(state, n.kind);
+  if (mode === 'off') return;
   const t = el(`<div class="fixed left-1/2 -translate-x-1/2 bg-amber-500 text-white rounded-lg shadow-lg px-3 py-2 z-[60] text-sm font-bold flex items-center gap-2">
     <span class="flex-1">🔔 ${n.message}</span>
     <button class="toast-check bg-white/25 rounded px-2 py-1 text-xs shrink-0" title="物件詳細へ">✓</button>
@@ -6978,6 +7854,7 @@ function showNotifToast(n) {
     dismissToast(t);
     openPropertyFromNotif(n);
   });
+  if (mode === 'temp') setTimeout(() => dismissToast(t), NOTIF_TEMP_MS);
 }
 // Enterキーで一番上（最初に出た）トーストから順に閉じる。
 document.addEventListener('keydown', (e) => {
@@ -7130,20 +8007,141 @@ function onSearchPress(box, closeModal) {
   return { pressed: true, found: false };
 }
 
-// 🔒未開拓エリアをタップしたときの気の利いたティーザー（今後のアップデート解放を匂わせる）。
-function openLockTeaser() {
+// ================================================================
+// v9-A: エリア（陸地）の切り替えと解放
+// ================================================================
+// 旧「未開拓エリアのティーザー（いつか新しい街が…）」を、条件と進捗が見えるパネルに置き換えた。
+// 「いつか」は飾りにしかならないが、「あと2棟」は目標になる。
+
+// エリアピル。解放済みは押すとその陸地へ視点が回り、未解放は解放条件パネルが出る。
+function renderRegionPills() {
+  const box = document.getElementById('region-pills');
+  if (!box) return;
+  box.classList.toggle('hidden', !state);
+  if (!state) return;
+  box.innerHTML = `<div class="flex gap-1.5 items-center">` + Object.values(L.REGIONS).map(r => {
+    const open = L.isRegionUnlocked(state, r.key);
+    const cls = open
+      ? 'bg-white/15 hover:bg-white/25 text-white border-white/25'
+      : 'bg-black/25 hover:bg-black/35 text-slate-300 border-white/10';
+    return `<button class="rp-btn shrink-0 border rounded-full px-2.5 py-1 text-[11px] font-bold ${cls}" data-region="${r.key}">`
+      + `${r.icon} ${r.label}${open ? '' : ' 🔒'}</button>`;
+  }).join('') + `</div>`;
+  box.querySelectorAll('.rp-btn').forEach(b => b.addEventListener('click', () => {
+    const key = b.dataset.region;
+    sfxClick();
+    focusOnRegion(key);
+    if (!L.isRegionUnlocked(state, key)) setTimeout(() => openRegionPanel(key), 700);
+  }));
+}
+
+// 入場条件バッジ。r.gate があるエリアだけ、金枠のバッジで表示する。
+function gateBadgeHtml(r) {
+  if (!r.gate) return '';
+  return `<div class="inline-block text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-300 rounded-full px-2.5 py-0.5">
+    🔑 ${r.gate}</div>`;
+}
+
+// 解放条件パネル。進捗は L.regionUnlockProgress の戻り値だけで描く（条件のロジックをUIに書かない）。
+//
+// r.ready が false（＝中身がまだ無く、企画を伏せている段階）のあいだは、達成状況を数字で
+// 見せない。条件そのものはモザイク（CSSぼかし）の下に隠し、「今後のアップデートで解禁」とだけ
+// 伝える——シークレット感を出すための表示上の演出であり、実際の解放判定（ready ゲート）とは別物。
+// 中身が実装されて ready:true になったら、この分岐は自然に「実際の進捗を見せる」側へ回る。
+function openRegionPanel(key) {
+  const r = L.REGIONS[key];
+  if (!r) return;
+  const pr = L.regionUnlockProgress(state, key);
+
+  if (!pr.unlocked && !r.ready) {
+    const overlay = el(`<div class="fixed inset-0 z-[65] bg-black/60 flex items-center justify-center p-4">
+      <div class="bg-white rounded-xl p-5 max-w-xs w-full text-center space-y-3">
+        <div class="text-4xl">🔒</div>
+        <h2 class="font-bold text-lg">${r.icon} ${r.label}</h2>
+        ${gateBadgeHtml(r)}
+        <p class="text-sm text-slate-600">${r.desc}</p>
+        <div class="relative rounded-lg border border-slate-200 bg-slate-50 p-3 text-left overflow-hidden">
+          <div class="space-y-1.5" style="filter:blur(4px); opacity:0.55; user-select:none;">
+            <div class="flex justify-between text-xs font-bold text-slate-600">
+              <span>⬜ 条件A</span><span>？？？</span></div>
+            <div class="h-2 rounded bg-slate-300"></div>
+            <div class="flex justify-between text-xs font-bold text-slate-600">
+              <span>⬜ 条件B</span><span>？？？</span></div>
+            <div class="h-2 rounded bg-slate-300"></div>
+          </div>
+          <div class="absolute inset-0 flex items-center justify-center">
+            <span class="text-[11px] font-bold text-slate-500 bg-white/70 rounded px-2 py-1">解放条件は非公開</span>
+          </div>
+        </div>
+        <p class="text-[11px] font-bold text-amber-600">🚧 今後のアップデートで解禁予定</p>
+        <button id="rg-ok" class="w-full bg-navy text-white rounded py-2 text-sm font-bold">閉じる</button>
+      </div></div>`);
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector('#rg-ok').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    return;
+  }
+
+  const fmtVal = (c) => c.fmt === 'yen' ? L.yen(c.cur)
+    : c.fmt === 'bool' ? (c.cur ? '済み' : 'まだ') : `${c.cur}`;
+  const fmtNeed = (c) => c.fmt === 'yen' ? L.yen(c.need)
+    : c.fmt === 'bool' ? '必要' : `${c.need}`;
+  const rows = pr.conditions.map((c, i) => {
+    const ratio = Math.max(0, Math.min(1, c.need ? c.cur / c.need : 1));
+    const joiner = i === 0 ? '' :
+      `<div class="text-[11px] font-bold text-slate-500 text-center">${pr.mode === 'or' ? 'または' : 'かつ'}</div>`;
+    return joiner + `<div>
+      <div class="flex justify-between text-xs font-bold ${c.met ? 'text-emerald-600' : 'text-slate-600'}">
+        <span>${c.met ? '✅' : '⬜'} ${c.label}</span>
+        <span>${fmtVal(c)} / ${fmtNeed(c)}</span>
+      </div>
+      <div class="h-2 rounded bg-slate-200 overflow-hidden mt-0.5">
+        <div class="h-full ${c.met ? 'bg-emerald-500' : 'bg-navy'}" style="width:${Math.round(ratio * 100)}%"></div>
+      </div>
+    </div>`;
+  }).join('');
+  const footer = pr.unlocked
+    ? `<p class="text-[11px] font-bold text-emerald-600">✅ 解放済み</p>`
+    : pr.met
+      ? `<p class="text-[11px] font-bold text-amber-600">🚧 まもなく開通</p>`
+      : `<p class="text-[11px] text-slate-500">条件を満たすと解放される</p>`;
   const overlay = el(`<div class="fixed inset-0 z-[65] bg-black/60 flex items-center justify-center p-4">
-    <div class="bg-white rounded-xl p-6 max-w-xs text-center space-y-3">
-      <div class="text-5xl">🔒🏝️</div>
-      <h2 class="font-bold text-lg">未開拓エリア</h2>
-      <p class="text-sm text-slate-600">ここはまだ手つかずの原野。<br>君がもっと大物大家になるか、時が満ちれば……いつか新しい街が広がるかも。</p>
-      <p class="text-[11px] text-slate-500">🚧 今後のアップデートで解放予定</p>
-      <button id="lock-ok" class="w-full bg-navy text-white rounded py-2 text-sm">わくわく…！</button>
+    <div class="bg-white rounded-xl p-5 max-w-xs w-full text-center space-y-3">
+      <div class="text-4xl">${pr.unlocked ? r.icon : '🔒'}</div>
+      <h2 class="font-bold text-lg">${r.icon} ${r.label}</h2>
+      ${gateBadgeHtml(r)}
+      <p class="text-sm text-slate-600">${r.desc}</p>
+      <div class="space-y-1.5 text-left">${rows}</div>
+      ${footer}
+      <button id="rg-ok" class="w-full bg-navy text-white rounded py-2 text-sm font-bold">閉じる</button>
     </div></div>`);
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
-  overlay.querySelector('#lock-ok').addEventListener('click', close);
+  overlay.querySelector('#rg-ok').addEventListener('click', close);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+}
+
+// 解放演出。🔒が砕ける → 地図がそのエリアへ回る → 黒い土地に色が戻り、橋が架かる（島は航路と✈️）。
+// A段階では REGIONS[].ready が false なので自然には発火しない。`?unlock=` で確認する。
+function playRegionUnlock(key) {
+  const r = L.REGIONS[key];
+  if (!r) return;
+  focusOnRegion(key);
+  sfxFanfare();
+  const overlay = el(`<div class="fixed inset-0 z-[68] pointer-events-none flex items-center justify-center">
+    <div class="text-center" style="animation: rgUnlock 2.2s ease-out forwards;">
+      <div class="text-6xl">🔓</div>
+      <div class="text-white font-black text-2xl mt-1" style="text-shadow:0 2px 12px rgba(0,0,0,0.8);">${r.icon} ${r.label}</div>
+      <div class="text-amber-200 font-bold text-sm mt-1" style="text-shadow:0 2px 8px rgba(0,0,0,0.8);">
+        ${r.island ? '航路がひらかれた' : '橋が架かった'}</div>
+    </div></div>`);
+  document.body.appendChild(overlay);
+  setTimeout(() => overlay.remove(), 2300);
+  // 回転が終わって新しい陸地が正面に来てから判子を押す（何に対する「開拓」かが分かるように）
+  setTimeout(() => playStampFx({
+    stamp: '開拓', title: `${r.icon} ${r.label} が解放された`, sub: r.desc, emojis: ['🗺️', '🎉', '✨'],
+  }), r.island ? 2000 : 1600);
 }
 
 // 翌月へ進む瞬間、シティビューの各建物から現金表示へ💰（ドル袋）が飛ぶ「回収」の動き。
@@ -7278,6 +8276,8 @@ function onNextMonth() {
   (r.logs || []).forEach(pushLog);
   save(); render();
   maybeOfferRewind();
+  // v9-A: 新しい陸地が解放された月は、その演出を最優先で見せる（通知トーストより先）
+  (r.newlyUnlocked || []).forEach((key, i) => setTimeout(() => playRegionUnlock(key), 200 + i * 3200));
   const freshNotifs = (state.notifications || []).filter(n => !priorNotifIds.has(n.id));
   freshNotifs.forEach((n, i) => setTimeout(() => showNotifToast(n), 500 + i * 900));
   // v3.6: 売却成立も買付・購入と同じ判子スタンプ演出に統一
@@ -7686,11 +8686,24 @@ initCity(document.getElementById('city-canvas'), {
   onTapProperty: (id) => { if (state) openDetail(id, 'owned'); },
   onTapMarket: (id) => { if (state) openPurchase(id); },
   onTapMarketDetail: (id) => { if (state) openDetail(id, 'market'); },   // 地図のピンをクリック→詳細画面
-  onTapLock: () => openLockTeaser(),                                      // 🔒未開拓エリアをクリック→ティーザー
+  onTapLock: (key) => openRegionPanel(key),                               // 🔒未解放エリアをクリック→解放条件パネル
 });
 
 // 起動（v3.7: まずタイトル画面。セーブがあれば「続きから」）
 showTitle(load());
+
+// v9-A: 検証用の強制解放。A段階では REGIONS[].ready が false で自然には解放されないため、
+// 地形と演出をこれで確認する。`?unlock=newbuild` / `?unlock=all`。
+// 製品コードとして残してよい（デバッグフックのように後で消す必要はない）。
+{
+  const want = new URLSearchParams(location.search).get('unlock');
+  if (want && state) {
+    const keys = want === 'all' ? Object.keys(L.REGIONS).filter(k => k !== 'main') : want.split(',');
+    let changed = false;
+    keys.forEach(k => { if (L.unlockRegion(state, k.trim())) changed = true; });
+    if (changed) { save(); render(); }
+  }
+}
 document.getElementById('btn-result')?.addEventListener('click', () => openResultScreen('clear'));
 
 document.getElementById('btn-reset').addEventListener('click', () => {
