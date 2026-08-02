@@ -136,11 +136,13 @@
   @media (max-width: 360px) {
     #hud-clock-extra { display: none !important; }
   }
-  /* v11.6: clamp()は「ビューポート幅」しか見ないため、経過年数や現金の桁が増えて実際の
-     文字数が伸びると、幅は同じでもhud-clock-extra込みの合計幅が#hud-clockからはみ出し、
-     overflow:hiddenで末尾の⚡行動力だけが数px欠けて見切れることがあった（360px超の幅でも発生）。
-     JS側(renderHeaderClock)で実測してはみ出す時だけ付与するクラス。 */
-  .hud-extra-fit-hide { display: none !important; }
+  /* v11.7: v11.6はclamp()で縮めても#hud-clockからはみ出す時、JS側(renderHeaderClock)で
+     実測して#hud-clock-extra（💰現金/📈CF/⚡行動力）を丸ごと隠す対策にしていた。
+     しかし現金・CFは投資が進むほど桁が増え続ける一方なので、一度はみ出すと二度と収まらず、
+     現金・CF・行動力が全く表示されないまま復活しなくなる不具合だった。
+     金額side（現金・CF）だけを個別に…省略させ、⚡行動力を含む全体は必ず表示され続けるようにする。 */
+  #hud-clock-cash { display: inline-block; max-width: 11ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+  #hud-clock-cf { display: inline-block; max-width: 8ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
   /* v11.6: 縦幅が狭い端末で#mobile-status（現金/CF/行動力＋市場/所有）と#mobile-actions
      （探す/働く/翌月）が重なるのを避けるため、JS側(fitMobileHud)が実測して現金/CF/行動力の
      1段目（ヘッダーのhud-clock-extraと重複する情報）だけを畳む時に付与するクラス。 */
@@ -168,6 +170,12 @@
     #diy-modal {
       padding-top: calc(36px + env(safe-area-inset-top, 0px) + 8px) !important;
       align-items: flex-start !important;
+    }
+    /* v11.8: 上記13モーダルは中身が長い前提で「ヘッダー直下から開始」（flex-start）にしたが、
+       募集ポップアップ等のように中身が短いウインドは同じpadding-topだけ足してalign-itemsは
+       centerのまま（デフォルト）にする。ヘッダー分の余白を除いた領域のちょうど中央に来る。 */
+    .modal-below-header {
+      padding-top: calc(36px + env(safe-area-inset-top, 0px) + 8px) !important;
     }
   }
   /* ノッチ／ホームインジケータを避ける（viewport-fit=cover と対で機能する） */
@@ -2001,13 +2009,15 @@ export const EVENTS = [
       { label: '防水を部分補修する（-¥300,000）', log: '雨漏りを修理した', apply: evPay(300000) },
       { label: '様子を見る（躯体-20・入居者1戸退去）', log: '入居者が愛想を尽かして退去…',
         apply: evChain(evHitStruct(20), evEvict(1)) } ] },
-  { id: 'daikibo_shuzen', title: '🏗️ 外壁塗装・大規模修繕の見積もりが届いた', cooldown: 144,
+  { id: 'daikibo_shuzen', title: '🏗️ 外壁のヒビについて入居者から問い合わせが来た', cooldown: 144,
     // 1回目の外壁塗装は築12〜15年で来る。区分は管理組合が積立金でやるので対象外。
+    // v11.7: 大規模修繕そのものはイベント内で完結させない（見積書の提示が要る重い処理のため）。
+    // 実際の工事は物件詳細の「修繕」（見積・DIY/業者選択）で行う。ここでは入居者対応の要否だけを選ぶ。
     match: evTarget({ minAge: 12, kind: 'notKubun', structBelow: 90 }),
     choices: [
-      { label: '実施する（躯体100%・資産価値+8%）', log: '大規模修繕を実施。ピカピカに',
-        apply: (s, id) => { const p = evFind(s, id); if (p) { s.cash -= repairCost(p, 'large'); p.repairState = 100; p.timeValue = Math.round(p.timeValue * 1.08); } return s; } },
-      { label: '先送りする（躯体-15）', log: '先送りした…外壁のヒビが気になる', apply: evHitStruct(15) } ] },
+      { label: '確認する（行動力-10）', log: '入居者に事情を説明し、ひとまず様子を見てもらった',
+        apply: s => { s.actionPower -= 10; return s; } },
+      { label: '放置する（躯体-15）', log: '放置した…外壁のヒビが広がっている', apply: evHitStruct(15) } ] },
   { id: 'tile_ukiage', title: '🧱 外壁タイルの浮きが見つかった', cooldown: 144,
     // 打診調査（10年ごとの特定建築物定期調査）で指摘される。タイル張りは主にS・RCの一棟もの。
     match: evTarget({ structures: ['S', 'RC'], kind: 'tou', minAge: 15, minUnits: 6, structBelow: 85 }),
@@ -5218,8 +5228,8 @@ function renderTutFinal(stp) {
   tutMaskEls.push(veil);
 
   const canBack = tutPrevIdx() >= 0;
-  tutBubble = el(`<div class="fixed inset-0 z-[65] flex items-center justify-center p-4 pointer-events-none">
-    <div class="bg-white rounded-xl shadow-2xl p-4 w-full max-w-xs space-y-3 border-2 border-amber-400 pointer-events-auto text-center">
+  tutBubble = el(`<div class="fixed inset-0 z-[65] flex items-center justify-center p-4 pointer-events-none modal-below-header">
+    <div class="bg-white rounded-xl shadow-2xl p-4 w-full max-w-xs space-y-3 border-2 border-amber-400 pointer-events-auto text-center max-h-[85vh] overflow-y-auto" style="max-height:85dvh">
       <div class="text-3xl">🧑‍🏫</div>
       <div class="font-bold text-slate-800">チュートリアル終了</div>
       <div class="text-xs text-slate-700 leading-relaxed text-left">${linkTerms(stp.text)}</div>
@@ -5708,14 +5718,6 @@ function renderHeaderClock() {
   cfEl.classList.toggle('hud-money', mcf >= 0);
   cfEl.classList.toggle('hud-bad', mcf < 0);
   box.querySelector('#hud-clock-ap').textContent = `${state.actionPower}/${state.baseActionPower}`;
-  // v11.6: 経過年数や現金の桁が増えて実際の文字数が伸びると、clamp()で縮めた後でも
-  // #hud-clockからはみ出し、overflow:hiddenで末尾の⚡行動力だけが見切れることがあった。
-  // 実測してはみ出す時だけ#hud-clock-extra（#mobile-statusと重複する情報）を畳む。
-  const extra = box.querySelector('#hud-clock-extra');
-  if (extra) {
-    extra.classList.remove('hud-extra-fit-hide');
-    if (box.scrollWidth > box.clientWidth) extra.classList.add('hud-extra-fit-hide');
-  }
 }
 
 // バランスシートの先頭に置く1行。PC左パネルとスマホの資産モーダルで共用する。
@@ -6683,7 +6685,7 @@ function appealBox(p, u) {
 function openRecruitPicker(p, unitIndex, onAd, onSelf) {
   const u = p.units[unitIndex];
   // 物件詳細（z-50）の上に重ねるので、既存のモーダル枠は使わず専用のオーバーレイを作る。
-  const m = el('<div class="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4"></div>');
+  const m = el('<div class="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4 modal-below-header"></div>');
   document.body.appendChild(m);
   const close = () => m.remove();
   const base = L.unitFillChance(p, u);
@@ -7332,7 +7334,9 @@ function openSell(propId) {
     const r = L.requestAppraisal(state, propId, Math.random);
     state = r.state; save();
     // v8.13: backを渡していなかったため、価格決定画面に×しか無く前の画面へ戻れなかった。
-    drawPricing(m, p, r.appraisal, close, () => openSell(propId));
+    // v11.2: afterListはnull固定。openSell(propId)をbackとafterList両方に使うと、売り出し成功直後の
+    // 再実行が新規掲載を検知して管理画面（5%値下げ/取り下げ）を初回から開いてしまうため。
+    drawPricing(m, p, r.appraisal, close, () => openSell(propId), null);
   });
 }
 
@@ -7366,8 +7370,11 @@ function netProceedsBox(p, price, hideWait = false) {
 }
 
 // v3.5: 売出価格は自由入力。査定はあくまで参考値として表示し、利回りをリアルタイムに見ながら自分で決める。
-// v3.6: backを渡すと「← 戻る」を表示し、売り出し後・戻る押下でひとつ前の画面（売却センター等）へ戻る。
-function drawPricing(m, p, appraisal, close, back) {
+// v3.6: backを渡すと「← 戻る」を表示し、戻る押下でひとつ前の画面（売却センター等）へ戻る。
+// v11.2: 売り出し成功後の戻り先は afterList で別指定する（省略時はbackを流用）。openSell()自身をbackに
+// 渡す呼び出し元だと、backをそのまま流用すると掲載直後のopenSell()再実行が「既に掲載中」を検知して
+// 管理画面（5%値下げ/取り下げ）を初回から開いてしまうため、backと切り離した。
+function drawPricing(m, p, appraisal, close, back, afterList = back) {
   m.innerHTML = '';
   let price = appraisal;
   const gpi = L.gpiAnnual(p);
@@ -7419,7 +7426,7 @@ function drawPricing(m, p, appraisal, close, back) {
     state = r.state;
     pushLog(`${p.label} を ${L.yen(price)} で売りに出した（表面${yieldOf(price)}%）`);
     save(); render(); close();
-    back?.();   // v3.6: 売りに出したらひとつ前の画面（売却センター等）へ戻る
+    afterList?.();   // v11.2: 売り出し後の戻り先（backとは別。openSell経由では管理画面を初回に開かせないためnull）
   });
   box.querySelector('#sl-back')?.addEventListener('click', () => { close(); back(); });
   box.querySelector('#sl-cancel2').addEventListener('click', close);
@@ -8965,8 +8972,8 @@ function openRegionPanel(key) {
   const pr = L.regionUnlockProgress(state, key);
 
   if (!pr.unlocked && !r.ready) {
-    const overlay = el(`<div class="fixed inset-0 z-[65] bg-black/60 flex items-center justify-center p-4">
-      <div class="bg-white rounded-xl p-5 max-w-xs w-full text-center space-y-3">
+    const overlay = el(`<div class="fixed inset-0 z-[65] bg-black/60 flex items-center justify-center p-4 modal-below-header">
+      <div class="bg-white rounded-xl p-5 max-w-xs w-full text-center space-y-3 max-h-[85vh] overflow-y-auto" style="max-height:85dvh">
         <div class="text-4xl">🔒</div>
         <h2 class="font-bold text-lg">${r.icon} ${r.label}</h2>
         ${gateBadgeHtml(r)}
@@ -9017,8 +9024,8 @@ function openRegionPanel(key) {
     : pr.met
       ? `<p class="text-[11px] font-bold text-amber-600">🚧 まもなく開通</p>`
       : `<p class="text-[11px] text-slate-500">条件を満たすと解放される</p>`;
-  const overlay = el(`<div class="fixed inset-0 z-[65] bg-black/60 flex items-center justify-center p-4">
-    <div class="bg-white rounded-xl p-5 max-w-xs w-full text-center space-y-3">
+  const overlay = el(`<div class="fixed inset-0 z-[65] bg-black/60 flex items-center justify-center p-4 modal-below-header">
+    <div class="bg-white rounded-xl p-5 max-w-xs w-full text-center space-y-3 max-h-[85vh] overflow-y-auto" style="max-height:85dvh">
       <div class="text-4xl">${pr.unlocked ? r.icon : '🔒'}</div>
       <h2 class="font-bold text-lg">${r.icon} ${r.label}</h2>
       ${gateBadgeHtml(r)}
