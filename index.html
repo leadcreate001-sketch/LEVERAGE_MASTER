@@ -150,6 +150,16 @@
     header { position: relative; z-index: 55 !important; }
     /* v8.17: 💰現金・📈月CF・⚡行動力の3項目が詰まって見えたのでinline-flex+gapで間隔を空ける。 */
     #hud-clock-extra { display: inline-flex; align-items: center; gap: 10px; }
+    /* v11.5: ヘッダーをモーダルより前面(z-55>z-50/40/30)にしたことで、中身が長い(94vh近い)
+       モーダルは中央寄せの結果、上端がヘッダーの帯(実測36px)と重なり、モーダル自身の見出しや
+       先頭のボタンがヘッダーの下に隠れて操作できなくなっていた。全モーダルの上パディングを
+       ヘッダー高さぶん確保し、モーダルの中身が必ずヘッダーの下から始まるようにする。 */
+    #setup-modal, #event-modal, #detail-modal, #purchase-modal, #sell-modal, #repair-modal,
+    #search-modal, #log-modal, #listings-modal, #notifications-modal, #kpi-modal, #bgm-modal,
+    #diy-modal {
+      padding-top: calc(36px + env(safe-area-inset-top, 0px) + 8px) !important;
+      align-items: flex-start !important;
+    }
   }
   /* ノッチ／ホームインジケータを避ける（viewport-fit=cover と対で機能する） */
   #mobile-actions {
@@ -7100,10 +7110,13 @@ function showPayment(propId, price, close) {
     // 金利等の詳細も「金利・年数」「月返済・自己資金」の2行に固定し、自然な折り返しに任せない。
     // v11.4: ◯／✕アイコンを削除（紺=借りられる／灰=借りられないの背景色だけで可否は伝わる）。
     // 否決カードはタップで理由をalert表示できるようにし、アイコンが無くなった分の分かりにくさを補う。
+    // v11.5: 銀行名はtruncate(省略記号)ではなくフォントサイズを縮めて全文字を表示する
+    // （「日本政策金融公庫」のような長い名前でも省略しない）。
+    const bankNameStyle = 'font-size:clamp(0.65rem,3.5vw,0.875rem)';
     banksDiv.innerHTML = rs.map(r => r.approved
       ? `<div class="border rounded p-1.5 mb-1 bg-navy text-white">
           <div class="flex items-center justify-between gap-1.5">
-            <b class="min-w-0 truncate">${r.label}</b>
+            <b class="min-w-0" style="${bankNameStyle}">${r.label}</b>
             ${metricsBadge(r, true)}
           </div>
           <div class="text-[11px] text-white/80 mt-0.5">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年</div>
@@ -7111,12 +7124,11 @@ function showPayment(propId, price, close) {
           <button class="pay-bank w-full bg-white text-navy rounded py-1.5 text-sm font-bold mt-1.5" data-k="${r.bankKey}">借りる</button></div>`
       : `<div class="bank-rejected border rounded p-1.5 mb-1 bg-slate-50 cursor-pointer" data-k="${r.bankKey}">
           <div class="flex items-center justify-between gap-1.5">
-            <b class="min-w-0 truncate text-slate-400">${r.label}</b>
+            <b class="min-w-0 text-slate-400" style="${bankNameStyle}">${r.label}</b>
             ${metricsBadge(r, false)}
           </div>
           ${r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').length
-            ? `<div class="text-[11px] text-red-600 mt-0.5">${linkTerms(r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').map(x => x.msg).join('／'))}</div>` : ''}
-          <div class="text-[10px] text-slate-400 mt-0.5">タップで理由を見る</div></div>`).join('');
+            ? `<div class="text-[11px] text-red-600 mt-0.5">${linkTerms(r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').map(x => x.msg).join('／'))}</div>` : ''}</div>`).join('');
     banksDiv.querySelectorAll('.bank-rejected').forEach(el => el.addEventListener('click', () => {
       const r = rs.find(x => x.bankKey === el.dataset.k);
       if (!r) return;
