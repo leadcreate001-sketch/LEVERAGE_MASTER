@@ -136,6 +136,15 @@
   @media (max-width: 360px) {
     #hud-clock-extra { display: none !important; }
   }
+  /* v11.6: clamp()は「ビューポート幅」しか見ないため、経過年数や現金の桁が増えて実際の
+     文字数が伸びると、幅は同じでもhud-clock-extra込みの合計幅が#hud-clockからはみ出し、
+     overflow:hiddenで末尾の⚡行動力だけが数px欠けて見切れることがあった（360px超の幅でも発生）。
+     JS側(renderHeaderClock)で実測してはみ出す時だけ付与するクラス。 */
+  .hud-extra-fit-hide { display: none !important; }
+  /* v11.6: 縦幅が狭い端末で#mobile-status（現金/CF/行動力＋市場/所有）と#mobile-actions
+     （探す/働く/翌月）が重なるのを避けるため、JS側(fitMobileHud)が実測して現金/CF/行動力の
+     1段目（ヘッダーのhud-clock-extraと重複する情報）だけを畳む時に付与するクラス。 */
+  .hud-row1-hide { display: none !important; }
   @media (min-width: 640px) and (min-height: 520px) {
     #panel-left, #panel-right { display: flex; }
   }
@@ -5350,7 +5359,7 @@ function showSetup() {
   let step = 0;
   const TOTAL = 7;   // v8: 先頭に難易度選択を足して 6 → 7
   const frame = (title, flavor, inner, opts = {}) => `
-    <div class="bg-white rounded-xl p-6 w-full max-w-md space-y-4 max-h-[90vh] overflow-y-auto">
+    <div class="bg-white rounded-xl p-6 w-full max-w-md space-y-4 max-h-[90vh] overflow-y-auto" style="max-height:90dvh">
       <div class="flex items-center justify-between text-[11px] text-slate-500">
         <span>あなたの物語 ${step + 1} / ${TOTAL}</span>
         <span>${'●'.repeat(step + 1)}${'○'.repeat(TOTAL - step - 1)}</span></div>
@@ -5557,7 +5566,34 @@ function renderMobileBars() {
   wireWorkButton(actEl.querySelector('#m-work'));
   actEl.querySelector('#m-next').addEventListener('click', onNextMonth);
   actEl.querySelector('#m-menu').addEventListener('click', openMobileDrawer);
+  fitMobileHud();
 }
+
+// v11.6: 縦幅が狭い端末では、上詰めの#mobile-status（現金/CF/行動力＋市場/所有）と
+// 下詰めの#mobile-actions（探す/働く/翌月/≡）が近づきすぎて重なり、市場/所有の行が
+// 探す/働く/翌月の裏に隠れて押せなくなることがあった。スクロール導入はマップのドラッグ
+// 操作と競合するため、代わりに現金/CF/行動力の1段目（ヘッダーの#hud-clock-extraと
+// 重複する情報）を畳んで市場/所有の行を上に詰める。それでも下段が収まらないくらい
+// 極端に狭い場合は、畳んでも解決しないので既定表示（ヘッダーの下から1段目込み）に戻す。
+function fitMobileHud() {
+  const statusEl = document.getElementById('mobile-status');
+  const actionsEl = document.getElementById('mobile-actions');
+  const main = document.querySelector('main');
+  if (!statusEl || !actionsEl || !main) return;
+  const row1 = statusEl.children[0];
+  if (!row1) return;
+  row1.classList.remove('hud-row1-hide');   // 判定は常に既定表示（1段目あり）基準で行う
+  if (getComputedStyle(statusEl).display === 'none') return;   // PC/タブレット（左右パネル）は対象外
+  const mainTop = main.getBoundingClientRect().top;
+  const actionsTop = actionsEl.getBoundingClientRect().top - mainTop;
+  const margin = 6;
+  const fits = () => (statusEl.getBoundingClientRect().bottom - mainTop) + margin <= actionsTop;
+  if (fits()) return;   // 既定のままで十分収まる
+
+  row1.classList.add('hud-row1-hide');
+  if (!fits()) row1.classList.remove('hud-row1-hide');   // 畳んでも収まらないなら畳む意味が無い
+}
+window.addEventListener('resize', fitMobileHud);
 
 // v3.9: スマホの≡メニュー。普段隠している機能（一覧・通知・ログ・資産詳細・スキル・音・リセット）をまとめる。
 function openMobileDrawer() {
@@ -5672,6 +5708,14 @@ function renderHeaderClock() {
   cfEl.classList.toggle('hud-money', mcf >= 0);
   cfEl.classList.toggle('hud-bad', mcf < 0);
   box.querySelector('#hud-clock-ap').textContent = `${state.actionPower}/${state.baseActionPower}`;
+  // v11.6: 経過年数や現金の桁が増えて実際の文字数が伸びると、clamp()で縮めた後でも
+  // #hud-clockからはみ出し、overflow:hiddenで末尾の⚡行動力だけが見切れることがあった。
+  // 実測してはみ出す時だけ#hud-clock-extra（#mobile-statusと重複する情報）を畳む。
+  const extra = box.querySelector('#hud-clock-extra');
+  if (extra) {
+    extra.classList.remove('hud-extra-fit-hide');
+    if (box.scrollWidth > box.clientWidth) extra.classList.add('hud-extra-fit-hide');
+  }
 }
 
 // バランスシートの先頭に置く1行。PC左パネルとスマホの資産モーダルで共用する。
@@ -5876,7 +5920,7 @@ function openKpiModal(which, keepBulk = false) {
       <div class="text-[11px] text-slate-500 mb-1">信用度が高いほど審査に通りやすく、取引実績（完済）が増えると金利優遇を受けやすくなります。</div>
       <table class="w-full text-sm">${bankRows}</table>`;
   }
-  const boxEl = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2">
+  const boxEl = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2" style="max-height:75dvh">
     <div class="flex justify-between items-center"><h2 class="font-bold">${title}</h2><button id="kpi-close" class="text-slate-400 text-xl">✕</button></div>
     <div>${body}</div></div>`);
   m.appendChild(boxEl);
@@ -5992,8 +6036,9 @@ function openDetail(propId, from, back) {
   const m = document.getElementById('detail-modal');
   m.classList.remove('hidden'); m.classList.add('flex');
   // v8.9: 融資タブは購入検討中の市場物件だけに必要（所有物件はローンの有無に関わらず不要）。
-  // v8.19: 「収支」タブ（月次履歴）は概要の「年間収支・運営費の内訳」と情報が重複するため廃止。
-  const tabs = from === 'owned' ? ['概要', 'レントロール'] : ['概要', 'レントロール', '融資'];
+  // v8.19で「収支」タブ（月次履歴）を概要の「年間収支・運営費の内訳」と重複するとして廃止したが、
+  // 月ごとの内訳・累計CF・自己資金回収率は年間集計だけでは追えないため、v11.6で復活させる。
+  const tabs = from === 'owned' ? ['概要', 'レントロール', '収支'] : ['概要', 'レントロール', '融資'];
   // v8.19: 「年間収支・運営費の内訳」は所有・市場のどちらも情報過多になるため、デフォルトは常に格納。
   let active = 0, saleSimOpen = false, gpiOpen = false;
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
@@ -6022,7 +6067,7 @@ function openDetail(propId, from, back) {
     // （建物の状態＝ボロ・傾き等が一目で分かる情報なので、小さいと意味が伝わらない）。
     // その下にもう1行、保有期間（所有）／📍地図を見る を横並びで足す。
     const held = from === 'owned' ? L.heldMonthsOf(state, p) : null;
-    const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
+    const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col" style="max-height:85dvh">
       <div class="p-3 border-b shrink-0">
         <div class="flex justify-between items-center mb-1">
           ${back ? '<button id="dt-back" class="text-xs text-navy">← 戻る</button>' : '<span></span>'}
@@ -6080,6 +6125,7 @@ function openDetail(propId, from, back) {
       });
     }
     if (tabs[active] === 'レントロール') { body.innerHTML = rentRollTab(p, from); wireFillButtons(body, p, from); }
+    if (tabs[active] === '収支') body.innerHTML = plTab(p);
     if (tabs[active] === '融資') {
       body.innerHTML = financeTab(p);
       body.querySelector('.ft-toggle-tip')?.addEventListener('click', () => {
@@ -6246,7 +6292,7 @@ function openGlossaryModal() {
       </div>`).join('');
     return `<div class="mb-3"><h3 class="font-bold text-xs text-navy bg-slate-100 rounded px-2 py-1 mb-1">${g}</h3>${rows}</div>`;
   };
-  const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
+  const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col" style="max-height:85dvh">
     <div class="p-3 border-b shrink-0 flex justify-between items-center">
       <h2 class="font-bold">📖 用語集（${Object.keys(L.TERMS).length}語）</h2>
       <button id="gl-close" class="text-slate-400 text-xl leading-none">✕</button></div>
@@ -6661,7 +6707,7 @@ function openRecruitPicker(p, unitIndex, onAd, onSelf) {
       ${!enough ? '<div class="text-[11px] text-red-600">現金が足りません</div>' : ''}</button>`;
   }).join('');
 
-  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-3 max-h-[85vh] overflow-y-auto">
+  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-sm space-y-3 max-h-[85vh] overflow-y-auto" style="max-height:85dvh">
     <div class="flex justify-between items-center">
       <h2 class="font-bold">📣 ${unitIndex + 1}号室の入居者を募集</h2>
       <button id="rc-x" class="text-slate-400 text-xl leading-none">✕</button></div>
@@ -6707,6 +6753,23 @@ function buildingComposition(p) {
   return `${layout}×${p.units.length}戸・平均${avg}㎡`;
 }
 
+// v8.19で一度廃止（概要の年間収支と重複するため）→ v11.6で復活。月ごとの内訳・累計CF・
+// 自己資金回収率は年間集計だけでは追えず、月次の推移を見たいという要望があったため。
+function plTab(p) {
+  if (!p.history.length) return '<div class="text-slate-500">購入後、月が進むと収支が記録されます。</div>';
+  // v8.5: 投下自己資金は購入時に実際に払った諸費用で計算する（旧セーブは概算にフォールバック）
+  const acq = p.acquisitionCost ?? Math.round((p.boughtPrice || 0) * L.CONFIG.closingCostRate);
+  const equity = p.boughtPrice ? p.boughtPrice - (p.loan ? p.loan.principal : 0) + acq : 0;
+  const ccr = equity > 0 ? (p.cum.cf / equity * 100).toFixed(1) : '-';
+  return `<div class="mb-1">累計CF: <b class="${p.cum.cf >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(p.cum.cf)}</b>（${p.cum.months}ヶ月）／ 自己資金回収率 ${ccr}%</div>
+    <div class="max-h-60 overflow-y-auto"><table class="w-full text-xs">
+    <tr class="text-slate-500"><th>月</th><th>家賃</th><th>空室損</th><th>運営費</th><th>利息</th><th>元金</th><th>税</th><th>CF</th></tr>
+    ${[...p.history].reverse().map(h => `<tr class="border-t"><td>${h.month}</td><td>${L.yen(h.rentIn)}</td><td>${L.yen(h.vacancyLoss)}</td>
+      <td>${L.yen(h.opex)}</td><td>${L.yen(h.interest)}</td><td>${L.yen(h.principal)}</td><td>${L.yen(h.tax)}</td>
+      <td class="${h.cf >= 0 ? 'text-emerald' : 'text-red-600'}">${L.yen(h.cf)}</td></tr>`).join('')}
+    </table></div>`;
+}
+
 // v8.9: 融資タブは所有物件では表示しなくなったため、市場物件（未購入・ローン無し）専用に単純化した。
 function financeTab(p) {
   const rs = L.reviewAllBanks(p, p.price, 0.2, state);
@@ -6736,12 +6799,12 @@ function metricsBadge(r, muted) {
     <span class="${tone(dscrOk)}">${term('dscr')}${r.dscr.toFixed(2)}${dscrSym}${r.dscrMin}</span></span>`;
 }
 
+// v11.6: 融資タブはあくまで下見用のプレビューなので、可否は○×とLTV/DSCR・条件の数値だけで
+// 示す。色分け・否決理由・借りる操作は支払い方法画面（showPayment）側だけの役目にする。
 function bankReviewList(rs) {
   return `<div class="space-y-1">${rs.map(r => r.approved
-    ? `<div class="border rounded p-2"><div class="flex items-center gap-2"><b class="min-w-0">◯ ${r.label}</b>${metricsBadge(r, false)}</div><div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div></div>`
-    : `<div class="border rounded p-2 bg-slate-50"><div class="flex items-center gap-2"><b class="min-w-0">✕ ${r.label}</b>${metricsBadge(r, false)}</div>
-        ${r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').length
-          ? `<div class="text-xs text-red-600">${linkTerms(r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').map(x => x.msg).join('／'))}</div>` : ''}</div>`).join('')}</div>`;
+    ? `<div class="border rounded p-2"><div class="flex items-center gap-2"><b class="min-w-0">◯ ${r.label}</b>${metricsBadge(r, true)}</div><div class="text-xs">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div></div>`
+    : `<div class="border rounded p-2"><div class="flex items-center gap-2"><b class="min-w-0">✕ ${r.label}</b>${metricsBadge(r, true)}</div></div>`).join('')}</div>`;
 }
 
 // v8: 募集が建物ごと止まっている状態は、費用・行動力を払う前に理由を出して止める。
@@ -7074,7 +7137,7 @@ function showPayment(propId, price, close) {
     // 画面内に残す。高さもmax-h-[85vh]→94vhに広げ、そもそものスクロール量自体を減らす。
     // さらに「4行同時審査」の一覧が初見で全部見えることを優先し、各行・各ボックスの余白を
     // 詰めて375×667のような低い画面高でも4行が最初のスクロール位置で収まるようにしている。
-    const box = el(`<div class="bg-white rounded-xl w-full max-w-md max-h-[94vh] flex flex-col">
+    const box = el(`<div class="bg-white rounded-xl w-full max-w-md max-h-[94vh] flex flex-col" style="max-height:94dvh">
       <div class="p-4 pb-1.5 shrink-0 flex justify-between items-center gap-2"><h2 class="font-bold" style="font-size:clamp(0.7rem,4vw,0.9rem);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 auto">支払い方法（成約価格 ${L.yen(price)}）</h2><button id="pay-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
       <div class="px-4 pb-1.5 space-y-1.5 overflow-y-auto flex-1 min-h-0">
       ${state.isIncorporated ? `<div class="flex gap-2 text-sm items-center"><span class="font-bold shrink-0">名義:</span>
@@ -7112,11 +7175,13 @@ function showPayment(propId, price, close) {
     // 否決カードはタップで理由をalert表示できるようにし、アイコンが無くなった分の分かりにくさを補う。
     // v11.5: 銀行名はtruncate(省略記号)ではなくフォントサイズを縮めて全文字を表示する
     // （「日本政策金融公庫」のような長い名前でも省略しない）。
+    // v11.6: 融資タブ（bankReviewList）と表記を揃えるため◯／✕を復活。背景色・借りるボタン・
+    // タップで理由を見る操作はそのまま維持する（可否の伝え方を重ねるだけで、操作性は変えない）。
     const bankNameStyle = 'font-size:clamp(0.65rem,3.5vw,0.875rem)';
     banksDiv.innerHTML = rs.map(r => r.approved
       ? `<div class="border rounded p-1.5 mb-1 bg-navy text-white">
           <div class="flex items-center justify-between gap-1.5">
-            <b class="min-w-0" style="${bankNameStyle}">${r.label}</b>
+            <b class="min-w-0" style="${bankNameStyle}">◯ ${r.label}</b>
             ${metricsBadge(r, true)}
           </div>
           <div class="text-[11px] text-white/80 mt-0.5">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年</div>
@@ -7124,7 +7189,7 @@ function showPayment(propId, price, close) {
           <button class="pay-bank w-full bg-white text-navy rounded py-1.5 text-sm font-bold mt-1.5" data-k="${r.bankKey}">借りる</button></div>`
       : `<div class="bank-rejected border rounded p-1.5 mb-1 bg-slate-50 cursor-pointer" data-k="${r.bankKey}">
           <div class="flex items-center justify-between gap-1.5">
-            <b class="min-w-0 text-slate-400" style="${bankNameStyle}">${r.label}</b>
+            <b class="min-w-0 text-slate-400" style="${bankNameStyle}">✕ ${r.label}</b>
             ${metricsBadge(r, false)}
           </div>
           ${r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').length
@@ -7633,7 +7698,7 @@ function openWorkMenu(propId, category, back, initialSel = null) {
           : `<div class="text-xs text-red-600">🚫 ${blockedReason}</div>`}`;
     }
 
-    const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md space-y-2 max-h-[85vh] overflow-y-auto">${body}</div>`);
+    const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md space-y-2 max-h-[85vh] overflow-y-auto" style="max-height:85dvh">${body}</div>`);
     m.appendChild(box);
     box.querySelector('#wk-x').addEventListener('click', close);
     box.querySelector('#wk-back')?.addEventListener('click', () => {
@@ -8471,7 +8536,7 @@ function wireWorkButton(btn) {
 function openLogModal() {
   const m = document.getElementById('log-modal');
   m.classList.remove('hidden'); m.classList.add('flex'); m.innerHTML = '';
-  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[70vh] overflow-y-auto">
+  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[70vh] overflow-y-auto" style="max-height:70dvh">
     <div class="flex justify-between items-center mb-2"><h2 class="font-bold">📜 ログ</h2><button id="log-close" class="text-slate-400 text-xl">✕</button></div>
     <div class="text-xs space-y-0.5">${(state.log || []).map(l => `<div>・${l}</div>`).join('') || '<div class="text-slate-500">まだログはありません</div>'}</div></div>`);
   m.appendChild(box);
@@ -8506,7 +8571,7 @@ function openListingsModal() {
       </div>
     </div>`;
   }).join('') : '<div class="text-slate-500 text-sm">まだ見つかった物件はありません。営業してみましょう。</div>';
-  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2">
+  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2" style="max-height:75dvh">
     <div class="flex justify-between items-center"><h2 class="font-bold">🗂️ 物件情報（${state.market.length}件）</h2><button id="listings-close" class="text-slate-400 text-xl">✕</button></div>
     ${rows}</div>`);
   m.appendChild(box);
@@ -8555,7 +8620,7 @@ function openSoldSnapshot(p) {
   const close = () => { m.classList.add('hidden'); m.classList.remove('flex'); m.innerHTML = ''; };
   const occ = p.units?.length ? Math.round(p.units.filter(u => u.occupied).length / p.units.length * 100) : 100;
   const rows = (p.units || []).map((u, i) => `<tr class="border-t"><td>${i + 1}号室</td><td class="text-right">${L.yen(u.rent)}</td><td class="text-right">${u.occupied ? '入居中' : '空室'}</td></tr>`).join('');
-  const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col">
+  const box = el(`<div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col" style="max-height:85dvh">
     <div class="p-3 border-b shrink-0">
       <div class="flex justify-between items-center mb-1">
         <span class="text-[11px] bg-slate-500 text-white rounded px-2 py-0.5">🚫 他決済み（閲覧のみ）</span>
@@ -8621,7 +8686,7 @@ function openNotificationsModal() {
       </div>
     </div>`;
   }).join('') : '<div class="text-slate-500 text-sm">通知はまだありません</div>';
-  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2">
+  const box = el(`<div class="bg-white rounded-xl p-4 w-full max-w-md max-h-[75vh] overflow-y-auto space-y-2" style="max-height:75dvh">
     <div class="flex justify-between items-center"><h2 class="font-bold">🔔 通知</h2><button id="notifs-close" class="text-slate-400 text-xl">✕</button></div>
     <div class="flex items-center justify-between gap-2">
       <button id="notifs-settings-toggle" class="text-[11px] font-bold text-navy underline text-left">${notifSettingsOpen ? '▲ 通知の表示設定を閉じる' : '▶ 通知の表示設定'}</button>
@@ -9314,7 +9379,7 @@ function openQuiz(venueKey, done) {
     const RANK_COLOR = { S: '#f59e0b', A: '#10b981', B: '#3b82f6', C: '#94a3b8' };
     m.innerHTML = '';
     const learned = (state.learnedTerms || []).length;
-    const box = el(`<div class="bg-white rounded-xl w-full max-w-md max-h-[90vh] overflow-y-auto">
+    const box = el(`<div class="bg-white rounded-xl w-full max-w-md max-h-[90vh] overflow-y-auto" style="max-height:90dvh">
       <div class="p-5 text-center space-y-2">
         <div class="text-xs font-bold text-slate-500">📚 ${venue.title}・結果発表</div>
         <div class="mx-auto w-28 h-28 rounded-full bg-white flex items-center justify-center shadow-lg"
@@ -9474,7 +9539,7 @@ function openResultScreen(kind) {
        <div class="text-sm text-slate-600">目標 ${goalText} を ${Math.floor(state.month / 12)}年${state.month % 12}ヶ月 で達成！</div>`
     : `<div class="text-2xl font-black text-slate-700">${kind === 'bankrupt' ? '💥' : '⏰'} 称号「${title}」</div>
        <div class="text-sm text-slate-600">${Math.floor(state.month / 12)}年${state.month % 12}ヶ月の挑戦でした（目標 ${goalText}）</div>`;
-  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-lg max-h-[90vh] overflow-y-auto space-y-3 text-center">
+  const box = el(`<div class="bg-white rounded-xl p-5 w-full max-w-lg max-h-[90vh] overflow-y-auto space-y-3 text-center" style="max-height:90dvh">
     ${head}
     <div class="text-left">
       <div class="font-bold text-sm mb-1">📒 最終バランスシート</div>
