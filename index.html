@@ -6706,7 +6706,7 @@ function financeTab(p) {
 function metricsBadge(r, muted) {
   const ltvOk = r.ltv <= r.ltvMax, dscrOk = r.dscr >= r.dscrMin;
   const tone = (ok) => muted ? '' : ok ? 'text-slate-500' : 'text-red-600 font-bold';
-  return `<span class="text-[10px] font-normal shrink-0">
+  return `<span class="text-[10px] font-normal shrink-0 whitespace-nowrap">
     <span class="${tone(ltvOk)}">${term('ltv')}${Math.round(r.ltv * 100)}/${Math.round(r.ltvMax * 100)}%</span>
     <span class="${tone(dscrOk)}">${term('dscr')}${r.dscr.toFixed(2)}/${r.dscrMin}</span></span>`;
 }
@@ -6772,7 +6772,7 @@ function openPurchase(propId, back) {
     <div class="flex justify-between items-center gap-2">
       ${back ? '<button id="of-back" class="text-xs text-navy">← 戻る</button>' : '<span></span>'}
       <button id="of-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
-    <div><h2 class="font-bold" style="font-size:clamp(0.8rem,4.5vw,1.05rem)">${p.name || p.label} に買付を入れる（行動力-10）</h2><div class="text-[11px] text-slate-500">${p.label}</div></div>
+    <div><h2 class="font-bold" style="font-size:clamp(0.75rem,4vw,0.95rem);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.name || p.label} に買付を入れる（行動力-10）</h2><div class="text-[11px] text-slate-500">${p.label}</div></div>
     <div class="text-sm">売出価格: ${p.origPrice && p.price < p.origPrice ? `<span class="line-through text-slate-400">${L.yen(p.origPrice)}</span> → ` : ''}<b>${L.yen(p.price)}</b>${p.origPrice && p.price < p.origPrice ? ' <span class="text-[11px] bg-red-500 text-white rounded px-1">値下げ中</span>' : ''}${p.staleFlag ? ' <span class="text-[11px] bg-amber-500 text-white rounded px-1">売れ残り中</span>' : ''}</div>
     ${p.sellerUrgency ? `<div class="text-xs"><span class="bg-rose-100 text-rose-700 rounded px-1.5 py-0.5 font-bold">🏃 売り急ぎ</span> <span class="text-slate-600">${p.sellerUrgency.reason}そうだ</span></div>` : ''}
     ${blocked ? `<div class="rounded-lg bg-red-50 text-red-800 p-2 text-xs space-y-1">
@@ -7050,7 +7050,7 @@ function showPayment(propId, price, close) {
     // さらに「4行同時審査」の一覧が初見で全部見えることを優先し、各行・各ボックスの余白を
     // 詰めて375×667のような低い画面高でも4行が最初のスクロール位置で収まるようにしている。
     const box = el(`<div class="bg-white rounded-xl w-full max-w-md max-h-[94vh] flex flex-col">
-      <div class="p-4 pb-1.5 shrink-0 flex justify-between items-center gap-2"><h2 class="font-bold min-w-0 truncate" style="font-size:clamp(0.8rem,4.5vw,1.05rem)">支払い方法（成約価格 ${L.yen(price)}）</h2><button id="pay-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
+      <div class="p-4 pb-1.5 shrink-0 flex justify-between items-center gap-2"><h2 class="font-bold" style="font-size:clamp(0.7rem,4vw,0.9rem);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 auto">支払い方法（成約価格 ${L.yen(price)}）</h2><button id="pay-x" class="text-slate-400 text-xl leading-none shrink-0">✕</button></div>
       <div class="px-4 pb-1.5 space-y-1.5 overflow-y-auto flex-1 min-h-0">
       ${state.isIncorporated ? `<div class="flex gap-2 text-sm items-center"><span class="font-bold shrink-0">名義:</span>
         <label class="flex-1 border rounded p-1 text-center cursor-pointer ${buyOwner === 'personal' ? 'bg-slate-100 font-bold border-navy' : ''}"><input type="radio" name="buy-owner" value="personal" ${buyOwner === 'personal' ? 'checked' : ''} class="mr-1">👤 個人</label>
@@ -7068,8 +7068,8 @@ function showPayment(propId, price, close) {
           <div class="text-[10px] text-slate-500 mt-0.5">${term('closing_cost', '諸費用')}込み必要現金 <span id="pay-down-need">${L.yen(Math.round(price * downRatio) + closing)}</span></div>
         </div>
         <input id="pay-down-range" type="range" min="0" max="${maxDownPct}" step="1" value="${Math.round(downRatio * 100)}" class="w-full">
-        <div class="text-[10px] text-slate-500">スライダーで頭金の割合を自由に決められます（手持ち現金で用意できる範囲まで動かせます）</div>
-        <div id="pay-loan-costs">${purchaseCostBox(p, price, Math.round(price * (1 - downRatio)), `📋 この頭金で融資を使う場合の${term('closing_cost', '諸費用')}`, 'loan', openLoan)}</div>
+        <div class="text-[10px] text-slate-500">スライダーで頭金の割合を自由に決められます</div>
+        <div id="pay-loan-costs">${purchaseCostBox(p, price, Math.round(price * (1 - downRatio)), `📋 ${term('closing_cost', '諸費用')}`, 'loan', openLoan)}</div>
         <div id="pay-banks"></div>
       </div>
       </div>
@@ -7080,16 +7080,23 @@ function showPayment(propId, price, close) {
     // 「紺＝借りられる／灰＝借りられない」の明暗差だけで、読まずに判別できる状態を狙っている。
     // v11.2: 承認カードはアイコン+銀行名+LTV/DSCR+ボタンを1行に詰めていたため、銀行名だけが
     // 省略記号で削られていた（否決カードはボタンが無い分崩れず、見た目のバラつきの原因だった）。
-    // 要素ごとに行を分け、承認・否決どちらも「アイコン+銀行名」→「LTV/DSCR」の同じ構造にする。
+    // v11.3: ボタンを専用行に分離したことで名前+LTV/DSCRだけなら1行に収まるため、その2つは
+    // 同じ行に戻す（銀行名は必要ならtruncate・LTV/DSCRはwhitespace-nowrapで折り返さない）。
+    // 金利等の詳細も「金利・年数」「月返済・自己資金」の2行に固定し、自然な折り返しに任せない。
     banksDiv.innerHTML = rs.map(r => r.approved
       ? `<div class="border rounded p-1.5 mb-1 bg-navy text-white">
-          <div class="flex items-center gap-1.5"><span class="inline-flex items-center justify-center w-4 h-4 rounded-full bg-white text-navy text-[10px] font-black shrink-0">◯</span><b class="flex-1 min-w-0 truncate">${r.label}</b></div>
-          <div class="mt-0.5">${metricsBadge(r, true)}</div>
-          <div class="text-[11px] text-white/80 mt-0.5">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年・月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div>
+          <div class="flex items-center justify-between gap-1.5">
+            <div class="flex items-center gap-1.5 min-w-0"><span class="inline-flex items-center justify-center w-4 h-4 rounded-full bg-white text-navy text-[10px] font-black shrink-0">◯</span><b class="min-w-0 truncate">${r.label}</b></div>
+            ${metricsBadge(r, true)}
+          </div>
+          <div class="text-[11px] text-white/80 mt-0.5">金利${(r.terms.rate * 100).toFixed(2)}%・${r.terms.years}年</div>
+          <div class="text-[11px] text-white/80">月返済${L.yen(r.terms.monthlyPay)}・要${term('own_cash', '自己資金')}${L.yen(r.terms.requiredCash)}</div>
           <button class="pay-bank w-full bg-white text-navy rounded py-1.5 text-sm font-bold mt-1.5" data-k="${r.bankKey}">借りる</button></div>`
       : `<div class="border rounded p-1.5 mb-1 bg-slate-50">
-          <div class="flex items-center gap-1.5"><span class="inline-flex items-center justify-center w-4 h-4 rounded-full bg-slate-300 text-white text-[10px] font-black shrink-0">✕</span><b class="flex-1 min-w-0 truncate">${r.label}</b></div>
-          <div class="mt-0.5">${metricsBadge(r, false)}</div>
+          <div class="flex items-center justify-between gap-1.5">
+            <div class="flex items-center gap-1.5 min-w-0"><span class="inline-flex items-center justify-center w-4 h-4 rounded-full bg-slate-300 text-white text-[10px] font-black shrink-0">✕</span><b class="min-w-0 truncate">${r.label}</b></div>
+            ${metricsBadge(r, false)}
+          </div>
           ${r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').length
             ? `<div class="text-[11px] text-red-600 mt-0.5">${linkTerms(r.reasons.filter(x => x.code !== 'OVER_LTV' && x.code !== 'DSCR_LOW').map(x => x.msg).join('／'))}</div>` : ''}</div>`).join('');
     const range = box.querySelector('#pay-down-range');
@@ -7102,7 +7109,7 @@ function showPayment(propId, price, close) {
       box.querySelector('#pay-down-amt').textContent = L.yen(Math.round(price * pct / 100));
       box.querySelector('#pay-down-need').textContent = L.yen(Math.round(price * pct / 100) + closingNow);
       box.querySelector('#pay-loan-costs').innerHTML =
-        purchaseCostBox(p, price, loanNow, `📋 この頭金で融資を使う場合の${term('closing_cost', '諸費用')}`, 'loan', openLoan);
+        purchaseCostBox(p, price, loanNow, `📋 ${term('closing_cost', '諸費用')}`, 'loan', openLoan);
       box.querySelector('#pay-credit').innerHTML = creditSummaryBox(pct / 100, openCredit);   // v8.7: 評価も追従
     });
     range.addEventListener('change', () => { downRatio = Number(range.value) / 100; draw(); });
