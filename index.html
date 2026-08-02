@@ -170,6 +170,13 @@
     #diy-modal {
       padding-top: calc(36px + env(safe-area-inset-top, 0px) + 8px) !important;
       align-items: flex-start !important;
+      /* v11.9: 上のflex-startは「中身が長い」前提の対策だったため、中身が短い（物件1件だけ等）
+         時は使用可能領域の下半分が丸ごと空白になり「上に寄って見える」不具合になっていた。
+         中身が使用可能領域に収まる時だけ実際に中央へ、はみ出す時は安全に上のflex-startへ留まる
+         align-items: safe center で解決する（中身の長さ判定にJS計測は不要）。
+         safe/unsafeキーワード未対応ブラウザはこの行が構文エラーとして無視され、
+         直前のflex-startへ自然にフォールバックする（同じ考え方をmax-height:dvhでも使用済み）。 */
+      align-items: safe center !important;
     }
     /* v11.8: 上記13モーダルは中身が長い前提で「ヘッダー直下から開始」（flex-start）にしたが、
        募集ポップアップ等のように中身が短いウインドは同じpadding-topだけ足してalign-itemsは
