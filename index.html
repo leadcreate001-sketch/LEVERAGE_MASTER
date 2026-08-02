@@ -414,7 +414,9 @@ export function worstBandOf(property) {
 }
 
 // 躯体が傷んだ建物は市場で買い叩かれる。fairValue は独自の repairFactor を持っているので、
-// ここで割り引くのは「timeValue をそのまま資産額として使っている経路」だけ（純資産・買付・法人移転）。
+// ここで割り引くのは「timeValue をそのまま資産額として使っている経路」だけ（実際の呼び出し元は
+// totalAssetsV2＝純資産集計のみ。法人移転transferToCorpはtimeValueを直接使い、ここを通らない）。
+// v11: 買付判定(rollBuyOffer)は査定額(listing.appraisal・無ければfairValue)ベースになり、ここは通らなくなった。
 export const STRUCT_VALUE_FACTOR = { ok: 1.0, warn: 0.95, danger: 0.90, dead: 0.85 };
 export function marketValueOf(property) {
   return Math.round((property.timeValue ?? 0) * STRUCT_VALUE_FACTOR[structBandOf(property)]);
@@ -847,7 +849,7 @@ export function offerChance(askingPrice, refValue, fullyOccupied, listedMonths) 
     : ratio <= 1.3 ? 0.06
     : ratio <= 1.6 ? 0.03
     : 0.01;
-  p += fullyOccupied ? 0.10 : -0.10;
+  p *= fullyOccupied ? 1.3 : 0.7;   // v11.1: 加算だと新設の割高帯(6%/3%/1%)の相対差がほぼ潰れるため乗算に変更
   return Math.max(0.01, Math.min(0.8, p));
 }
 
@@ -863,8 +865,11 @@ export function sashineChance(ratio) {
 
 export function rollBuyOffer(listing, property, rng = Math.random) {
   const full = property.units.every(u => u.occupied);
-  const fv = fairValue(property);   // v11: marketValueOf(timeValueベース)から査定額(fairValue)に変更
-  // v8: 買い手は傷んだ建物を割り引いて見る。同じ売出価格でも躯体が悪いほど買付が入りにくい。
+  // v11.1: プレイヤーが実際に見た査定額(listing.appraisal)を基準にする。都度fairValueを再計算すると、
+  // 査定表示に乗っている±ノイズ・0.92掛けの分だけ「見た数字」と「判定される数字」がズレてしまうため
+  // （例: 査定×120%で売り出しても、fairValue比では0.99〜1.21倍にばらつき約半数が狙った帯に入らない）。
+  // 査定未取得の掲載（想定外経路・旧セーブ）だけfairValueへフォールバックする。
+  const fv = listing.appraisal ?? fairValue(property);
   if (rng() >= offerChance(listing.askingPrice, fv, full, listing.listedMonths)) return null;
   const mustSashine = listing.listedMonths >= 6;
   const sashine = mustSashine || rng() < sashineChance(listing.askingPrice / fv);   // v11: 比率で指値/満額を振り分け
@@ -3137,8 +3142,8 @@ export function reviewAllBanks(property, price, downRatio, state) {
 // v3.9: 市場利回り。物件の「通常版ジャンル」の標準利回りを基準に、築年・エリア・訳あり・価値UPで調整。
 // 高利回り=市場が高い利回りを要求＝安く評価。低利回り=人気で高く評価。
 // v11: 価値UPで利回りが下がり、上限で頭打ちになる
-export const VALUEUP_YIELD_STEP = 0.004;   // v11: 価値UP1回につき利回り-0.4pt
-export const VALUEUP_YIELD_MAX = 0.02;     // v11: 上限-2.0pt（5回で頭打ち）
+export const VALUEUP_YIELD_STEP = 0.01;    // v11.1: 価値UP1回につき利回り-1.0pt（実際の上限VALUE_UP_MAX_LEVEL=2回で-2.0ptに届くよう調整。旧0.004だと2回で-0.8ptにしか届かず、5回前提だった-2.0pt上限が実質到達不能だった）
+export const VALUEUP_YIELD_MAX = 0.02;     // 上限-2.0pt（VALUE_UP_MAX_LEVEL=2回で到達）
 export function marketYield(property) {
   const genreKey = property.genreKey || 'kodate';   // v11: rollBuyOffer経由で最小stubから呼ばれても落ちないよう防御
   const normalKey = genreKey.startsWith('w_') ? genreKey.slice(2) : genreKey;
