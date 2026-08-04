@@ -184,6 +184,11 @@
     .modal-below-header {
       padding-top: calc(36px + env(safe-area-inset-top, 0px) + 8px) !important;
     }
+    /* v7.7: top-4固定の通知トースト（チュートリアル終了・実績解除）が、最前面固定した
+       ヘッダー帯(z-55)の下に上半分だけ隠れて文字が欠けていた。ヘッダー分だけ下げる。 */
+    .toast-below-header {
+      top: calc(36px + env(safe-area-inset-top, 0px) + 8px) !important;
+    }
   }
   /* ノッチ／ホームインジケータを避ける（viewport-fit=cover と対で機能する） */
   #mobile-actions {
@@ -640,7 +645,10 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
   // v3.11: opts.lowYield=true は利回り帯の下限寄り（家賃に対して割高＝買う魅力の薄い「平凡物件」）を生成。
   const gpiM = units.reduce((s, u) => s + u.rent, 0);
   const yr = g.yieldMax - g.yieldMin;
-  const yieldPick = opts.lowYield ? (g.yieldMin + lr(0, 0.30) * yr) : lr(g.yieldMin, g.yieldMax);
+  // v12: opts.highYield はレンジ上位30%に強制（相続・売り急ぎのレアな掘り出し物用）
+  const yieldPick = opts.lowYield ? (g.yieldMin + lr(0, 0.30) * yr)
+    : opts.highYield ? (g.yieldMax - lr(0, 0.30) * yr)
+    : lr(g.yieldMin, g.yieldMax);
   const grossYield = Math.max(0.03, yieldPick + a.yieldAdd);
   const price = Math.max(10000, Math.round(gpiM * 12 / grossYield / 10000) * 10000);
   const rentTotalM = gpiM;
@@ -680,7 +688,8 @@ export function generateProperty(genreKey, areaKey, rng = Math.random, ageBands 
     history: [], cum: { cf: 0, months: 0 },
   };
   // v3.8: 売主事情。売り急ぎ（相続・資金繰り等）の売主は深い指値にも応じやすい（レアな掘り出し物・訳ありはやや高め）
-  const urgent = rng() < (g.wake ? 0.15 : 0.07);
+  // v12: opts.forceUrgency は抽選をスキップして必ず売り急ぎにする（レアな掘り出し物用）
+  const urgent = opts.forceUrgency || rng() < (g.wake ? 0.15 : 0.07);
   p.sellerUrgency = urgent ? { reason: URGENCY_REASONS[Math.floor(rng() * URGENCY_REASONS.length)] } : null;
   return p;
 }
@@ -3358,6 +3367,12 @@ export function drawSearchThreshold({ genres, areas, ages }, appraisalLv, rng = 
 // v3.11: 平凡物件は買い候補の約2倍の頻度で出す（＝閾値が約半分）
 export const MUNDANE_SEARCH_DIVISOR = 2;
 
+// v12: 相続・売り急ぎのレアな掘り出し物。既存の隠し閾値システム（発見・平凡ルート）とは
+// 完全に独立に、押下のたびに極小確率で成立する。訳あり自体も「訳あり物件も含める」ON時に
+// 限り、ジャンル抽選プールに混ぜるのではなくこの独立ロールでのみ出現する。
+export const RARE_HIGHYIELD_CHANCE = 0.002;   // 0.2%（0.1〜0.3%の中央値）: 通常ジャンルがレンジ上位で出る
+export const RARE_WAKEARI_CHANCE = 0.0075;    // 0.75%（0.5〜1%の中央値）: 訳あり自体が出る
+
 // 市場に1件追加してID採番・名前付けする内部ヘルパー
 function pushToMarket(s, p) {
   s.nextPropertyId = s.nextPropertyId || 1;
@@ -3367,8 +3382,8 @@ function pushToMarket(s, p) {
   return p;
 }
 
-export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) {
-  if (state.actionPower < SEARCH_PRESS_COST) return { state, found: null, mundane: [], pressed: false };
+export function doSalesPress(state, { genres, areas, ages, wakeari = false }, rng = Math.random) {
+  if (state.actionPower < SEARCH_PRESS_COST) return { state, found: null, mundane: [], rareFind: null, pressed: false };
   const s = structuredClone(state);
   s.actionPower -= SEARCH_PRESS_COST;
   const ss = s.salesSearch = s.salesSearch || { spent: 0, threshold: null };
@@ -3379,6 +3394,21 @@ export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) 
   ss.spent += SEARCH_PRESS_COST;
   ss.mundaneSpent = (ss.mundaneSpent || 0) + SEARCH_PRESS_COST;
   s.skills.appraisal.exp += 1;
+
+  // v12: 相続・売り急ぎのレアな掘り出し物。既存の閾値システムとは独立に毎押下で判定する。
+  // 平凡ルート（低利回り前提）とは趣旨が矛盾するため対象外。wakeari中は訳あり自体がこのロールでのみ出現する。
+  let rareFind = null;
+  if (wakeari && rng() < RARE_WAKEARI_CHANCE) {
+    const ak = areas[Math.floor(rng() * areas.length)];
+    const nk = genres[Math.floor(rng() * genres.length)];
+    const rp = generateProperty('w_' + nk, ak, rng, ages, { forceUrgency: true });
+    rareFind = pushToMarket(s, rp);
+  } else if (rng() < RARE_HIGHYIELD_CHANCE) {
+    const ak = areas[Math.floor(rng() * areas.length)];
+    const gk = genres[Math.floor(rng() * genres.length)];
+    const rp = generateProperty(gk, ak, rng, ages, { highYield: true, forceUrgency: true });
+    rareFind = pushToMarket(s, rp);
+  }
 
   // v3.11: 平凡ルート（低利回り・1〜2件・売れ残り演出）。買い候補とは独立に発火する。
   const mundane = [];
@@ -3407,7 +3437,7 @@ export function doSalesPress(state, { genres, areas, ages }, rng = Math.random) 
     ss.spent = 0; ss.threshold = null;
     log = `${p.name || p.label}（${p.label}）を発見（表面${(p.grossYield * 100).toFixed(1)}%・${yen(p.price)}）`;
   }
-  return { state: s, found, mundane, pressed: true, log };
+  return { state: s, found, mundane, rareFind, pressed: true, log };
 }
 
 // === v6: 用語ヘルプ ===
@@ -3686,7 +3716,7 @@ export function currentYieldOf(property) {
 }
 
   // ==== L 名前空間（city/ui が L.xxx で参照）====
-  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, DIFFICULTY, difficultyOf, STRUCT_BANDS, CARE_BANDS, BAND_RANK, structBandOf, careBandOf, worstBandOf, STRUCT_VALUE_FACTOR, marketValueOf, CREDIT_HIT_DANGER, CREDIT_HIT_DEAD, CREDIT_HIT_CAP, creditPenalty, effectiveCredit, ASSET_BACKING_MAX, DOWN_PAYMENT_BONUS_MAX, DOWN_BONUS_START, DOWN_BONUS_FULL, assetBackingBonus, downPaymentBonus, creditForReview, isCondemned, CONDEMNED_COST_MULT, CONDEMNED_EXTRA_MONTHS, STRUCT_DANGER_VACATE_CHANCE, CARE_DANGER_CLAIM_CHANCE, CARE_DANGER_CLAIM_AP, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, offerBlockedReason, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, sashineChance, rollBuyOffer, respondToOffer, LONG_TERM_MONTHS, heldMonthsOf, isLongTermHold, monthsToLongTerm, capGainTaxRate, capGainOf, capGainTaxOf, loanPayoffOf, CONSUMPTION_TAX, LOW_PRICE_BROKER_FEE_MAX_PRICE, LOW_PRICE_BROKER_FEE_CAP, brokerFee, STAMP_DUTY_TABLE, stampDuty, MORTGAGE_RELEASE_FEE, mortgageReleaseFee, REG_TAX_LAND, REG_TAX_BLDG, REG_TAX_MORTGAGE, ACQUISITION_TAX_RATE, scrivenerFee, loanArrangementFee, ASSESSED_VALUE_RATE, REBUILD_COST_PER_SQM, ASSESSED_USEFUL_LIFE, ASSESSED_DEPRECIATION_FLOOR, PROPERTY_TAX_RATE, LAND_VALUE_RANGE_BY_AREA, LAND_VALUE_SKEW, landValuePerSqm, totalFloorSqm, estimateAssessedValueDetail, estimateAssessedValue, assessedValueBreakdown, assessedValue, assessedValueOf, purchaseCosts, closingCostOf, saleCosts, saleBreakdown, incorporationSaving, incorporationPaybackYears, settleSale, monthlyVacancyRoll, APPEAL_WEIGHTS, APPEAL_AGE_LIMIT, APPEAL_SQM_MIN, APPEAL_SQM_MAX, FILL_BASE, FILL_APPEAL_SPAN, appealBreakdown, appealScore, naturalFillChance, AD_PLANS, AD_MAX_CHANCE, SELF_FILL_AP, SELF_FILL_BASE, SELF_FILL_PER_LV, adCost, adBonusOf, unitFillChance, LONG_VACANCY_MONTHS, APPEAL_ALERT_SCORE, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, DIY_QUALITY, diyQualityOf, estimateDiySessionsLeft, restoreCost, startRestore, REPAIR_KINDS, repairKindAvailable, DEEPCLEAN_COST_MULT, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, REFORM_LOAN_MIN_COST, canUseReformLoan, REFORM_LOAN_RATE_BANDS, reformLoanRateFor, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, QUIZ_MIN_Q, QUIZ_MAX_Q, QUIZ_COMBO_MULT, QUIZ_CASH_PER_CORRECT, QUIZ_SASHINE_BONUS, quizComboMult, quizRank, buildQuiz, applyQuizResult, sashineBuffBonus, consumeSashineBuff, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, markJunkResolved, FAVORITE_LIMIT, addFavorite, removeFavorite, NOTIF_KIND_INFO, defaultNotifSettings, notifModeOf, setNotifMode, markNotificationsRead, markNotificationRead, markAllNotificationsRead, BADGES, AD_FREE_BADGE_COUNT, evaluateBadges, resultTitle, bandAdviceText, REGIONS, SEA_GAP, ROAD_W, ZOOM_MIN, LAND_FILL, BLD_RANGE, ROAD_CURVE, CAPES, CAPE_SIZE, ROAD_CLEAR, LAKES, HILLS, regionAngularDistance, regionOverlaps, isRegionUnlocked, regionUnlockProgress, checkRegionUnlocks, unlockRegion, unitVacancyAdvice, propertyAdviceLines, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, MIN_LOAN_AMOUNT, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, PERMANENT_JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, VALUEUP_YIELD_STEP, VALUEUP_YIELD_MAX, marketYield, fairValue, appraise, requestAppraisal, listForSale, pruneListings, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash, purchaseSignal, currentYieldOf };
+  const L = { CONFIG, yen, monthlyPayment, remainingPrincipal, noiAnnual, dscr, monthlyDepreciation, monthlyTax, incorporate, negotiationRateCut, termBonusYears, ltvCap, applicableRate, canFinance, requiredCash, EXP_THRESHOLDS, skillLevel, expToNext, troubleRepairCost, ageBandOf, DECAY_BY_AGE, DECAY_BY_STRUCTURE, CARE_DECAY_PER_MONTH, structuralDecay, DIFFICULTY, difficultyOf, STRUCT_BANDS, CARE_BANDS, BAND_RANK, structBandOf, careBandOf, worstBandOf, STRUCT_VALUE_FACTOR, marketValueOf, CREDIT_HIT_DANGER, CREDIT_HIT_DEAD, CREDIT_HIT_CAP, creditPenalty, effectiveCredit, ASSET_BACKING_MAX, DOWN_PAYMENT_BONUS_MAX, DOWN_BONUS_START, DOWN_BONUS_FULL, assetBackingBonus, downPaymentBonus, creditForReview, isCondemned, CONDEMNED_COST_MULT, CONDEMNED_EXTRA_MONTHS, STRUCT_DANGER_VACATE_CHANCE, CARE_DANGER_CLAIM_CHANCE, CARE_DANGER_CLAIM_AP, VACANCY_BY_AGE, TROUBLE_BY_AGE, vacancyRate, troubleChanceFor, propertyName, LAYOUT_SIZES, estimateRent, generateProperty, maxBrokerCut, hasSellerBackground, offerSuccessChance, offerBlockedReason, makeOffer, buyPropertyV2, currentMarketValue, gpiAnnual, vacancyLossAnnual, egiAnnual, opexAnnual, noiAnnualV2, propertyMonthlyPL, bookValueV2, offerChance, sashineChance, rollBuyOffer, respondToOffer, LONG_TERM_MONTHS, heldMonthsOf, isLongTermHold, monthsToLongTerm, capGainTaxRate, capGainOf, capGainTaxOf, loanPayoffOf, CONSUMPTION_TAX, LOW_PRICE_BROKER_FEE_MAX_PRICE, LOW_PRICE_BROKER_FEE_CAP, brokerFee, STAMP_DUTY_TABLE, stampDuty, MORTGAGE_RELEASE_FEE, mortgageReleaseFee, REG_TAX_LAND, REG_TAX_BLDG, REG_TAX_MORTGAGE, ACQUISITION_TAX_RATE, scrivenerFee, loanArrangementFee, ASSESSED_VALUE_RATE, REBUILD_COST_PER_SQM, ASSESSED_USEFUL_LIFE, ASSESSED_DEPRECIATION_FLOOR, PROPERTY_TAX_RATE, LAND_VALUE_RANGE_BY_AREA, LAND_VALUE_SKEW, landValuePerSqm, totalFloorSqm, estimateAssessedValueDetail, estimateAssessedValue, assessedValueBreakdown, assessedValue, assessedValueOf, purchaseCosts, closingCostOf, saleCosts, saleBreakdown, incorporationSaving, incorporationPaybackYears, settleSale, monthlyVacancyRoll, APPEAL_WEIGHTS, APPEAL_AGE_LIMIT, APPEAL_SQM_MIN, APPEAL_SQM_MAX, FILL_BASE, FILL_APPEAL_SPAN, appealBreakdown, appealScore, naturalFillChance, AD_PLANS, AD_MAX_CHANCE, SELF_FILL_AP, SELF_FILL_BASE, SELF_FILL_PER_LV, adCost, adBonusOf, unitFillChance, LONG_VACANCY_MONTHS, APPEAL_ALERT_SCORE, naturalFillRoll, fillVacancy, DIY_WORK_TOTAL, RESTORE_DIY_AP, RESTORE_DIY_STEP, DIY_MATERIAL_RATE, diyWorkStep, DIY_QUALITY, diyQualityOf, estimateDiySessionsLeft, restoreCost, startRestore, REPAIR_KINDS, repairKindAvailable, DEEPCLEAN_COST_MULT, repairGaugeValue, repairCost, largeRepairMonths, repairJobMonths, repairDetail, repairResultState, startRepair, AUTO_MANAGE_MARKUP, AUTO_MANAGE_CARE_FLOOR, autoManageCost, setAutoManage, totalDebt, reformLoansRemaining, professionalRepairCost, reformLoanAmount, REFORM_LOAN_MIN_COST, canUseReformLoan, REFORM_LOAN_RATE_BANDS, reformLoanRateFor, repairMonthsForCost, startProfessionalRepair, VALUE_UP_PLANS, VALUE_UP_MAX_LEVEL, valueUpCost, startValueUp, applyValueUp, totalAssetsV2, netWorth, monthlyCF, isClearedV2, isTimeUpV2, isBankrupt, taxRiskLevelV2, SEMINAR_TOPICS, QUIZ_MIN_Q, QUIZ_MAX_Q, QUIZ_COMBO_MULT, QUIZ_CASH_PER_CORRECT, QUIZ_SASHINE_BONUS, quizComboMult, quizRank, buildQuiz, applyQuizResult, sashineBuffBonus, consumeSashineBuff, EVENTS, EVENT_COOLDOWN_MONTHS, EVENT_COOLDOWN_GLOBAL, eventCooldownOf, eventOnCooldown, eventTitle, eventTargets, eligibleEvents, maxYearsForAge, doWork, createInitialState, dedupePropertyIds, transferToCorp, recordJunkRepair, markJunkResolved, FAVORITE_LIMIT, addFavorite, removeFavorite, NOTIF_KIND_INFO, defaultNotifSettings, notifModeOf, setNotifMode, markNotificationsRead, markNotificationRead, markAllNotificationsRead, BADGES, AD_FREE_BADGE_COUNT, evaluateBadges, resultTitle, bandAdviceText, REGIONS, SEA_GAP, ROAD_W, ZOOM_MIN, LAND_FILL, BLD_RANGE, ROAD_CURVE, CAPES, CAPE_SIZE, ROAD_CLEAR, LAKES, HILLS, regionAngularDistance, regionOverlaps, isRegionUnlocked, regionUnlockProgress, checkRegionUnlocks, unlockRegion, unitVacancyAdvice, propertyAdviceLines, advanceMonth, serialize, deserialize, migrateSave, GENRE, AREA_ADJ, SHAPE_BY_GENRE, svgBuildingParts, MIN_LOAN_AMOUNT, BANKS, STRUCTURE_LIFE, JUNK_FLAGS, PERMANENT_JUNK_FLAGS, usefulLifeRemaining, deprMonthsFor, bankRate, reviewLoan, reviewAllBanks, VALUEUP_YIELD_STEP, VALUEUP_YIELD_MAX, marketYield, fairValue, appraise, requestAppraisal, listForSale, pruneListings, updateListing, delist, bargainScore, tickMarket, searchHitChance, SEARCH_PRESS_COST, SEARCH_MIN, SEARCH_MAX, drawSearchThreshold, MUNDANE_SEARCH_DIVISOR, RARE_HIGHYIELD_CHANCE, RARE_WAKEARI_CHANCE, doSalesPress, TERM_GROUPS, TERMS, minRequiredCash, purchaseSignal, currentYieldOf };
 
   // ==== inlined from src/city.mjs（import行除去・export除去）====
 // src/city.mjs — 疑似3Dの球体マップ（ピンハネ帝国と同じ正射影の球）。描画とタップ判定だけを担当し、ゲーム状態は読み取り専用。
@@ -5057,10 +5087,9 @@ const TUTORIAL_STEPS = [
     text: '次は物件探し。🏘️「物件を探す」を押そう。' },
   { key: 'search', keep: ['search-modal'], targets: ['btn-search'], rebuild: () => openSearchModal(),
     text: '🔍「動いて情報を集める」を押そう。押すほど出物に近づく。' },
-  // スマホは市場一覧が≡メニューの中にあるため1手増える。PCでは対象が無いので自動で飛ぶ。
-  { key: 'drawer', keep: [], targets: ['m-menu'], optional: true,
-    text: '見つけた物件は市場一覧に並ぶ。≡「メニュー」を開こう。' },
-  { key: 'listings', keep: ['mobile-drawer'], targets: ['dr-listings', 'btn-open-listings'],
+  // v7.7: 市場一覧はスマホでもホーム画面の上段（ms-listings）から直接開ける（v5でドロワーの外に
+  // 出た導線）。以前はここで一度≡メニューを開かせていたが、直接ボタンがあるのに回り道させていた。
+  { key: 'listings', keep: [], targets: ['ms-listings', 'btn-open-listings'],
     text: '🗂️「市場」を押して、見つけた物件を見てみよう。' },
   { key: 'buy', keep: ['listings-modal'], selector: '.listing-buy', rebuild: () => openListingsModal(),
     text: '物件の「買付を検討」を押そう。' },
@@ -5072,6 +5101,9 @@ const TUTORIAL_STEPS = [
   // prepare で行動力をわざと一桁まで減らしておき、押した瞬間に満タンへ戻るのを見せる。
   { key: 'next', keep: [], targets: ['m-next', 'btn-next-month-desk'],
     prepare: () => { state.actionPower = 6; },
+    // v7.7: 「行動力が6しかない」と言うだけで数字自体は光っていなかったので、
+    // ボタンと一緒に行動力の表示そのものも光らせて、話している数字がどれか分かるようにする。
+    glowExtra: ['hud-ap', 'hud-ap-m'],
     text: '行動力が残り6しかない。📅「翌月へ進む」を押そう。' },
   // ここから先は押すボタンが無い説明。吹き出しの「次へ」で進む。
   // v7.5: 回復は専用の演出ではなく、実際の行動力の欄を指して見せる。
@@ -5084,8 +5116,14 @@ const TUTORIAL_STEPS = [
     text: '点線の用語はポインタを合わせると説明が出る。📖 で表示のON/OFF、長押しで用語集がまとめて読める。' },
   // v7.6: ここで「押して確認してみよう」とは言わない。押すと開く画面は暗幕の下に入って読めず、
   // 促しておきながら確認できない状態になる。場所だけ教えて、確認は本編に入ってからにしてもらう。
-  { key: 'panel', keep: [], info: true, targets: ['panel-left', 'mobile-status'],
-    text: 'ここに現金・月CF・バランスシート。純資産や負債といった財務の状況、法人成りもこの中から。経過年数と年齢は画面いちばん上に出ている。各項目はあとでゆっくりチェックしてみてね。' },
+  // v7.7: スキル状況（目利き力・交渉力・自主管理）とスマホの≡メニューへの言及を追加。
+  // PCは常設の右パネルにスキルが出ているので触れるだけでよいが、スマホは≡の中でしか見えない。
+  { key: 'panel', keep: [], info: true, targets: ['panel-left', 'mobile-status'], glowExtra: ['m-menu'],
+    text: 'ここに現金・月CF・バランスシート。純資産や負債といった財務の状況、法人成りもこの中から。経過年数と年齢は画面いちばん上に出ている。スキル状況（目利き力・交渉力・自主管理）もここから確認できる。スマホは右下の≡メニューにこれらがまとまっているので、あとで覗いてみて。' },
+  // v7.7: エリアピル（国内/新築/競売/海外）に一切触れていなかった。常時表示で鍵アイコンも
+  // 付いているため、無言だと「詰んだ？」と誤解されうる。今は国内だけで遊べることを伝える。
+  { key: 'regions', keep: [], info: true, targets: ['region-pills'],
+    text: '🌏 ここは進出エリア。今は「国内」だけで十分に遊べる。新築・競売・海外は条件を満たすと解放される、この先のお楽しみだ。' },
   { key: 'finish', keep: [], final: true,
     text: 'ひととおり触れた！ここまでの操作はリセットされ、本編は最初から始まる。' },
 ];
@@ -5219,7 +5257,7 @@ function tutMaybeAdvance(key) {
 }
 
 function showTutEndToast() {
-  const t = el(`<div class="fixed top-4 left-1/2 -translate-x-1/2 bg-amber-500 text-white rounded-lg shadow-lg px-4 py-2 z-50 text-sm font-bold">🧑‍🏫 チュートリアル終了！ここからが本編だ</div>`);
+  const t = el(`<div class="fixed top-4 left-1/2 -translate-x-1/2 bg-amber-500 text-white rounded-lg shadow-lg px-4 py-2 z-50 text-sm font-bold toast-below-header">🧑‍🏫 チュートリアル終了！ここからが本編だ</div>`);
   document.body.appendChild(t);
   setTimeout(() => { t.style.transition = 'opacity 0.5s'; t.style.opacity = '0'; setTimeout(() => t.remove(), 500); }, 2200);
 }
@@ -5271,6 +5309,10 @@ function renderTutStep() {
   if (!tutStepStates[tutIdx]) tutStepStates[tutIdx] = structuredClone(state);
   target.classList.add('tut-hl');
   buildTutMask(target.getBoundingClientRect());
+  // v7.7: 対象ボタンだけでなく、話題にしている数値表示（行動力など）も一緒に光らせたい段がある。
+  // 穴あき暗幕はtargetの1つ分しか避けないが、tut-hlはz-66で暗幕(64)より前面に出るので、
+  // 穴を追加しなくてもここに足すだけでちゃんと光って見える。
+  (stp.glowExtra || []).forEach(id => document.getElementById(id)?.classList.add('tut-hl'));
   // v7.2: 吹き出しと三角はクリックを透過させる。三角は対象ボタンの上にかぶることがあり、
   // 透過しないと「光っているボタンを押したのに反応しない」状態になる（実際に3段目で起きていた）。
   // スキップだけは押せる必要があるので、そこだけ pointer-events を戻す。
@@ -5329,14 +5371,20 @@ function placeTutBubble(bubble, r) {
   const w = Math.min(260, vw - M * 2);
   bubble.style.width = w + 'px';
   const h = bubble.offsetHeight;                       // 幅確定後に実測する
+  // v7.7: モーダル内の対象（探す/買付/満額など）は、上に説明文やチェックボックス列が
+  // 詰まっていて下側は空いていることが多い。「対象の上」を先に試すと、その説明や項目が
+  // 吹き出しの下敷きになって隠れてしまうため、収まるなら「対象の下」を優先する。
+  // スマホ下部バーのボタンは下に余白が無い（画面最下部）ので、自然と次の分岐（上に置く）へ回る。
   let left, top, dir;
   if (r.left - w - GAP >= M) {                         // 対象の左に置く（PCの右パネル）
     dir = 'right'; left = r.left - w - GAP; top = clamp(r.top - 10, M, vh - h - M);
   } else if (r.right + w + GAP <= vw - M) {            // 対象の右に置く（PCの左パネル）
     dir = 'left'; left = r.right + GAP; top = clamp(r.top - 10, M, vh - h - M);
-  } else if (r.top - h - GAP >= M) {                   // 対象の上に置く（スマホ下部バー）
+  } else if (r.bottom + GAP + h <= vh - M) {           // 対象の下に置く（モーダル内はこちらを優先）
+    dir = 'up'; left = clamp(r.left + r.width / 2 - w / 2, M, vw - w - M); top = r.bottom + GAP;
+  } else if (r.top - h - GAP >= M) {                   // 下に収まらない時だけ上に置く（スマホ下部バー）
     dir = 'down'; left = clamp(r.left + r.width / 2 - w / 2, M, vw - w - M); top = r.top - h - GAP;
-  } else {                                             // 対象の下に置く（スマホ上部バー）
+  } else {                                             // どちらにも収まらない時の最終手段
     dir = 'up'; left = clamp(r.left + r.width / 2 - w / 2, M, vw - w - M); top = clamp(r.bottom + GAP, M, vh - h - M);
   }
   bubble.style.left = Math.round(left) + 'px';
@@ -5362,8 +5410,10 @@ window.addEventListener('resize', () => { if (tutIdx >= 0) renderTutStep(); });
 function showSetup() {
   const m = document.getElementById('setup-modal');
   m.classList.remove('hidden');
+  // v7.7: 完了済みでも次回の初期値は常にON。更新でチュートリアル内容が変わっても
+  // 毎回手動でチェックし直す必要がないようにする（外すのは自由）。
   const data = { difficulty: 'beginner', attr: 'employee', age: 30, seed: 10_000_000, goalType: 'networth', goalAmount: 100_000_000, years: 20,
-    tutorial: localStorage.getItem('lm_tutorial_done') !== '1' };
+    tutorial: true };
   // v8: 初心者モードは目標プリセットを半分にして、最初の成功体験までを近くする。
   const BASE_PRESETS = {
     networth: [[30_000_000, '3,000万'], [100_000_000, '1億'], [300_000_000, '3億']],
@@ -5646,8 +5696,6 @@ function openMobileDrawer() {
       </div>
     </div></div>`);
   m.innerHTML = ''; m.appendChild(box);
-  // v7.2: ≡メニューを開いた時点で drawer ステップは完了。次は中の「物件市場」を指す。
-  tutMaybeAdvance('drawer');
   const go = (fn) => { close(); fn(); };
   m.querySelector('#dr-backdrop').addEventListener('click', close);
   m.querySelector('#dr-close').addEventListener('click', close);
@@ -8369,7 +8417,7 @@ function showBadgeToast(id) {
   const b = L.BADGES[id];
   if (!b) return;
   sfxBadge();
-  const t = el(`<div class="fixed top-4 left-1/2 -translate-x-1/2 bg-navy text-white rounded-lg shadow-lg px-4 py-2 z-50 text-sm font-bold badge-toast">${b.icon} 実績解除: ${b.label}</div>`);
+  const t = el(`<div class="fixed top-4 left-1/2 -translate-x-1/2 bg-navy text-white rounded-lg shadow-lg px-4 py-2 z-50 text-sm font-bold badge-toast toast-below-header">${b.icon} 実績解除: ${b.label}</div>`);
   document.body.appendChild(t);
   setTimeout(() => { t.style.transition = 'opacity 0.5s'; t.style.opacity = '0'; setTimeout(() => t.remove(), 500); }, 2200);
 }
@@ -8383,7 +8431,6 @@ function checkNewBadges() {
 }
 
 const BASE_GENRE_ORDER = ['kodate', 'apart', 'tekkotsu', 'kubun', 'rc'];
-const WAKEARI_MAP = { kodate: 'w_kodate', apart: 'w_apart', tekkotsu: 'w_tekkotsu', kubun: 'w_kubun', rc: 'w_rc' };
 
 // 直前の営業条件を保持（「この条件で探す」を押すたびにチェックがリセットされないように）
 let searchSelection = { genres: ['kodate', 'apart'], areas: ['local', 'urban'], ages: ['young', 'mid', 'old'], wakeari: false };
@@ -8808,6 +8855,9 @@ function tutForceFind(box, closeModal) {
   pushLog(`${p.name || p.label}（${p.label}）を発見（表面${(p.grossYield * 100).toFixed(1)}%・${L.yen(p.price)}）`);
   box.querySelector('#sr-progress').textContent = '発見！ 続けて探すこともできます';
   renderPanelRight();
+  // v7.7: スマホ上段の「市場」ボタン件数もここで更新しないと、次のステップで指す時に
+  // 「市場（0）」のまま光ってしまう（前は≡メニューを一度開かせていたので気付かなかった）。
+  renderMobileBars();
   tutMaybeAdvance('search');
 }
 
@@ -8846,7 +8896,7 @@ function openSearchModal() {
   const srStop = () => { if (srTimer) { clearInterval(srTimer); srTimer = null; } };
   const srOnce = () => {
     const res = onSearchPress(box, close);
-    if (!res || !res.pressed || res.found) srStop();
+    if (!res || !res.pressed || res.found || res.rareFind) srStop();
   };
   searchBtn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
@@ -8892,8 +8942,8 @@ function onSearchPress(box, closeModal) {
   if (!sel.genres.length || !sel.areas.length || !sel.ages.length) { alert('ジャンル・エリア・築年帯を1つ以上選んでください'); return { pressed: false }; }
   if (state.actionPower < 1) { alert('行動力が足りません。翌月へ進むと回復します。'); return { pressed: false }; }
   searchSelection = sel;
-  const genres = sel.wakeari ? sel.genres.flatMap(k => [k, WAKEARI_MAP[k]]) : sel.genres;
-  const r = L.doSalesPress(state, { genres, areas: sel.areas, ages: sel.ages }, Math.random);
+  // v12: 訳ありはジャンル抽選プールに混ぜず、独立のレア掘り出し物ロールでのみ出現させる
+  const r = L.doSalesPress(state, { genres: sel.genres, areas: sel.areas, ages: sel.ages, wakeari: sel.wakeari }, Math.random);
   if (!r.pressed) { alert('行動力が足りません。翌月へ進むと回復します。'); return { pressed: false }; }
   state = r.state; save();
   setCityState(state);   // v3.8fix: 新着物件を地図側の状態にも反映（これがないと「地図を見る」が効かない）
@@ -8912,6 +8962,19 @@ function onSearchPress(box, closeModal) {
     sfxMundane();
     pushLog(`平凡な出物を${r.mundane.length}件見た（低利回り・売れ残り）`);
     renderPanelRight();
+  }
+  // v12: 相続・売り急ぎのレアな掘り出し物。通常の発見よりさらに目立たせ、長押しも止める。
+  if (r.rareFind) {
+    const rp = r.rareFind;
+    const tag = rp.genreKey.startsWith('w_') ? '訳あり' : '掘り出し物';
+    const line = el(`<div class="sr-rare font-bold text-amber-600 underline cursor-pointer">🍀 ${act}…まさかの${tag}！ ${rp.name || rp.label}（表面${(rp.grossYield * 100).toFixed(1)}%・売り急ぎ）を掴んだ（タップで詳細）</div>`);
+    line.addEventListener('click', () => { closeModal(); openDetail(rp.id, 'market', openSearchModal); });
+    feed.insertBefore(line, feed.firstChild);
+    sfxKnock();
+    pushLog(`レアな${tag}を発見（表面${(rp.grossYield * 100).toFixed(1)}%・${yen(rp.price)}）`);
+    box.querySelector('#sr-progress').textContent = '掘り出し物！ 続けて探すこともできます';
+    renderPanelRight();
+    return { pressed: true, found: false, rareFind: true };
   }
   if (r.found) {
     // v3.5: 自動で一覧へ飛ばず、発見ログをタップで詳細へ（ログは消えず残る）
