@@ -72,15 +72,26 @@
   }
 
   /* v7.2: チュートリアルで押すべきボタンを目立たせる。周囲は暗幕で覆われているので、
-     ここは「光って脈打つ」ことだけに集中させる（暗い中で動くものに目が行く）。 */
+     ここは「光って脈打つ」ことだけに集中させる（暗い中で動くものに目が行く）。
+     v7.8: z-indexに!importantを付けた。対象がTailwindの`z-*`ユーティリティを自前で
+     持っている場合（例: エリアピルのz-10）、Tailwind CDNは使用中のクラスを検出した順に
+     <style>へ動的追記するため、後から挿入された`z-10`のルールがこの.tut-hlより後勝ちし、
+     リングがヘッダー(z-55)の裏に回って上側が欠けて見える不具合があった。 */
   .tut-hl {
-    position: relative; z-index: 66;
+    position: relative; z-index: 66 !important;
     animation: tutPulse 1.2s ease-in-out infinite;
     border-radius: 8px;
   }
   @keyframes tutPulse {
     0%, 100% { box-shadow: 0 0 0 3px #fbbf24, 0 0 12px 4px rgba(251,191,36,0.55); }
     50%      { box-shadow: 0 0 0 5px #fde68a, 0 0 22px 8px rgba(251,191,36,0.85); }
+  }
+  /* v7.8: 対象ボタンと「一緒に」光らせたい数値表示（行動力の残量など）向け。
+     ボタンは元から塗りつぶし背景を持つため.tut-hlの枠線だけで十分目立つが、
+     地の色が濃紺のHUD数値は枠線だけだと沈んで見えるため、塗りのバッジにして明度を上げる。 */
+  .tut-hl-extra {
+    background: #fbbf24 !important; color: #1e293b !important;
+    padding: 1px 4px; border-radius: 4px;
   }
 
   /* v8: 用語クイズの演出。既存のスタンプ演出はオーバーレイ内の <style> に閉じていて
@@ -5196,7 +5207,7 @@ function endTutorial() {
   tutStepStates = [];
   clearTutMask();
   closeTutOverlays([]);   // 途中でスキップしても、開きっぱなしの画面を残さない
-  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl'));
+  document.querySelectorAll('.tut-hl, .tut-hl-extra').forEach(e => e.classList.remove('tut-hl', 'tut-hl-extra'));
   tutIdx = -1;
   if (tutSnapshot) {
     state = tutSnapshot; tutSnapshot = null;
@@ -5290,7 +5301,7 @@ function renderTutStep() {
   if (tutIdx < 0) return;
   tutBubble?.remove(); tutBubble = null;
   clearTutMask();
-  document.querySelectorAll('.tut-hl').forEach(e => e.classList.remove('tut-hl'));
+  document.querySelectorAll('.tut-hl, .tut-hl-extra').forEach(e => e.classList.remove('tut-hl', 'tut-hl-extra'));
   if (tutIdx >= TUTORIAL_STEPS.length) { endTutorial(); return; }
   const stp = TUTORIAL_STEPS[tutIdx];
   // v7.2: このステップに不要な重ね画面は先に閉じる。開いたままだと対象ボタンが裏に隠れて押せない。
@@ -5312,7 +5323,7 @@ function renderTutStep() {
   // v7.7: 対象ボタンだけでなく、話題にしている数値表示（行動力など）も一緒に光らせたい段がある。
   // 穴あき暗幕はtargetの1つ分しか避けないが、tut-hlはz-66で暗幕(64)より前面に出るので、
   // 穴を追加しなくてもここに足すだけでちゃんと光って見える。
-  (stp.glowExtra || []).forEach(id => document.getElementById(id)?.classList.add('tut-hl'));
+  (stp.glowExtra || []).forEach(id => document.getElementById(id)?.classList.add('tut-hl', 'tut-hl-extra'));
   // v7.2: 吹き出しと三角はクリックを透過させる。三角は対象ボタンの上にかぶることがあり、
   // 透過しないと「光っているボタンを押したのに反応しない」状態になる（実際に3段目で起きていた）。
   // スキップだけは押せる必要があるので、そこだけ pointer-events を戻す。
